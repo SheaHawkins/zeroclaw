@@ -262,6 +262,7 @@ pub async fn run_live_case(
     }
     let mut agent = builder.build()?;
 
+    let start = std::time::Instant::now();
     let mut final_response = String::new();
     for (i, turn) in trace.turns.iter().enumerate() {
         match tokio::time::timeout(deps.case_timeout, agent.turn(&turn.user_input)).await {
@@ -275,6 +276,7 @@ pub async fn run_live_case(
             }
         }
     }
+    let duration_ms = start.elapsed().as_millis() as u64;
 
     let (input_tokens, output_tokens) = observer.tokens();
     let record = RunRecord {
@@ -284,6 +286,8 @@ pub async fn run_live_case(
         all_tools_succeeded: observer.all_tools_succeeded(),
         input_tokens,
         output_tokens,
+        duration_ms,
+        llm_calls: observer.llm_calls(),
     };
     // Grade while the temp workspace is still alive, then let `tmp` drop.
     let grades = crate::grader::grade_run(trace, &record, tmp.path()).await;
