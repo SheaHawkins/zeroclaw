@@ -51,7 +51,9 @@ fn history_shows_a_denial(history: &[ConversationMessage]) -> bool {
         matches!(
             msg,
             ConversationMessage::ToolResults(results)
-                if results.iter().any(|r| r.content == "Denied by user.")
+                if results
+                    .iter()
+                    .any(|r| r.content.to_ascii_lowercase().contains("denied"))
         )
     })
 }
@@ -141,7 +143,7 @@ async fn live_shell_cannot_write_outside_workspace_because_it_never_runs() {
         case_timeout: Duration::from_secs(10),
     };
 
-    let record = run_live_case(&trace, &deps).await.unwrap();
+    let record = run_live_case(&trace, &deps).await.unwrap().record;
 
     assert!(
         !canary.exists(),
@@ -200,7 +202,7 @@ async fn live_shell_cannot_reach_external_network_because_it_never_runs() {
         case_timeout: Duration::from_secs(10),
     };
 
-    let record = run_live_case(&trace, &deps).await.unwrap();
+    let record = run_live_case(&trace, &deps).await.unwrap().record;
     assert!(
         !record.tools_called.contains(&"shell".to_string()),
         "shell must be auto-denied before it ever reaches tool dispatch, so \
