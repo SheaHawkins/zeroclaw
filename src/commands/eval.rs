@@ -8,6 +8,7 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_eval::baseline::{self, Baseline, CaseComparison, SuiteKind};
 use zeroclaw_eval::{CaseProvider, CaseReport, LlmTrace, Mode, RunDeps, SuiteReport};
 use zeroclaw_runtime::agent::agent::build_session_model_provider;
+use zeroclaw_runtime::i18n::get_required_cli_string_with_args;
 
 /// Where failed-case records are auto-dumped on every run.
 pub const AUTO_DUMP_DIR: &str = "target/eval-last-run";
@@ -39,7 +40,13 @@ pub async fn finalize(
         Path::new(AUTO_DUMP_DIR),
     )?;
     if wrote_auto && opts.format == OutputFormat::Table {
-        println!("  failed-case records: {AUTO_DUMP_DIR}/");
+        println!(
+            "{}",
+            get_required_cli_string_with_args(
+                "cli-eval-failed-case-records",
+                &[("dir", AUTO_DUMP_DIR)],
+            )
+        );
     }
 
     // --write-baseline: persist the run and exit with its normal code.
