@@ -4,7 +4,8 @@
 
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
 use landlock::{
-    AccessFs, Errno, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr,
+    AccessFs, Errno, PathBeneath, PathFd, PathFdError, Ruleset, RulesetAttr, RulesetCreated,
+    RulesetCreatedAttr,
 };
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
 use std::os::unix::process::CommandExt;
@@ -62,79 +63,139 @@ impl LandlockSandbox {
     /// child process via `pre_exec` (see `wrap_command`), so only the
     /// child is restricted — the daemon (parent) process is never affected.
     fn build_ruleset(&self) -> std::io::Result<RulesetCreated> {
-        // Rights granted within the workspace and `/tmp` below: read/write an
-        // existing file, list a directory, create/remove a regular file,
-        // create/remove a directory, and create a symlink. All of these are
-        // in the *handled* set (below), so any of them attempted outside the
-        // explicit `PathBeneath` grants further down (workspace, `/tmp`) is
-        // denied by Landlock, not merely unrestricted.
-        let workspace_write_rights = AccessFs::ReadFile
-            | AccessFs::WriteFile
-            | AccessFs::ReadDir
-            | AccessFs::MakeReg
-            | AccessFs::MakeDir
-            | AccessFs::RemoveFile
-            | AccessFs::RemoveDir
-            | AccessFs::MakeSym;
-
         let mut ruleset = Ruleset::default()
             .handle_access(
-                AccessFs::ReadFile
+                AccessFs::Execute
                     | AccessFs::WriteFile
+                    | AccessFs::ReadFile
+                    | AccessFs::Truncate
                     | AccessFs::ReadDir
                     | AccessFs::RemoveDir
                     | AccessFs::RemoveFile
                     | AccessFs::MakeChar
+                    | AccessFs::MakeDir
+                    | AccessFs::MakeReg
                     | AccessFs::MakeSock
                     | AccessFs::MakeFifo
                     | AccessFs::MakeBlock
-                    | AccessFs::MakeReg
-                    | AccessFs::MakeSym
-                    | AccessFs::MakeDir,
+                    | AccessFs::MakeSym,
             )
             .and_then(|ruleset| ruleset.create())
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        // Allow workspace directory: read, write, list, and create/remove
-        // files, directories, and symlinks within it (but not device nodes,
-        // sockets, or FIFOs -- those stay denied everywhere, workspace
-        // included, since no rule below grants them).
-        if let Some(ref workspace) = self.workspace_dir
-            && workspace.exists()
-        {
+        // Allow workspace directory (read/write/execute).
+        // If a workspace was supplied but doesn't exist, fail closed rather than
+        // silently applying restrictions without a rule for it.
+        if let Some(ref workspace) = self.workspace_dir {
             let workspace_fd =
                 PathFd::new(workspace).map_err(|e| std::io::Error::other(e.to_string()))?;
             ruleset = ruleset
-                .add_rule(PathBeneath::new(workspace_fd, workspace_write_rights))
+                .add_rule(PathBeneath::new(
+                    workspace_fd,
+                    AccessFs::Execute
+                        | AccessFs::WriteFile
+                        | AccessFs::ReadFile
+                        | AccessFs::Truncate
+                        | AccessFs::ReadDir
+                        | AccessFs::RemoveDir
+                        | AccessFs::RemoveFile
+                        | AccessFs::MakeDir
+                        | AccessFs::MakeReg
+                        | AccessFs::MakeSock
+                        | AccessFs::MakeFifo
+                        | AccessFs::MakeSym,
+                ))
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
 
-        // Allow /tmp the same create/remove rights as the workspace (general
-        // scratch-file operations; e.g. `mkstemp`-style temp files).
-        let tmp_fd =
-            PathFd::new(Path::new("/tmp")).map_err(|e| std::io::Error::other(e.to_string()))?;
-        ruleset = ruleset
-            .add_rule(PathBeneath::new(tmp_fd, workspace_write_rights))
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-        // Allow /usr and /bin for executing commands
-        let usr_fd =
-            PathFd::new(Path::new("/usr")).map_err(|e| std::io::Error::other(e.to_string()))?;
-        ruleset = ruleset
-            .add_rule(PathBeneath::new(
-                usr_fd,
+        // Allow paths for general operations.
+        // `required = true`  -> fail closed if the path is missing (baseline devices, system roots).
+        // `required = false` -> skip on NotFound (distro-optional loader/layout paths).
+        for (allow_path, perm, required) in [
+            // /tmp: general temp directory for child processes (pipes, sockets, temp files).
+            // Execute is intentionally omitted to prevent running untrusted binaries from /tmp.
+            (
+                "/tmp",
+                AccessFs::Truncate | AccessFs::WriteFile | AccessFs::ReadFile,
+                true,
+            ),
+            // Linux dynamic linker (ld-linux-yourarch.so.version) which designed to run on FHS 3.0
+            // system will read the following file/directories to retrieve dynamic linker config.
+            // These are optional: minimal systems may not have all of them.
+            ("/etc/ld.so.cache", AccessFs::ReadFile.into(), false),
+            ("/etc/ld.so.conf", AccessFs::ReadFile.into(), false),
+            ("/etc/ld.so.preload", AccessFs::ReadFile.into(), false),
+            (
+                "/etc/ld.so.conf.d",
                 AccessFs::ReadFile | AccessFs::ReadDir,
-            ))
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-        let bin_fd =
-            PathFd::new(Path::new("/bin")).map_err(|e| std::io::Error::other(e.to_string()))?;
-        ruleset = ruleset
-            .add_rule(PathBeneath::new(
-                bin_fd,
-                AccessFs::ReadFile | AccessFs::ReadDir,
-            ))
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                false,
+            ),
+            // In FHS 3.0 systems, system binaries will live in the following directories:
+            // /usr/bin, /usr/lib, /usr/lib64, /bin, /lib, /lib64.
+            // Execute: needed to run binaries (execve) and for the dynamic linker's
+            // access(X_OK) checks on shared libraries.
+            //
+            // /usr is optional: Non-FHS distros may not have it.
+            (
+                "/usr",
+                AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir,
+                false,
+            ),
+            (
+                "/bin",
+                AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir,
+                true,
+            ),
+            // /lib and /lib64 are distro-optional: some systems have one, some both.
+            (
+                "/lib",
+                AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir,
+                false,
+            ),
+            (
+                "/lib64",
+                AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir,
+                false,
+            ),
+            // some variant of sh requires access to /dev/null
+            ("/dev/null", AccessFs::WriteFile | AccessFs::ReadFile, true),
+        ] {
+            match PathFd::new(Path::new(allow_path)) {
+                Ok(path_fd) => {
+                    ruleset = ruleset
+                        .add_rule(PathBeneath::new(path_fd, perm))
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                }
+                Err(PathFdError::OpenCall { source, .. }) => {
+                    if source.kind() == std::io::ErrorKind::NotFound {
+                        if required {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                format!(
+                                    "Required path {allow_path} not found for Landlock sandbox"
+                                ),
+                            ));
+                        }
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            format!(
+                                "Failed to create PathFd for a nonexistent path {}.",
+                                allow_path,
+                            ),
+                        );
+                    } else {
+                        Err(std::io::Error::other(source.to_string()))?;
+                    }
+                }
+                Err(e) => {
+                    Err(std::io::Error::other(e.to_string()))?;
+                }
+            }
+        }
 
         // Return the ruleset WITHOUT enforcing it.
         // Enforcement is deferred to the child process via pre_exec
