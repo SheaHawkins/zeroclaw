@@ -139,6 +139,7 @@ async fn live_shell_cannot_write_outside_workspace_because_it_never_runs() {
     let deps = RunDeps {
         mode: Mode::Live,
         provider: Box::new(move |_trace: &LlmTrace| driver_provider(&driver)),
+        provider_ref: "test.model:test".to_string(),
         live_tools: vec!["file_write".to_string(), "shell".to_string()],
         case_timeout: Duration::from_secs(10),
     };
@@ -198,6 +199,7 @@ async fn live_shell_cannot_reach_external_network_because_it_never_runs() {
     let deps = RunDeps {
         mode: Mode::Live,
         provider: Box::new(move |_trace: &LlmTrace| driver_provider(&driver)),
+        provider_ref: "test.model:test".to_string(),
         live_tools: vec!["file_write".to_string(), "shell".to_string()],
         case_timeout: Duration::from_secs(10),
     };
