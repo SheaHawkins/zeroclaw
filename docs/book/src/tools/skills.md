@@ -62,7 +62,7 @@ tags: [release, docs]
 Review the release notes, changelog, version tags, and migration notes before confirming that a release is ready.
 ```
 
-Supported frontmatter fields are `name`, `description`, `license`, `author`, `version`, `category`, `tags`, `always`, and `slash_options`.
+Supported frontmatter fields are `name`, `description`, `author`, `version`, `tags`, `always`, and `slash_options`.
 
 Setting `always: true` keeps a skill's full instructions inlined in the system prompt even when the agent runs in compact skill-prompt mode (where other skills are summarized and their instructions are loaded on demand via `read_skill`). It defaults to `false`. Reserve it for policy or safety-critical skills that must always be visible to the model, not routine workflow skills like the release check above:
 
