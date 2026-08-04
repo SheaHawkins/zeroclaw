@@ -4227,6 +4227,57 @@ impl Config {
             .map(|(alias, _)| alias.as_str())
     }
 
+    /// Channel refs (`<type>.<alias>`) owned by `agent_alias`, for binding
+    /// per-agent ownership scopes (session tools, discord_search) at tool
+    /// registration. Mirrors the orchestrator's `build_owner_by_channel_key`
+    /// semantics so tool-side ownership and message routing agree:
+    ///
+    /// - When any `[agents.<alias>]` entry declares channel bindings,
+    ///   ownership is exactly the agent's own `channels` list (empty for
+    ///   disabled or unknown aliases).
+    /// - True legacy mode (no agent anywhere declares a binding): the
+    ///   deterministic fallback owner — `default` if enabled, else the
+    ///   lexicographically first enabled alias — owns every configured
+    ///   channel; every other agent owns none.
+    #[must_use]
+    pub fn channel_refs_owned_by_agent(&self, agent_alias: &str) -> Vec<String> {
+        let any_binding_declared = self.agents.values().any(|a| !a.channels.is_empty());
+        if any_binding_declared {
+            return self
+                .agents
+                .get(agent_alias)
+                .filter(|agent| agent.enabled)
+                .map(|agent| {
+                    agent
+                        .channels
+                        .iter()
+                        .map(|c| c.as_str().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+
+        let fallback_owner = self
+            .agents
+            .get("default")
+            .filter(|a| a.enabled)
+            .map(|_| "default")
+            .or_else(|| {
+                self.agents
+                    .iter()
+                    .filter(|(_, a)| a.enabled)
+                    .map(|(alias, _)| alias.as_str())
+                    .min()
+            });
+        if fallback_owner != Some(agent_alias) {
+            return Vec::new();
+        }
+        self.channels_by_alias()
+            .into_iter()
+            .map(|info| format!("{}.{}", info.channel_type, info.alias))
+            .collect()
+    }
+
     /// Workspace dir a channel's inbound-media handler writes into. Resolves
     /// the channel's owning agent and returns `<install>/agents/<alias>/workspace/`;
     /// falls back to `data_dir` for orphan channels (no owning agent enabled).
@@ -38448,6 +38499,125 @@ model_provider = \"ollama.default\"
         let from_empty: BuiltinHooksConfig = toml::from_str("").unwrap();
         let default = BuiltinHooksConfig::default();
         assert_eq!(from_empty.command_logger, default.command_logger);
+    }
+
+    // ── channel_refs_owned_by_agent: ownership basis for per-agent tool
+    // scoping (sessions_*, discord_search). Must agree with the
+    // orchestrator's build_owner_by_channel_key semantics. ──
+
+    fn agent_with_channels(enabled: bool, channels: &[&str]) -> AliasedAgentConfig {
+        AliasedAgentConfig {
+            enabled,
+            channels: channels
+                .iter()
+                .map(|c| crate::providers::ChannelRef::new(*c))
+                .collect(),
+            ..AliasedAgentConfig::default()
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_refs_owned_by_agent_declared_mode_returns_own_bindings_only() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "rowan".to_string(),
+            agent_with_channels(true, &["telegram.main", "discord.ops"]),
+        );
+        config.agents.insert(
+            "sable".to_string(),
+            agent_with_channels(true, &["slack.hq"]),
+        );
+
+        let rowan = config.channel_refs_owned_by_agent("rowan");
+        assert_eq!(rowan, vec!["telegram.main", "discord.ops"]);
+        assert_eq!(
+            config.channel_refs_owned_by_agent("sable"),
+            vec!["slack.hq"]
+        );
+        assert!(config.channel_refs_owned_by_agent("missing").is_empty());
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_refs_owned_by_agent_declared_mode_disabled_agent_owns_nothing() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "rowan".to_string(),
+            agent_with_channels(false, &["telegram.main"]),
+        );
+        config.agents.insert(
+            "sable".to_string(),
+            agent_with_channels(true, &["slack.hq"]),
+        );
+
+        assert!(config.channel_refs_owned_by_agent("rowan").is_empty());
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_refs_owned_by_agent_legacy_mode_fallback_owner_gets_all_channels() {
+        let mut config = Config::default();
+        // No agent declares any binding -> true legacy mode.
+        config
+            .agents
+            .insert("zeta".to_string(), agent_with_channels(true, &[]));
+        config
+            .agents
+            .insert("alpha".to_string(), agent_with_channels(true, &[]));
+        config
+            .channels
+            .telegram
+            .insert("main".to_string(), TelegramConfig::default());
+        config
+            .channels
+            .discord
+            .insert("ops".to_string(), DiscordConfig::default());
+
+        // Lexicographically first enabled alias wins when no `default` agent.
+        let alpha = config.channel_refs_owned_by_agent("alpha");
+        assert!(alpha.contains(&"telegram.main".to_string()), "{alpha:?}");
+        assert!(alpha.contains(&"discord.ops".to_string()), "{alpha:?}");
+        assert!(config.channel_refs_owned_by_agent("zeta").is_empty());
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_refs_owned_by_agent_legacy_mode_prefers_enabled_default_agent() {
+        let mut config = Config::default();
+        config
+            .agents
+            .insert("alpha".to_string(), agent_with_channels(true, &[]));
+        config
+            .agents
+            .insert("default".to_string(), agent_with_channels(true, &[]));
+        config
+            .channels
+            .telegram
+            .insert("main".to_string(), TelegramConfig::default());
+
+        assert_eq!(
+            config.channel_refs_owned_by_agent("default"),
+            vec!["telegram.main"]
+        );
+        assert!(config.channel_refs_owned_by_agent("alpha").is_empty());
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_refs_owned_by_agent_legacy_mode_skips_disabled_default_agent() {
+        let mut config = Config::default();
+        config
+            .agents
+            .insert("alpha".to_string(), agent_with_channels(true, &[]));
+        config
+            .agents
+            .insert("default".to_string(), agent_with_channels(false, &[]));
+        config
+            .channels
+            .telegram
+            .insert("main".to_string(), TelegramConfig::default());
+
+        assert_eq!(
+            config.channel_refs_owned_by_agent("alpha"),
+            vec!["telegram.main"]
+        );
+        assert!(config.channel_refs_owned_by_agent("default").is_empty());
     }
 
     #[test]

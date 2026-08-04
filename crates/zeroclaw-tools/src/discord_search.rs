@@ -1,18 +1,78 @@
 use async_trait::async_trait;
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::fmt::Write;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
 use zeroclaw_memory::Memory;
+
+/// Rows archived before per-channel provenance stamping carry the memory
+/// schema's namespace column default instead of a `discord.<alias>` ref.
+const LEGACY_NAMESPACE: &str = "default";
+
+/// Archive rows the calling agent may read, bound at tool construction
+/// from trusted config (never from model-supplied arguments).
+///
+/// The Discord archive (`discord.db`) is shared across every configured
+/// Discord alias; each row's `namespace` records the ChannelRef
+/// (`discord.<alias>`) of the channel that archived it. An agent reads
+/// rows whose namespace is one of its owned channel refs, plus
+/// unattributed legacy rows when the install has at most one enabled
+/// agent (a sole agent owns everything; in multi-agent installs legacy
+/// rows fail closed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscordArchiveScope {
+    owned_channel_refs: BTreeSet<String>,
+    include_unattributed: bool,
+}
+
+impl DiscordArchiveScope {
+    pub fn new<I, S>(owned_channel_refs: I, include_unattributed: bool) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            owned_channel_refs: owned_channel_refs.into_iter().map(Into::into).collect(),
+            include_unattributed,
+        }
+    }
+
+    fn allows(&self, namespace: &str) -> bool {
+        if namespace == LEGACY_NAMESPACE {
+            return self.include_unattributed;
+        }
+        self.owned_channel_refs.contains(namespace)
+    }
+}
 
 /// Search Discord message history stored in discord.db.
 pub struct DiscordSearchTool {
     discord_memory: Arc<dyn Memory>,
+    security: Arc<SecurityPolicy>,
+    archive_scope: Option<DiscordArchiveScope>,
 }
 
 impl DiscordSearchTool {
-    pub fn new(discord_memory: Arc<dyn Memory>) -> Self {
-        Self { discord_memory }
+    pub fn new(discord_memory: Arc<dyn Memory>, security: Arc<SecurityPolicy>) -> Self {
+        Self {
+            discord_memory,
+            security,
+            archive_scope: None,
+        }
+    }
+
+    pub fn for_agent(
+        discord_memory: Arc<dyn Memory>,
+        security: Arc<SecurityPolicy>,
+        archive_scope: DiscordArchiveScope,
+    ) -> Self {
+        Self {
+            discord_memory,
+            security,
+            archive_scope: Some(archive_scope),
+        }
     }
 }
 
@@ -23,7 +83,7 @@ impl Tool for DiscordSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search Discord message history. Returns messages matching a keyword query, optionally filtered by channel_id, author_id, or time range."
+        "Search Discord message history from this agent's configured Discord channels. Returns messages matching a keyword query, optionally filtered by channel_id, author_id, or time range."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -55,6 +115,17 @@ impl Tool for DiscordSearchTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if let Err(error) = self
+            .security
+            .enforce_tool_operation(ToolOperation::Read, "discord_search")
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error),
+            });
+        }
+
         let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
         let channel_id = args.get("channel_id").and_then(|v| v.as_str());
         let since = args.get("since").and_then(|v| v.as_str());
@@ -112,17 +183,33 @@ impl Tool for DiscordSearchTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(10, |v| v as usize);
 
+        // The archive is shared across aliases, so ownership filtering
+        // happens after recall. Over-fetch so foreign rows do not crowd
+        // owned rows out of the requested limit (bounded; a scoped search
+        // that matches more than the over-fetch window is truncated).
+        let fetch_limit = if self.archive_scope.is_some() {
+            limit.max(limit.saturating_mul(4).min(200))
+        } else {
+            limit
+        };
+
         match self
             .discord_memory
-            .recall(query, limit, channel_id, since, until)
+            .recall(query, fetch_limit, channel_id, since, until)
             .await
         {
-            Ok(entries) if entries.is_empty() => Ok(ToolResult {
-                success: true,
-                output: "No Discord messages found.".into(),
-                error: None,
-            }),
-            Ok(entries) => {
+            Ok(mut entries) => {
+                if let Some(scope) = &self.archive_scope {
+                    entries.retain(|entry| scope.allows(&entry.namespace));
+                    entries.truncate(limit);
+                }
+                if entries.is_empty() {
+                    return Ok(ToolResult {
+                        success: true,
+                        output: "No Discord messages found.".into(),
+                        error: None,
+                    });
+                }
                 let mut output = format!("Found {} Discord messages:\n", entries.len());
                 for entry in &entries {
                     let score = entry
@@ -151,16 +238,42 @@ mod tests {
     use tempfile::TempDir;
     use zeroclaw_memory::{MemoryCategory, SqliteMemory};
 
+    fn test_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy::default())
+    }
+
     fn seeded_discord_mem() -> (TempDir, Arc<dyn Memory>) {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new_named("test", tmp.path(), "discord").unwrap();
         (tmp, Arc::new(mem))
     }
 
+    /// Archive a row the way DiscordChannel does post-provenance: the
+    /// numeric Discord channel id as session, the archiving channel's
+    /// ChannelRef as namespace.
+    async fn archive_row(
+        mem: &Arc<dyn Memory>,
+        key: &str,
+        content: &str,
+        discord_channel_id: &str,
+        namespace: Option<&str>,
+    ) {
+        mem.store_with_metadata(
+            key,
+            content,
+            MemoryCategory::Custom("discord".to_string()),
+            Some(discord_channel_id),
+            namespace,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn search_empty() {
         let (_tmp, mem) = seeded_discord_mem();
-        let tool = DiscordSearchTool::new(mem);
+        let tool = DiscordSearchTool::new(mem, test_security());
         let result = tool.execute(json!({"query": "hello"})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("No Discord messages found"));
@@ -178,7 +291,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tool = DiscordSearchTool::new(mem);
+        let tool = DiscordSearchTool::new(mem, test_security());
         let result = tool.execute(json!({"query": "hello"})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello"));
@@ -187,10 +300,160 @@ mod tests {
     #[tokio::test]
     async fn search_requires_query_or_time() {
         let (_tmp, mem) = seeded_discord_mem();
-        let tool = DiscordSearchTool::new(mem);
+        let tool = DiscordSearchTool::new(mem, test_security());
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("at least"));
+    }
+
+    #[tokio::test]
+    async fn scoped_search_excludes_foreign_alias_rows() {
+        let (_tmp, mem) = seeded_discord_mem();
+        archive_row(
+            &mem,
+            "discord_own",
+            "@a in #111 at 2025-01-01T00:00:00Z: shared keyword own",
+            "111",
+            Some("discord.mine"),
+        )
+        .await;
+        archive_row(
+            &mem,
+            "discord_foreign",
+            "@b in #222 at 2025-01-01T00:00:00Z: shared keyword foreign",
+            "222",
+            Some("discord.theirs"),
+        )
+        .await;
+
+        let tool = DiscordSearchTool::for_agent(
+            mem,
+            test_security(),
+            DiscordArchiveScope::new(["discord.mine"], false),
+        );
+
+        let result = tool
+            .execute(json!({"query": "shared keyword"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("own"));
+        assert!(!result.output.contains("foreign"));
+    }
+
+    #[tokio::test]
+    async fn scoped_search_ignores_model_supplied_channel_id_as_authorization() {
+        let (_tmp, mem) = seeded_discord_mem();
+        archive_row(
+            &mem,
+            "discord_foreign",
+            "@b in #222 at 2025-01-01T00:00:00Z: private foreign text",
+            "222",
+            Some("discord.theirs"),
+        )
+        .await;
+
+        let tool = DiscordSearchTool::for_agent(
+            mem,
+            test_security(),
+            DiscordArchiveScope::new(["discord.mine"], false),
+        );
+
+        // The model names the foreign channel id explicitly; the arg is a
+        // selector, not an authorization, so nothing may come back.
+        let result = tool
+            .execute(json!({"query": "private", "channel_id": "222"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("No Discord messages found"));
+        assert!(!result.output.contains("private foreign text"));
+    }
+
+    #[tokio::test]
+    async fn scoped_search_legacy_rows_fail_closed_in_multi_agent_mode() {
+        let (_tmp, mem) = seeded_discord_mem();
+        // Pre-provenance archive row: bare store, namespace stays 'default'.
+        mem.store(
+            "discord_legacy",
+            "@old in #333 at 2024-01-01T00:00:00Z: legacy text",
+            MemoryCategory::Custom("discord".to_string()),
+            Some("333"),
+        )
+        .await
+        .unwrap();
+
+        let tool = DiscordSearchTool::for_agent(
+            mem,
+            test_security(),
+            DiscordArchiveScope::new(["discord.mine"], false),
+        );
+
+        let result = tool.execute(json!({"query": "legacy"})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("No Discord messages found"));
+    }
+
+    #[tokio::test]
+    async fn scoped_search_legacy_rows_visible_in_single_agent_mode() {
+        let (_tmp, mem) = seeded_discord_mem();
+        mem.store(
+            "discord_legacy",
+            "@old in #333 at 2024-01-01T00:00:00Z: legacy text",
+            MemoryCategory::Custom("discord".to_string()),
+            Some("333"),
+        )
+        .await
+        .unwrap();
+
+        let tool = DiscordSearchTool::for_agent(
+            mem,
+            test_security(),
+            DiscordArchiveScope::new(["discord.mine"], true),
+        );
+
+        let result = tool.execute(json!({"query": "legacy"})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("legacy text"));
+    }
+
+    #[tokio::test]
+    async fn scoped_search_filters_before_limit() {
+        let (_tmp, mem) = seeded_discord_mem();
+        for i in 0..5 {
+            archive_row(
+                &mem,
+                &format!("discord_foreign_{i}"),
+                &format!("@b in #222 at 2025-01-01T00:00:0{i}Z: crowding keyword {i}"),
+                "222",
+                Some("discord.theirs"),
+            )
+            .await;
+        }
+        archive_row(
+            &mem,
+            "discord_own",
+            "@a in #111 at 2025-01-01T00:00:09Z: crowding keyword own",
+            "111",
+            Some("discord.mine"),
+        )
+        .await;
+
+        let tool = DiscordSearchTool::for_agent(
+            mem,
+            test_security(),
+            DiscordArchiveScope::new(["discord.mine"], false),
+        );
+
+        // limit 1 with 5 foreign matches: over-fetch + post-filter must
+        // still surface the single owned row.
+        let result = tool
+            .execute(json!({"query": "crowding keyword", "limit": 1}))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("own"), "{}", result.output);
+        assert!(!result.output.contains("foreign"));
     }
 
     #[test]
@@ -211,7 +474,7 @@ mod tests {
     #[test]
     fn name_and_schema() {
         let (_tmp, mem) = seeded_discord_mem();
-        let tool = DiscordSearchTool::new(mem);
+        let tool = DiscordSearchTool::new(mem, test_security());
         assert_eq!(tool.name(), "discord_search");
         assert!(tool.parameters_schema()["properties"]["query"].is_object());
     }
