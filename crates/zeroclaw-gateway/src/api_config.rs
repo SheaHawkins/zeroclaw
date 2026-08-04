@@ -4255,6 +4255,11 @@ mod tests {
             ..Default::default()
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .to_string();
         let agent = zeroclaw_config::schema::AliasedAgentConfig {
             risk_profile: "default".into(),
             ..Default::default()
@@ -4277,6 +4282,22 @@ mod tests {
         std::fs::write(old_ws.join("marker.txt"), b"hi").unwrap();
         zeroclaw_runtime::cron::add_job(&config, "victim", "* * * * *", "echo hi")
             .expect("seed cron job");
+        let knowledge = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &config.knowledge.resolved_db_path(),
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        knowledge
+            .add_node(
+                &zeroclaw_memory::knowledge_graph::KnowledgeScope::for_agent("victim", Vec::new()),
+                zeroclaw_memory::knowledge_graph::NodeType::Pattern,
+                "Owned",
+                "archive failure proof",
+                &[],
+                None,
+            )
+            .unwrap();
+        drop(knowledge);
 
         let state = crate::api::test_state(config.clone());
         let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
@@ -4308,6 +4329,110 @@ mod tests {
         assert!(
             joined.contains("archive"),
             "warnings should mention archive-side failures, got: {joined}"
+        );
+        assert!(
+            joined.contains("knowledge purge skipped"),
+            "the response must say the knowledge purge was skipped, got: {joined}"
+        );
+        let knowledge = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &config.knowledge.resolved_db_path(),
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        assert_eq!(
+            knowledge.count_owner("victim").unwrap(),
+            1,
+            "knowledge rows must remain when the recovery archive cannot be created"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_delete_skips_knowledge_purge_when_export_fails() {
+        use axum::body::to_bytes;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .to_string();
+        config.agents.insert(
+            "victim".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config.runtime_profiles.entry("default".into()).or_default();
+
+        let knowledge_path = config.knowledge.resolved_db_path();
+        let knowledge = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &knowledge_path,
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        knowledge
+            .add_node(
+                &zeroclaw_memory::knowledge_graph::KnowledgeScope::for_agent("victim", Vec::new()),
+                zeroclaw_memory::knowledge_graph::NodeType::Pattern,
+                "Owned",
+                "export failure proof",
+                &[],
+                None,
+            )
+            .unwrap();
+        drop(knowledge);
+
+        // Leave the ownership columns readable while breaking the export's
+        // selected shape. KnowledgeGraph::new still opens this database, but
+        // export_owner fails before the deletion gate can be crossed.
+        let conn = rusqlite::Connection::open(&knowledge_path).unwrap();
+        conn.execute_batch("ALTER TABLE nodes RENAME COLUMN title TO broken_title;")
+            .unwrap();
+        drop(conn);
+
+        let state = crate::api::test_state(config.clone());
+        let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
+        let resp = delete_agent_cascade(&state, config.clone(), "victim", guard).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let joined = json
+            .get("warnings")
+            .and_then(|value| value.as_array())
+            .expect("export failure must be surfaced through warnings")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("knowledge purge skipped"),
+            "the response must say the knowledge purge was skipped, got: {joined}"
+        );
+
+        let conn = rusqlite::Connection::open(&knowledge_path).unwrap();
+        let owned_rows: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE owner_agent = 'victim'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            owned_rows, 1,
+            "knowledge rows must remain when their export fails"
         );
     }
 

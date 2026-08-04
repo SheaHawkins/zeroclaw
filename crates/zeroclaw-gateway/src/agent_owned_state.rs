@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
+use tokio::io::AsyncWriteExt;
 use zeroclaw_api::memory_traits::Memory;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::acp_session_store::AcpSessionStore;
@@ -33,16 +34,49 @@ pub struct OwnedStateReport {
     pub warnings: Vec<String>,
 }
 
-async fn write_json(path: &Path, bytes: Vec<u8>) {
-    if let Err(err) = tokio::fs::write(path, bytes).await {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"path": path.display().to_string(), "err": err.to_string()})),
-            "owned-state cascade: failed to write archive file"
-        );
+async fn write_json(path: &Path, bytes: Vec<u8>) -> anyhow::Result<()> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
+        .await
+        .with_context(|| format!("open archive file {}", path.display()))?;
+    file.write_all(&bytes)
+        .await
+        .with_context(|| format!("write archive file {}", path.display()))?;
+    file.sync_all()
+        .await
+        .with_context(|| format!("sync archive file {}", path.display()))?;
+    drop(file);
+
+    // Persist the directory entry as well as the file contents on platforms
+    // that support syncing directories. A successful return is the deletion
+    // gate for knowledge rows, so it must mean the recovery path is durable.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        let parent_dir = tokio::fs::File::open(parent)
+            .await
+            .with_context(|| format!("open archive directory {}", parent.display()))?;
+        parent_dir
+            .sync_all()
+            .await
+            .with_context(|| format!("sync archive directory {}", parent.display()))?;
     }
+
+    Ok(())
+}
+
+fn archive_warning(kind: &str, err: &anyhow::Error) -> String {
+    format!("{kind} archive: {err}")
+}
+
+fn knowledge_purge_skipped_warning(err: &anyhow::Error) -> String {
+    let error = err.to_string();
+    zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+        "cli-alias-knowledge-purge-skipped",
+        &[("error", error.as_str())],
+    )
 }
 
 pub async fn cascade_owned_state(
@@ -53,7 +87,15 @@ pub async fn cascade_owned_state(
     archive_dir: &Path,
 ) -> OwnedStateReport {
     let cascade_dir = archive_dir.join("cascade");
-    let _ = tokio::fs::create_dir_all(&cascade_dir).await;
+    if let Err(err) = tokio::fs::create_dir_all(&cascade_dir).await {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"path": cascade_dir.display().to_string(), "err": err.to_string()})),
+            "owned-state cascade: failed to create archive directory"
+        );
+    }
     let mut warnings: Vec<String> = Vec::new();
 
     // ── memory: export → archive → purge. Failures are SURFACED in `warnings`,
@@ -66,8 +108,13 @@ pub async fn cascade_owned_state(
             Vec::new()
         }
     };
-    if let Ok(bytes) = serde_json::to_vec_pretty(&mem_rows) {
-        write_json(&cascade_dir.join("memory.json"), bytes).await;
+    match serde_json::to_vec_pretty(&mem_rows).context("serialize memory export") {
+        Ok(bytes) => {
+            if let Err(err) = write_json(&cascade_dir.join("memory.json"), bytes).await {
+                warnings.push(archive_warning("memory", &err));
+            }
+        }
+        Err(err) => warnings.push(archive_warning("memory", &err)),
     }
     let memory_purged = match mem.purge_agent(alias).await {
         Ok(n) => n,
@@ -87,23 +134,30 @@ pub async fn cascade_owned_state(
             &knowledge_path,
             config.knowledge.max_nodes,
         ) {
-            Ok(graph) => {
-                match graph.export_owner(alias) {
-                    Ok(rows) => {
-                        if let Ok(bytes) = serde_json::to_vec_pretty(&rows) {
-                            write_json(&cascade_dir.join("knowledge.json"), bytes).await;
+            Ok(graph) => match graph
+                .export_owner(alias)
+                .context("export owned knowledge")
+                .and_then(|rows| {
+                    serde_json::to_vec_pretty(&rows).context("serialize owned knowledge export")
+                }) {
+                Ok(bytes) => match write_json(&cascade_dir.join("knowledge.json"), bytes).await {
+                    Ok(()) => match graph.purge_owner(alias) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            warnings.push(format!("knowledge purge: {e}"));
+                            0
                         }
-                    }
-                    Err(e) => warnings.push(format!("knowledge export: {e}")),
-                }
-                match graph.purge_owner(alias) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        warnings.push(format!("knowledge purge: {e}"));
+                    },
+                    Err(err) => {
+                        warnings.push(knowledge_purge_skipped_warning(&err));
                         0
                     }
+                },
+                Err(err) => {
+                    warnings.push(knowledge_purge_skipped_warning(&err));
+                    0
                 }
-            }
+            },
             Err(e) => {
                 warnings.push(format!("knowledge graph open: {e}"));
                 0
@@ -121,8 +175,13 @@ pub async fn cascade_owned_state(
             Vec::new()
         }
     };
-    if let Ok(bytes) = serde_json::to_vec_pretty(&cron_jobs) {
-        write_json(&cascade_dir.join("cron.json"), bytes).await;
+    match serde_json::to_vec_pretty(&cron_jobs).context("serialize cron export") {
+        Ok(bytes) => {
+            if let Err(err) = write_json(&cascade_dir.join("cron.json"), bytes).await {
+                warnings.push(archive_warning("cron", &err));
+            }
+        }
+        Err(err) => warnings.push(archive_warning("cron", &err)),
     }
     let cron_removed = match zeroclaw_runtime::cron::remove_jobs_by_agent(config, alias) {
         Ok(n) => n,
@@ -152,8 +211,13 @@ pub async fn cascade_owned_state(
                     })
                 })
                 .collect();
-            if let Ok(bytes) = serde_json::to_vec_pretty(&json) {
-                write_json(&cascade_dir.join("acp.json"), bytes).await;
+            match serde_json::to_vec_pretty(&json).context("serialize ACP export") {
+                Ok(bytes) => {
+                    if let Err(err) = write_json(&cascade_dir.join("acp.json"), bytes).await {
+                        warnings.push(archive_warning("ACP", &err));
+                    }
+                }
+                Err(err) => warnings.push(archive_warning("ACP", &err)),
             }
             match store.delete_sessions_by_agent(alias) {
                 Ok(n) => acp_removed = n,
@@ -185,7 +249,7 @@ pub async fn cascade_owned_state(
         );
     }
 
-    let report = OwnedStateReport {
+    let mut report = OwnedStateReport {
         memory_purged,
         knowledge_purged,
         cron_removed,
@@ -205,8 +269,13 @@ pub async fn cascade_owned_state(
         "sessions_cleared": report.sessions_cleared,
         "warnings": report.warnings,
     });
-    if let Ok(bytes) = serde_json::to_vec_pretty(&manifest) {
-        write_json(&archive_dir.join("manifest.json"), bytes).await;
+    match serde_json::to_vec_pretty(&manifest).context("serialize cascade manifest") {
+        Ok(bytes) => {
+            if let Err(err) = write_json(&archive_dir.join("manifest.json"), bytes).await {
+                report.warnings.push(archive_warning("manifest", &err));
+            }
+        }
+        Err(err) => report.warnings.push(archive_warning("manifest", &err)),
     }
 
     report
