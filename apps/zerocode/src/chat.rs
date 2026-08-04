@@ -243,7 +243,10 @@ impl Chat {
     }
 
     /// Fetch agent list. If exactly one enabled agent, auto-start a session (or
-    /// show the CWD picker first on WSS ACP connections).
+    /// show the CWD picker first on WSS ACP connections) — except on the Code
+    /// (ACP) pane with no resumable history, where the single-item agent
+    /// picker is shown first so the memory-isolation disclosure is visible
+    /// before the session starts.
     pub(crate) async fn init(&mut self) -> anyhow::Result<()> {
         let agents = match self.rpc.agents_status().await {
             Ok(result) => result
@@ -286,6 +289,17 @@ impl Chat {
                 return Ok(());
             }
             if self.try_show_recent_acp_session_picker(&agents).await {
+                return Ok(());
+            }
+            if self.pane_kind == PaneKind::Acp {
+                // No resumable ACP history: route through the same
+                // disclosure-bearing agent picker as the multi-agent
+                // no-history path (below) instead of starting straight into
+                // a session, so a first-time Code user still sees the
+                // history-vs-persistent-memory note before any fresh
+                // `session/new` request goes out. Chat has no such note and
+                // keeps auto-starting.
+                self.show_agent_picker(agents);
                 return Ok(());
             }
             self.pick_or_start_session(&agents[0]).await;
@@ -2113,13 +2127,18 @@ impl Chat {
             } = &mut self.phase
             {
                 let overlay_area = session_list_overlay_area(area);
+                // The resume picker renders the memory-isolation note in its
+                // footer; clicks there must not resolve to (possibly hidden)
+                // session rows, so hit-test against the note-free list rect.
+                let note = crate::i18n::t("zc-chat-session-list-resume-note");
+                let click_area = session_list_click_area(overlay_area, Some(&note));
                 match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left)
                         if mouse::in_rect(mouse.column, mouse.row, overlay_area) =>
                     {
                         if let Some(idx) = mouse::list_click_index(
                             mouse.row,
-                            overlay_area,
+                            click_area,
                             list_state.offset(),
                             sessions.len(),
                         ) {
@@ -4215,6 +4234,35 @@ fn session_list_overlay_area(area: Rect) -> Rect {
             Constraint::Percentage(15),
         ])
         .split(vert[1])[1]
+}
+
+/// Shrink the session-list overlay rect to the rows that actually render
+/// list items when a footer `note` is present, mirroring the carve-out in
+/// [`render_session_list_overlay`]. `mouse::list_click_index` treats every
+/// row inside the border as list content, so hit-testing against the full
+/// overlay rect would map clicks on the note rows to (possibly scrolled
+/// off-screen) session indices. Keeping this next to
+/// [`session_list_overlay_area`] preserves the "same geometry, no stored
+/// state" contract for mouse handling.
+fn session_list_click_area(overlay_area: Rect, note: Option<&str>) -> Rect {
+    let Some(note) = note else {
+        return overlay_area;
+    };
+    let inner_width = overlay_area.width.saturating_sub(2);
+    let inner_height = overlay_area.height.saturating_sub(2);
+    let reserved = note_reserved_rows(note, inner_width);
+    if inner_height > reserved {
+        Rect::new(
+            overlay_area.x,
+            overlay_area.y,
+            overlay_area.width,
+            overlay_area.height - reserved,
+        )
+    } else {
+        // The render path keeps the full inner rect for the list when the
+        // note cannot fit; mirror that here.
+        overlay_area
+    }
 }
 
 /// Rows to reserve for the dim footer `note` so it renders in full when
@@ -7985,6 +8033,27 @@ mod tests {
         assert_eq!(request["method"], method::SESSION_LIST_ACP);
         respond_ok(&rpc, &request, serde_json::json!({ "sessions": [] }));
 
+        // No resumable ACP history for the single remaining agent: `init`
+        // must land in the disclosure-bearing agent picker rather than
+        // starting a session on its own, and it must do so *before* any
+        // further RPC goes out — proven here by `init` completing without a
+        // response to a `config/list` or `session/new` request.
+        let mut chat = tokio::time::timeout(Duration::from_secs(2), init)
+            .await
+            .expect("init should finish")
+            .unwrap();
+        let ChatPhase::PickAgent { agents, .. } = &chat.phase else {
+            panic!("stale carried resume should land in the agent picker, not auto-start");
+        };
+        assert_eq!(agents, &vec!["alpha".to_string()]);
+
+        // Confirming the single-item picker (mirrors pressing Enter) starts
+        // the fresh session for the now-only enabled agent.
+        let start = tokio::spawn(async move {
+            chat.pick_or_start_session("alpha").await;
+            chat
+        });
+
         let request =
             next_rpc_request(&mut rx, "fresh fallback should load todotracker config").await;
         assert_eq!(request["method"], method::CONFIG_LIST);
@@ -8011,9 +8080,9 @@ mod tests {
         assert_eq!(request["params"]["prefix"], "agents.alpha.model_provider");
         respond_ok(&rpc, &request, serde_json::json!([]));
 
-        let chat = tokio::time::timeout(Duration::from_secs(2), init)
+        let chat = tokio::time::timeout(Duration::from_secs(2), start)
             .await
-            .expect("init should finish")
+            .expect("session start should finish")
             .unwrap();
         let ChatPhase::Active(state) = chat.phase else {
             panic!("stale carried resume should still enter a fresh ACP session");
@@ -9428,6 +9497,152 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn acp_init_single_agent_no_history_shows_disclosure_before_session_start() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        // The single-agent counterpart of the no-saved-session boundary above:
+        // with exactly one enabled agent, `init` skips `show_agent_picker` and
+        // `try_show_recent_acp_session_picker` finds nothing to resume, so the
+        // old fall-through called `pick_or_start_session()` directly and never
+        // showed the disclosure. It must now land on the same
+        // disclosure-bearing agent picker as the multi-agent path, and it must
+        // do so *before* any `session/new` request goes out.
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+
+        let init = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "init should request agents/status").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
+                ]
+            }),
+        );
+
+        let request =
+            next_rpc_request(&mut rx, "single-agent init should check for saved sessions").await;
+        assert_eq!(request["method"], method::SESSION_LIST_ACP);
+        respond_ok(&rpc, &request, serde_json::json!({ "sessions": [] }));
+
+        // `init` must finish here without a `config/list` or `session/new`
+        // request ever going out: neither response was supplied above, so if
+        // `init` tried to start a session first this join would time out.
+        let mut chat = tokio::time::timeout(Duration::from_secs(2), init)
+            .await
+            .expect(
+                "single-agent no-history ACP init must land on the disclosure surface \
+                 without starting a session first",
+            )
+            .unwrap();
+        let ChatPhase::PickAgent {
+            agents, loading, ..
+        } = &chat.phase
+        else {
+            panic!("single-agent no-history ACP start must land in the agent picker");
+        };
+        assert_eq!(agents, &vec!["alpha".to_string()]);
+        assert!(!loading);
+
+        let area = Rect::new(0, 0, 100, 30);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| chat.draw(frame, area))
+            .expect("draw single-agent no-history agent picker");
+
+        let text = overlay_text(&terminal, area);
+        assert!(
+            text.contains("resumable") && text.contains("isolated"),
+            "single-agent Code start with no saved session must render the \
+             history-vs-persistent-memory disclosure before any session starts: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_init_single_agent_no_history_skips_disclosure_and_autostarts() {
+        // Companion to the ACP case above: the Chat pane must keep the
+        // original no-saved-session behavior unchanged — straight into the
+        // session, no agent-picker detour, and no Code-only disclosure ever
+        // in the picture, since Chat has no session history to disclose.
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+
+        let init = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "init should request agents/status").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
+                ]
+            }),
+        );
+
+        // Chat never checks for ACP session history, so the very next request
+        // must be the todotracker config fetch `start_session` fires directly
+        // — never a `session/list_acp` request, and never a detour through
+        // the agent picker.
+        let request = next_rpc_request(
+            &mut rx,
+            "Chat single-agent start should load todotracker config",
+        )
+        .await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        assert_eq!(request["params"]["prefix"], "todotracker");
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let request = next_rpc_request(
+            &mut rx,
+            "Chat single-agent start should mint a fresh session",
+        )
+        .await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["agent_alias"], "alpha");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-chat",
+                "workspace_dir": "/tmp/chat"
+            }),
+        );
+
+        let request =
+            next_rpc_request(&mut rx, "fresh Chat session should refresh model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), init)
+            .await
+            .expect("init should finish")
+            .unwrap();
+        let ChatPhase::Active(state) = chat.phase else {
+            panic!("Chat single-agent no-history start must go straight to an active session");
+        };
+        assert_eq!(state.session_id, "sess-chat");
+        assert_eq!(state.agent_alias, "alpha");
+    }
+
     #[test]
     fn note_reserved_rows_accounts_for_word_boundary_wrapping() {
         let note = crate::i18n::t("zc-chat-agent-picker-acp-memory-note");
@@ -9511,6 +9726,86 @@ mod tests {
             idx,
             offset + 2,
             "clicked row must map to offset + visible row, not the unscrolled index"
+        );
+    }
+
+    #[test]
+    fn resume_picker_footer_clicks_do_not_select_hidden_sessions() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+
+        // Enough saved sessions to overflow the visible list, so the rows
+        // hidden behind the footer note correspond to real (off-screen)
+        // session indices — the exact shape where a footer click used to
+        // move the selection to a hidden session.
+        let sessions: Vec<SessionEntry> = (0..40)
+            .map(|i| SessionEntry {
+                session_id: format!("sess-{i}"),
+                session_key: format!("sess-{i}"),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                last_activity: "2026-01-01T00:00:00Z".to_string(),
+                agent_alias: Some("agent".to_string()),
+                channel_id: None,
+                name: Some(format!("prompt {i}")),
+                message_count: 1,
+            })
+            .collect();
+
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+
+        // 80x24 default terminal: narrow enough that the resume note wraps.
+        let area = Rect::new(0, 0, 80, 24);
+        let overlay_area = session_list_overlay_area(area);
+        let note = crate::i18n::t("zc-chat-session-list-resume-note");
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_session_list_overlay(
+                    frame,
+                    area,
+                    &sessions,
+                    &mut list_state,
+                    crate::i18n::t("zc-chat-session-list-resume-title"),
+                    Some(note.clone()),
+                );
+            })
+            .expect("draw resume overlay");
+
+        let click_area = session_list_click_area(overlay_area, Some(&note));
+        let reserved = note_reserved_rows(&note, overlay_area.width.saturating_sub(2));
+        assert_eq!(
+            click_area.height,
+            overlay_area.height - reserved,
+            "click area must exclude exactly the reserved note rows"
+        );
+
+        // Every reserved footer row (the note area sits directly above the
+        // bottom border) must be dead for list hit-testing, while the same
+        // rows against the full overlay rect would have resolved to a session.
+        let offset = list_state.offset();
+        for row_from_bottom in 0..reserved {
+            let note_row = overlay_area.y + overlay_area.height - 2 - row_from_bottom;
+            assert!(
+                crate::mouse::list_click_index(note_row, click_area, offset, sessions.len())
+                    .is_none(),
+                "footer note row {note_row} must not resolve to a session index"
+            );
+            assert!(
+                crate::mouse::list_click_index(note_row, overlay_area, offset, sessions.len())
+                    .is_some(),
+                "regression precondition: the full overlay rect maps row {note_row} to a session"
+            );
+        }
+
+        // The last true list row must still be clickable through the shrunken rect.
+        let last_list_row = overlay_area.y + click_area.height - 2;
+        assert!(
+            crate::mouse::list_click_index(last_list_row, click_area, offset, sessions.len())
+                .is_some(),
+            "the final visible list row must remain clickable"
         );
     }
 
