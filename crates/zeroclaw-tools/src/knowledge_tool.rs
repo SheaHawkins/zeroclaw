@@ -1397,11 +1397,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_unowned_rows_stay_visible_to_every_agent() {
+    async fn legacy_unowned_rows_stay_hidden_until_assigned() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("knowledge.db");
         let graph = Arc::new(KnowledgeGraph::new(&db_path, 10000).unwrap());
-        // Seed a shared row the way migrated pre-attribution data looks.
+        // Seed an unowned row the way migrated pre-attribution data looks.
         graph
             .add_node(
                 &KnowledgeScope::unrestricted(),
@@ -1413,7 +1413,7 @@ mod tests {
             )
             .unwrap();
         let rowan = KnowledgeTool::new(Arc::clone(&graph), scope_for("rowan"));
-        let sable = KnowledgeTool::new(graph, scope_for("sable"));
+        let sable = KnowledgeTool::new(Arc::clone(&graph), scope_for("sable"));
 
         for tool in [&rowan, &sable] {
             let result = tool
@@ -1421,11 +1421,22 @@ mod tests {
                 .await
                 .unwrap();
             let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
-            assert_eq!(
-                output["count"], 1,
-                "legacy rows are shared with every agent"
-            );
+            assert_eq!(output["count"], 0, "unowned legacy rows fail closed");
         }
+
+        graph.prepare_legacy_ownership(Some("rowan")).unwrap();
+        let result = rowan
+            .execute(json!({ "action": "search", "query": "legacy pattern" }))
+            .await
+            .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["count"], 1);
+        let result = sable
+            .execute(json!({ "action": "search", "query": "legacy pattern" }))
+            .await
+            .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["count"], 0);
     }
 
     async fn capture_node(

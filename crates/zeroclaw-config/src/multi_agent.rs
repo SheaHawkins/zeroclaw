@@ -70,7 +70,8 @@ pub struct AgentWorkspaceConfig {
     pub read_memory_from: Vec<AgentAlias>,
     /// Cross-agent knowledge allowlist. Grants read access to the named
     /// siblings' knowledge-graph rows; an empty list keeps reads scoped
-    /// to this agent's own rows plus shared pre-attribution rows.
+    /// to this agent's own rows. Pre-attribution rows must first be assigned
+    /// through `knowledge.legacy_owner_agent` when ownership is ambiguous.
     pub read_knowledge_from: Vec<AgentAlias>,
 }
 

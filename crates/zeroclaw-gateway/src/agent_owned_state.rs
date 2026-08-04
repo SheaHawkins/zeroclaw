@@ -1,5 +1,5 @@
-//! Agent-deletion **owned-state** cascade— the non-config half of
-//! deleting an agent.
+//! Agent rename/delete **owned-state** cascades: the non-config half of
+//! changing an agent alias lifecycle.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -22,6 +22,7 @@ pub fn live_acp_session_count(config: &Config, alias: &str) -> anyhow::Result<us
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct OwnedStateReport {
     pub memory_purged: usize,
+    pub knowledge_purged: usize,
     pub cron_removed: usize,
     pub acp_removed: usize,
     pub sessions_cleared: usize,
@@ -74,6 +75,42 @@ pub async fn cascade_owned_state(
             warnings.push(format!("memory purge: {e}"));
             0
         }
+    };
+
+    // ── knowledge graph: export → archive → purge. The graph owns durable
+    // alias attribution, so it participates in the same canonical lifecycle
+    // cascade as memory/session state. Avoid creating an empty DB when the
+    // operator has never enabled knowledge.
+    let knowledge_path = config.knowledge.resolved_db_path();
+    let knowledge_purged = if knowledge_path.exists() {
+        match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &knowledge_path,
+            config.knowledge.max_nodes,
+        ) {
+            Ok(graph) => {
+                match graph.export_owner(alias) {
+                    Ok(rows) => {
+                        if let Ok(bytes) = serde_json::to_vec_pretty(&rows) {
+                            write_json(&cascade_dir.join("knowledge.json"), bytes).await;
+                        }
+                    }
+                    Err(e) => warnings.push(format!("knowledge export: {e}")),
+                }
+                match graph.purge_owner(alias) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        warnings.push(format!("knowledge purge: {e}"));
+                        0
+                    }
+                }
+            }
+            Err(e) => {
+                warnings.push(format!("knowledge graph open: {e}"));
+                0
+            }
+        }
+    } else {
+        0
     };
 
     // ── cron: list → archive → remove (cron_runs cascade off job_id) ─────────
@@ -150,6 +187,7 @@ pub async fn cascade_owned_state(
 
     let report = OwnedStateReport {
         memory_purged,
+        knowledge_purged,
         cron_removed,
         acp_removed,
         sessions_cleared,
@@ -161,6 +199,7 @@ pub async fn cascade_owned_state(
     let manifest = serde_json::json!({
         "alias": alias,
         "memory_rows": report.memory_purged,
+        "knowledge_rows": report.knowledge_purged,
         "cron_jobs": report.cron_removed,
         "acp_sessions": report.acp_removed,
         "sessions_cleared": report.sessions_cleared,
@@ -177,6 +216,7 @@ pub async fn cascade_owned_state(
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct RenameStateReport {
     pub memory_rows: usize,
+    pub knowledge_rows: usize,
     pub cron_jobs: usize,
     pub acp_sessions: usize,
     pub sessions_repointed: usize,
@@ -200,6 +240,28 @@ pub async fn cascade_rename_agent(
             warnings.push(format!("memory rename: {e}"));
             0
         }
+    };
+
+    let knowledge_path = config.knowledge.resolved_db_path();
+    let knowledge_rows = if knowledge_path.exists() {
+        match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &knowledge_path,
+            config.knowledge.max_nodes,
+        ) {
+            Ok(graph) => match graph.rename_owner(from, to) {
+                Ok(n) => n,
+                Err(e) => {
+                    warnings.push(format!("knowledge rename: {e}"));
+                    0
+                }
+            },
+            Err(e) => {
+                warnings.push(format!("knowledge graph open: {e}"));
+                0
+            }
+        }
+    } else {
+        0
     };
 
     let cron_jobs = match zeroclaw_runtime::cron::rename_jobs_by_agent(config, from, to) {
@@ -247,6 +309,7 @@ pub async fn cascade_rename_agent(
 
     RenameStateReport {
         memory_rows,
+        knowledge_rows,
         cron_jobs,
         acp_sessions,
         sessions_repointed,

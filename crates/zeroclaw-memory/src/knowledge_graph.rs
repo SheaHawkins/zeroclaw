@@ -3,7 +3,7 @@
 //! Every read and write goes through a [`KnowledgeScope`]: rows are stamped
 //! with the writing agent's alias and reads are filtered to rows the scope
 //! may see. Rows with no owner (`owner_agent IS NULL`) predate attribution
-//! and stay visible to every scope as a shared, read-only substrate.
+//! and remain hidden until startup can assign them to one explicit owner.
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -101,7 +101,7 @@ pub struct KnowledgeNode {
     pub source_project: Option<String>,
     /// Alias of the agent that captured this node. `None` marks rows
     /// created before attribution existed (or by the unrestricted
-    /// maintenance scope); those are visible to every agent.
+    /// maintenance scope); agent-scoped reads never expose those rows.
     pub owner_agent: Option<String>,
 }
 
@@ -140,8 +140,8 @@ pub struct GraphStats {
 #[derive(Debug, Clone)]
 pub enum KnowledgeScope {
     /// Operations run as one configured agent. Reads see rows owned by
-    /// that agent, unowned legacy/shared rows, and rows owned by any
-    /// alias in the read allowlist. Writes are stamped with the alias.
+    /// that agent and rows owned by any alias in the read allowlist.
+    /// Writes are stamped with the alias.
     Agent {
         alias: String,
         /// Aliases whose rows this scope may additionally read
@@ -149,10 +149,9 @@ pub enum KnowledgeScope {
         /// never grants writes on the sibling's behalf.
         read_from: Vec<String>,
     },
-    /// Maintenance scope: reads see every row; writes carry no owner
-    /// and therefore become shared rows visible to every agent. Not
-    /// wired to any agent-facing tool; intended for operator tooling,
-    /// migrations, and tests.
+    /// Maintenance scope: reads see every row; writes carry no owner.
+    /// Not wired to any agent-facing tool; intended for migrations and
+    /// tests. Unowned rows are fail-closed to every agent scope.
     Unrestricted,
 }
 
@@ -207,18 +206,12 @@ impl KnowledgeScope {
     fn visibility_sql(&self, column: &str, first_param: usize) -> (String, Vec<&str>) {
         match self.visible_owners() {
             None => ("1=1".to_string(), Vec::new()),
-            Some(owners) if owners.is_empty() => (format!("{column} IS NULL"), owners),
+            Some(owners) if owners.is_empty() => ("0=1".to_string(), owners),
             Some(owners) => {
                 let placeholders: Vec<String> = (0..owners.len())
                     .map(|i| format!("?{}", first_param + i))
                     .collect();
-                (
-                    format!(
-                        "({column} IS NULL OR {column} IN ({}))",
-                        placeholders.join(", ")
-                    ),
-                    owners,
-                )
+                (format!("{column} IN ({})", placeholders.join(", ")), owners)
             }
         }
     }
@@ -238,8 +231,8 @@ impl KnowledgeGraph {
     /// Databases created before owner attribution existed are migrated
     /// in place: nodes gain a nullable `owner_agent` column and the
     /// edges table is rebuilt with `owner_agent` in its primary key.
-    /// Pre-existing rows keep `NULL` owners and remain visible to every
-    /// scope.
+    /// Pre-existing rows keep `NULL` owners until
+    /// [`Self::prepare_legacy_ownership`] assigns them.
     pub fn new(db_path: &Path, max_nodes: usize) -> anyhow::Result<Self> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -314,10 +307,176 @@ impl KnowledgeGraph {
              CREATE INDEX IF NOT EXISTS idx_edges_owner ON edges(owner_agent);",
         )?;
 
+        // SQLite permits duplicate NULL values in a composite primary key.
+        // Old binaries omit `owner_agent`, so preserve their historical
+        // `INSERT OR IGNORE` idempotency across downgrade by enforcing the
+        // legacy three-column identity when the owner is NULL.
+        conn.execute_batch(
+            "DELETE FROM edges
+             WHERE owner_agent IS NULL
+               AND rowid NOT IN (
+                   SELECT MIN(rowid) FROM edges
+                   WHERE owner_agent IS NULL
+                   GROUP BY from_id, to_id, relation
+               );
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_owner_identity
+                 ON edges(from_id, to_id, relation, COALESCE(owner_agent, ''));",
+        )?;
+
         Ok(Self {
             conn: Mutex::new(conn),
             max_nodes,
         })
+    }
+
+    /// Resolve unattributed pre-upgrade rows before exposing an agent tool.
+    ///
+    /// `owner` is derived by the runtime from the canonical config: either the
+    /// sole enabled agent or the operator's explicit legacy-owner mapping. If
+    /// legacy rows exist and no owner can be established, initialization fails
+    /// closed so a multi-agent install cannot observe ambiguous historical
+    /// knowledge.
+    pub fn prepare_legacy_ownership(&self, owner: Option<&str>) -> anyhow::Result<usize> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("failed to begin legacy knowledge ownership assignment")?;
+        let unowned_nodes: usize = tx.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE owner_agent IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        let unowned_edges: usize = tx.query_row(
+            "SELECT COUNT(*) FROM edges WHERE owner_agent IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        let unowned = unowned_nodes + unowned_edges;
+        if unowned == 0 {
+            tx.commit()?;
+            return Ok(0);
+        }
+
+        let owner = owner
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "knowledge graph contains {unowned} unattributed legacy row(s); set knowledge.legacy_owner_agent to an enabled agent before enabling the tool in a multi-agent install"
+                ))
+            })?;
+
+        // A partially attributed database can already contain the target
+        // owner's copy of an edge. Keep that attributed row and remove the
+        // unowned duplicate before assigning the remaining legacy edges.
+        tx.execute(
+            "DELETE FROM edges AS legacy
+             WHERE legacy.owner_agent IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM edges AS owned
+                   WHERE owned.from_id = legacy.from_id
+                     AND owned.to_id = legacy.to_id
+                     AND owned.relation = legacy.relation
+                     AND owned.owner_agent = ?1
+               )",
+            params![owner],
+        )?;
+        let nodes = tx.execute(
+            "UPDATE nodes SET owner_agent = ?1 WHERE owner_agent IS NULL",
+            params![owner],
+        )?;
+        let edges = tx.execute(
+            "UPDATE edges SET owner_agent = ?1 WHERE owner_agent IS NULL",
+            params![owner],
+        )?;
+        tx.commit()
+            .context("failed to commit legacy knowledge ownership assignment")?;
+        Ok(nodes + edges)
+    }
+
+    /// Count graph rows durably owned by one agent alias.
+    pub fn count_owner(&self, alias: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.lock();
+        let nodes: usize = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE owner_agent = ?1",
+            params![alias],
+            |row| row.get(0),
+        )?;
+        let edges: usize = conn.query_row(
+            "SELECT COUNT(*) FROM edges WHERE owner_agent = ?1",
+            params![alias],
+            |row| row.get(0),
+        )?;
+        Ok(nodes + edges)
+    }
+
+    /// Re-point all graph ownership during the canonical agent rename cascade.
+    pub fn rename_owner(&self, from: &str, to: &str) -> anyhow::Result<usize> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("failed to begin knowledge ownership rename")?;
+        tx.execute(
+            "DELETE FROM edges AS old
+             WHERE old.owner_agent = ?1
+               AND EXISTS (
+                   SELECT 1 FROM edges AS new
+                   WHERE new.from_id = old.from_id
+                     AND new.to_id = old.to_id
+                     AND new.relation = old.relation
+                     AND new.owner_agent = ?2
+               )",
+            params![from, to],
+        )?;
+        let nodes = tx.execute(
+            "UPDATE nodes SET owner_agent = ?2 WHERE owner_agent = ?1",
+            params![from, to],
+        )?;
+        let edges = tx.execute(
+            "UPDATE edges SET owner_agent = ?2 WHERE owner_agent = ?1",
+            params![from, to],
+        )?;
+        tx.commit()
+            .context("failed to commit knowledge ownership rename")?;
+        Ok(nodes + edges)
+    }
+
+    /// Export the rows owned by an agent for the deletion archive.
+    pub fn export_owner(&self, alias: &str) -> anyhow::Result<serde_json::Value> {
+        let conn = self.conn.lock();
+        let mut node_stmt = conn.prepare(
+            "SELECT id, node_type, title, content, tags, created_at, updated_at, source_project, owner_agent
+             FROM nodes WHERE owner_agent = ?1 ORDER BY id",
+        )?;
+        let mut node_rows = node_stmt.query(params![alias])?;
+        let mut nodes = Vec::new();
+        while let Some(row) = node_rows.next()? {
+            nodes.push(row_to_node(row)?);
+        }
+        let mut edge_stmt = conn.prepare(
+            "SELECT from_id, to_id, relation FROM edges
+             WHERE owner_agent = ?1 ORDER BY from_id, to_id, relation",
+        )?;
+        let edges = edge_stmt
+            .query_map(params![alias], |row| {
+                let relation: String = row.get(2)?;
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, relation))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(serde_json::json!({ "nodes": nodes, "edges": edges }))
+    }
+
+    /// Remove graph rows owned by an agent during the canonical delete cascade.
+    pub fn purge_owner(&self, alias: &str) -> anyhow::Result<usize> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("failed to begin knowledge ownership purge")?;
+        let owned_edges = tx.execute("DELETE FROM edges WHERE owner_agent = ?1", params![alias])?;
+        let owned_nodes = tx.execute("DELETE FROM nodes WHERE owner_agent = ?1", params![alias])?;
+        tx.commit()
+            .context("failed to commit knowledge ownership purge")?;
+        Ok(owned_nodes + owned_edges)
     }
 
     /// Bring a pre-attribution database up to the owned schema. Runs in
@@ -340,8 +499,7 @@ impl KnowledgeGraph {
 
         if !Self::table_has_column(&tx, "edges", "owner_agent")? {
             // The primary key changes, so the table is rebuilt. Existing
-            // edges keep NULL owners and stay visible to every scope,
-            // matching the legacy-node treatment.
+            // Edges keep NULL owners until startup assigns the legacy graph.
             tx.execute_batch(
                 "CREATE TABLE edges_owner_migration (
                     from_id TEXT NOT NULL,
@@ -439,9 +597,8 @@ impl KnowledgeGraph {
 
     /// Add a directed edge between two nodes the scope can see. The edge
     /// is stamped with the scope's identity, so it is visible only to
-    /// scopes that may read the writer's rows; the shared legacy graph
-    /// is never extended in place. Adding an edge identical to one the
-    /// scope already sees is a no-op.
+    /// scopes that may read the writer's rows. Adding an edge identical
+    /// to one the scope already sees is a no-op.
     pub fn add_edge(
         &self,
         scope: &KnowledgeScope,
@@ -471,7 +628,7 @@ impl KnowledgeGraph {
         }
 
         // Idempotence within the scope: if an identical edge is already
-        // visible (own, legacy, or shared-in), adding it again is a
+        // visible (own or shared-in), adding it again is a
         // no-op rather than a per-owner duplicate.
         let (vis_edge, edge_params) = scope.visibility_sql("owner_agent", 4);
         let dup_sql = format!(
@@ -1630,18 +1787,19 @@ mod tests {
     }
 
     #[test]
-    fn legacy_rows_are_visible_to_every_agent_but_additions_stay_private() {
-        let (_tmp, graph, rowan) = test_graph();
+    fn legacy_rows_fail_closed_until_assigned_to_one_agent() {
+        let (_tmp, graph, _unused) = test_graph();
+        let rowan = agent("rowan");
         let sable = agent("sable");
         let admin = KnowledgeScope::unrestricted();
 
-        // Unrestricted writes carry no owner: the shared substrate.
+        // Unrestricted writes model unattributed pre-upgrade rows.
         let shared_a = graph
             .add_node(
                 &admin,
                 NodeType::Pattern,
                 "Shared pattern",
-                "visible to all",
+                "legacy row",
                 &["shared".into()],
                 None,
             )
@@ -1651,26 +1809,34 @@ mod tests {
                 &admin,
                 NodeType::Technology,
                 "Shared tech",
-                "visible to all",
+                "legacy row",
                 &["shared".into()],
                 None,
             )
             .unwrap();
 
+        graph
+            .add_edge(&admin, &shared_a, &shared_b, Relation::Uses)
+            .unwrap();
         for scope in [&rowan, &sable] {
-            let node = graph.get_node(scope, &shared_a).unwrap().unwrap();
-            assert_eq!(node.owner_agent, None);
-            assert_eq!(
+            assert!(graph.get_node(scope, &shared_a).unwrap().is_none());
+            assert!(
                 graph
                     .query_by_tags(scope, &["shared".into()])
                     .unwrap()
-                    .len(),
-                2
+                    .is_empty()
             );
         }
+        let err = graph.prepare_legacy_ownership(None).unwrap_err();
+        assert!(err.to_string().contains("legacy_owner_agent"));
 
-        // Each agent may relate legacy nodes, but the edge stays private
-        // to its writer: the shared view is read-only.
+        assert_eq!(graph.prepare_legacy_ownership(Some("rowan")).unwrap(), 3);
+        let node = graph.get_node(&rowan, &shared_a).unwrap().unwrap();
+        assert_eq!(node.owner_agent.as_deref(), Some("rowan"));
+        assert!(graph.get_node(&sable, &shared_a).unwrap().is_none());
+        assert_eq!(graph.find_outbound(&rowan, &shared_a, 10).unwrap().len(), 1);
+
+        // The assigned graph behaves like any other private agent state.
         graph
             .add_edge(&rowan, &shared_a, &shared_b, Relation::Uses)
             .unwrap();
@@ -1679,8 +1845,7 @@ mod tests {
             graph
                 .find_outbound(&sable, &shared_a, 10)
                 .unwrap()
-                .is_empty(),
-            "one agent's edge over legacy nodes must not appear in another agent's view"
+                .is_empty()
         );
     }
 
@@ -1742,23 +1907,16 @@ mod tests {
     #[test]
     fn duplicate_edges_across_scopes_collapse_for_joint_readers() {
         let (_tmp, graph, _unused) = test_graph();
-        let admin = KnowledgeScope::unrestricted();
-        let rowan = agent("rowan");
-        let sable = agent("sable");
-        let carol = agent_reading_from("carol", &["rowan", "sable"]);
+        let seed = agent("seed");
+        let rowan = agent_reading_from("rowan", &["seed"]);
+        let sable = agent_reading_from("sable", &["seed"]);
+        let carol = agent_reading_from("carol", &["seed", "rowan", "sable"]);
 
         let a = graph
-            .add_node(&admin, NodeType::Pattern, "Legacy A", "shared", &[], None)
+            .add_node(&seed, NodeType::Pattern, "Seed A", "shared", &[], None)
             .unwrap();
         let b = graph
-            .add_node(
-                &admin,
-                NodeType::Technology,
-                "Legacy B",
-                "shared",
-                &[],
-                None,
-            )
+            .add_node(&seed, NodeType::Technology, "Seed B", "shared", &[], None)
             .unwrap();
 
         // Rowan and sable independently record the same relation; each
@@ -1782,9 +1940,10 @@ mod tests {
 
     #[test]
     fn subgraph_traversal_does_not_bridge_through_foreign_regions() {
-        let (_tmp, graph, rowan) = test_graph();
-        let admin = KnowledgeScope::unrestricted();
-        let sable = agent("sable");
+        let (_tmp, graph, _unused) = test_graph();
+        let seed = agent("seed");
+        let rowan = agent_reading_from("rowan", &["seed"]);
+        let sable = agent_reading_from("sable", &["seed"]);
 
         // Layout: rowan_node -> shared (rowan's edge), and sable's own
         // chain shared -> sable_private (sable's edge).
@@ -1792,7 +1951,7 @@ mod tests {
             .add_node(&rowan, NodeType::Pattern, "Rowan node", "mine", &[], None)
             .unwrap();
         let shared = graph
-            .add_node(&admin, NodeType::Technology, "Shared", "legacy", &[], None)
+            .add_node(&seed, NodeType::Technology, "Shared", "shared", &[], None)
             .unwrap();
         let sable_private = graph
             .add_node(
@@ -1953,7 +2112,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_preserves_legacy_rows_as_shared_and_is_idempotent() {
+    fn migration_assigns_legacy_rows_to_one_owner_and_is_idempotent() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("knowledge.db");
         let (id_a, id_b) = legacy_database(&db_path);
@@ -1961,16 +2120,19 @@ mod tests {
         let graph = KnowledgeGraph::new(&db_path, 1000).unwrap();
         let rowan = agent("rowan");
 
-        // Legacy nodes and their edge survive with no owner, visible to
-        // any agent scope.
+        assert!(graph.get_node(&rowan, &id_a).unwrap().is_none());
+        assert!(graph.prepare_legacy_ownership(None).is_err());
+        assert_eq!(graph.prepare_legacy_ownership(Some("rowan")).unwrap(), 3);
+
+        // Legacy nodes and their edge survive and belong only to the selected
+        // owner. FTS remains intact after attribution.
         let node = graph.get_node(&rowan, &id_a).unwrap().unwrap();
-        assert_eq!(node.owner_agent, None);
+        assert_eq!(node.owner_agent.as_deref(), Some("rowan"));
         assert_eq!(node.title, "Legacy pattern");
         let neighbors = graph.find_outbound(&rowan, &id_a, 10).unwrap();
         assert_eq!(neighbors.len(), 1);
         assert_eq!(neighbors[0].0.id, id_b);
 
-        // Legacy rows are searchable (FTS index intact after rebuild).
         assert!(
             !graph
                 .query_by_similarity(&rowan, "legacy content", 10)
@@ -1995,10 +2157,63 @@ mod tests {
 
         // Reopening (running the migration path again) changes nothing.
         let graph = KnowledgeGraph::new(&db_path, 1000).unwrap();
+        assert_eq!(graph.prepare_legacy_ownership(None).unwrap(), 0);
         let stats = graph.stats(&agent("sable")).unwrap();
-        assert_eq!(stats.total_nodes, 2, "sable sees the two legacy nodes only");
-        assert_eq!(stats.total_edges, 1);
+        assert_eq!(stats.total_nodes, 0);
+        assert_eq!(stats.total_edges, 0);
         assert_eq!(graph.stats(&rowan).unwrap().total_nodes, 3);
+    }
+
+    #[test]
+    fn migrated_schema_preserves_old_insert_or_ignore_idempotency() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("knowledge.db");
+        let (id_a, id_b) = legacy_database(&db_path);
+        drop(KnowledgeGraph::new(&db_path, 1000).unwrap());
+
+        // Simulate a downgraded pre-attribution binary: its insert omits the
+        // owner column and relies on INSERT OR IGNORE for idempotency.
+        let conn = Connection::open(&db_path).unwrap();
+        for _ in 0..2 {
+            conn.execute(
+                "INSERT OR IGNORE INTO edges (from_id, to_id, relation) VALUES (?1, ?2, 'uses')",
+                params![id_a, id_b],
+            )
+            .unwrap();
+        }
+        let count: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE from_id = ?1 AND to_id = ?2 AND relation = 'uses'",
+                params![id_a, id_b],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn rename_and_delete_follow_durable_owner_lifecycle() {
+        let (_tmp, graph, _unused) = test_graph();
+        let rowan = agent("rowan");
+        let a = graph
+            .add_node(&rowan, NodeType::Pattern, "A", "owned", &[], None)
+            .unwrap();
+        let b = graph
+            .add_node(&rowan, NodeType::Technology, "B", "owned", &[], None)
+            .unwrap();
+        graph.add_edge(&rowan, &a, &b, Relation::Uses).unwrap();
+
+        assert_eq!(graph.rename_owner("rowan", "renamed").unwrap(), 3);
+        assert_eq!(graph.count_owner("rowan").unwrap(), 0);
+        assert_eq!(graph.count_owner("renamed").unwrap(), 3);
+        assert!(graph.get_node(&agent("renamed"), &a).unwrap().is_some());
+        assert!(graph.get_node(&rowan, &a).unwrap().is_none());
+
+        let export = graph.export_owner("renamed").unwrap();
+        assert_eq!(export["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(export["edges"].as_array().unwrap().len(), 1);
+        assert_eq!(graph.purge_owner("renamed").unwrap(), 3);
+        assert_eq!(graph.count_owner("renamed").unwrap(), 0);
     }
 
     #[test]

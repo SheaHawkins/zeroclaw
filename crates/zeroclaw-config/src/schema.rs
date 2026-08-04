@@ -8214,6 +8214,11 @@ pub struct KnowledgeConfig {
     /// Maximum number of knowledge nodes. Default: 100000.
     #[serde(default = "default_knowledge_max_nodes")]
     pub max_nodes: usize,
+    /// Agent that receives unattributed rows from a pre-attribution database.
+    /// Required only when more than one agent is enabled and legacy rows exist;
+    /// a sole enabled agent is selected automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_owner_agent: Option<crate::multi_agent::AgentAlias>,
     /// Automatically capture knowledge from conversations. Default: false.
     #[serde(default)]
     pub auto_capture: bool,
@@ -8236,9 +8241,19 @@ impl Default for KnowledgeConfig {
             enabled: false,
             db_path: default_knowledge_db_path(),
             max_nodes: default_knowledge_max_nodes(),
+            legacy_owner_agent: None,
             auto_capture: false,
             suggest_on_query: true,
         }
+    }
+}
+
+impl KnowledgeConfig {
+    /// Resolve the configured SQLite path once for every runtime and
+    /// lifecycle consumer.
+    #[must_use]
+    pub fn resolved_db_path(&self) -> PathBuf {
+        expand_tilde_path(&self.db_path)
     }
 }
 
@@ -20620,6 +20635,23 @@ impl Config {
                     "knowledge.db_path",
                     "knowledge.db_path must not be empty"
                 );
+            }
+            if let Some(owner) = self.knowledge.legacy_owner_agent.as_ref() {
+                let owner = owner.as_str();
+                let Some(agent) = self.agents.get(owner) else {
+                    validation_bail!(
+                        DanglingReference,
+                        "knowledge.legacy_owner_agent",
+                        "knowledge.legacy_owner_agent points at agents.{owner}, which is not configured"
+                    );
+                };
+                if !agent.enabled {
+                    validation_bail!(
+                        InvalidFormat,
+                        "knowledge.legacy_owner_agent",
+                        "knowledge.legacy_owner_agent points at agents.{owner}, which is disabled"
+                    );
+                }
             }
         }
 
@@ -36221,6 +36253,35 @@ allowed_users = []
         config
             .validate()
             .expect("sibling grant must pass validation regardless of memory backend");
+    }
+
+    #[test]
+    async fn validate_rejects_dangling_legacy_knowledge_owner() {
+        let mut config = multi_agent_test_config();
+        config.knowledge.enabled = true;
+        config.knowledge.legacy_owner_agent = Some(crate::multi_agent::AgentAlias::new("ghost"));
+        let err = config
+            .validate()
+            .expect_err("legacy owner must resolve to a configured agent");
+        assert!(err.to_string().contains("knowledge.legacy_owner_agent"));
+    }
+
+    #[test]
+    async fn validate_rejects_disabled_legacy_knowledge_owner() {
+        let mut config = multi_agent_test_config();
+        config.knowledge.enabled = true;
+        config.agents.insert(
+            "sleeping".to_string(),
+            AliasedAgentConfig {
+                enabled: false,
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.knowledge.legacy_owner_agent = Some(crate::multi_agent::AgentAlias::new("sleeping"));
+        let err = config
+            .validate()
+            .expect_err("legacy owner must be runtime-enabled");
+        assert!(err.to_string().contains("which is disabled"));
     }
 
     #[test]

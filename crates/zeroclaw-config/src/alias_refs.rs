@@ -424,6 +424,14 @@ fn scrub_agent_refs(cfg: &mut Config, alias: &str) {
     if clear_acp {
         cfg.acp.default_agent = None;
     }
+    if cfg
+        .knowledge
+        .legacy_owner_agent
+        .as_ref()
+        .is_some_and(|owner| owner.as_str() == alias)
+    {
+        cfg.knowledge.legacy_owner_agent = None;
+    }
     for agent in cfg.agents.values_mut() {
         agent.delegates.retain(|d| d.agent().trim() != alias); // trimmed (validate trims)
         agent.workspace.access.retain(|k, _| k.as_str() != alias); // raw
@@ -711,6 +719,15 @@ fn rewrite_agent_refs(cfg: &mut Config, old: &str, new: &str) -> Vec<String> {
     if hit_acp {
         cfg.acp.default_agent = Some(new.to_string());
         dirty.push("acp.default_agent".to_string());
+    }
+    if cfg
+        .knowledge
+        .legacy_owner_agent
+        .as_ref()
+        .is_some_and(|owner| owner.as_str() == old)
+    {
+        cfg.knowledge.legacy_owner_agent = Some(AgentAlias::new(new));
+        dirty.push("knowledge.legacy_owner_agent".to_string());
     }
     for (name, agent) in cfg.agents.iter_mut() {
         let mut touched = false;
@@ -1213,6 +1230,15 @@ fn collect_agent_refs(cfg: &Config, alias: &str, sites: &mut Vec<RefSite>) {
             da,
         ));
     }
+    if let Some(owner) = cfg.knowledge.legacy_owner_agent.as_ref()
+        && owner.as_str() == alias
+    {
+        sites.push(RefSite::soft(
+            "knowledge.legacy_owner_agent".to_string(),
+            ScrubAction::ClearOptional,
+            owner.as_str(),
+        ));
+    }
     for (name, agent) in sorted_agents(cfg) {
         // delegates[].agent — validate() trims.
         for (i, d) in agent.delegates.iter().enumerate() {
@@ -1437,6 +1463,7 @@ mod tests {
         cfg.heartbeat.enabled = true;
         cfg.heartbeat.agent = "bot".to_string();
         cfg.acp.default_agent = Some("bot".to_string());
+        cfg.knowledge.legacy_owner_agent = Some(AgentAlias::new("bot"));
         let mut referrer = AliasedAgentConfig {
             delegates: vec![DelegateTargetConfig::bounded("bot")],
             ..Default::default()
@@ -1461,10 +1488,10 @@ mod tests {
 
         let report = plan_delete(&cfg, &AliasKind::Agent, "bot");
         // heartbeat (hard) + delegates + access + read_memory_from +
-        // read_knowledge_from + peer member + acp
+        // read_knowledge_from + peer member + acp + legacy knowledge owner
         assert_eq!(report.blockers.len(), 1);
         assert_eq!(report.blockers[0].path, "heartbeat.agent");
-        assert_eq!(report.scrubs.len(), 6);
+        assert_eq!(report.scrubs.len(), 7);
         assert!(!report.allowed);
     }
 
@@ -2067,6 +2094,7 @@ mod tests {
         cfg.heartbeat.enabled = false; // disabled → heartbeat.agent is a SOFT ref
         cfg.heartbeat.agent = "bot".to_string();
         cfg.acp.default_agent = Some("bot".to_string());
+        cfg.knowledge.legacy_owner_agent = Some(AgentAlias::new("bot"));
         let mut lead = AliasedAgentConfig {
             delegates: vec![DelegateTargetConfig::bounded("bot")],
             ..Default::default()
@@ -2094,11 +2122,12 @@ mod tests {
             CascadePolicy::RefuseOnHard,
         )
         .expect("soft-only agent delete succeeds");
-        assert_eq!(report.applied.len(), 7);
+        assert_eq!(report.applied.len(), 8);
         assert_eq!(report.deleted_entry.as_deref(), Some("agents.bot"));
         assert!(!cfg.agents.contains_key("bot"));
         assert!(cfg.heartbeat.agent.is_empty());
         assert!(cfg.acp.default_agent.is_none());
+        assert!(cfg.knowledge.legacy_owner_agent.is_none());
         assert!(cfg.agents["lead"].delegates.is_empty());
         assert!(cfg.agents["lead"].workspace.access.is_empty());
         assert!(cfg.agents["lead"].workspace.read_memory_from.is_empty());
@@ -2151,12 +2180,20 @@ mod tests {
         cfg.agents
             .insert("bot".to_string(), AliasedAgentConfig::default());
         cfg.acp.default_agent = Some("bot".to_string());
+        cfg.knowledge.legacy_owner_agent = Some(AgentAlias::new("bot"));
         let report =
             delete_with_cascade(&mut cfg, &AliasKind::Agent, "bot", CascadePolicy::DryRun).unwrap();
         assert!(report.deleted_entry.is_none());
-        assert_eq!(report.plan.scrubs.len(), 1);
+        assert_eq!(report.plan.scrubs.len(), 2);
         assert!(cfg.agents.contains_key("bot"));
         assert_eq!(cfg.acp.default_agent.as_deref(), Some("bot"));
+        assert_eq!(
+            cfg.knowledge
+                .legacy_owner_agent
+                .as_ref()
+                .map(AgentAlias::as_str),
+            Some("bot")
+        );
     }
 
     #[test]
@@ -2409,6 +2446,7 @@ mod tests {
         cfg.heartbeat.enabled = true;
         cfg.heartbeat.agent = "bot".to_string(); // HARD ref — rename rewrites it
         cfg.acp.default_agent = Some("bot".to_string());
+        cfg.knowledge.legacy_owner_agent = Some(AgentAlias::new("bot"));
         // The renamed agent itself self-delegates (must be rewritten too).
         let mut bot = AliasedAgentConfig {
             delegates: vec![DelegateTargetConfig::bounded("bot")],
@@ -2444,6 +2482,13 @@ mod tests {
         // every ref now names bot2
         assert_eq!(cfg.heartbeat.agent, "bot2");
         assert_eq!(cfg.acp.default_agent.as_deref(), Some("bot2"));
+        assert_eq!(
+            cfg.knowledge
+                .legacy_owner_agent
+                .as_ref()
+                .map(AgentAlias::as_str),
+            Some("bot2")
+        );
         assert_eq!(
             cfg.agents["bot2"].delegates,
             vec![DelegateTargetConfig::bounded("bot2")]
@@ -2483,6 +2528,7 @@ mod tests {
         for expected in [
             "heartbeat.agent",
             "acp.default_agent",
+            "knowledge.legacy_owner_agent",
             "agents.bot", // old entry removed on disk
             "agents.bot2",
             "agents.lead",
