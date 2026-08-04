@@ -2227,6 +2227,7 @@ mod tests {
         root_config.channels.discord.insert(
             "oracle".to_string(),
             zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
                 archive: true,
                 ..Default::default()
             },
@@ -2316,6 +2317,15 @@ mod tests {
         root_config.channels.discord.insert(
             "oracle".to_string(),
             zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                archive: true,
+                ..Default::default()
+            },
+        );
+        root_config.channels.discord.insert(
+            "disabled".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: false,
                 archive: true,
                 ..Default::default()
             },
@@ -2333,6 +2343,19 @@ mod tests {
                 channels: vec!["telegram.main".into()],
                 ..Default::default()
             },
+        );
+        root_config.agents.insert(
+            "disabled_only".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["discord.disabled".into()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            root_config.channel_refs_owned_by_agent("owner"),
+            vec!["discord.oracle"],
+            "the shared ownership resolver must expose the enabled archive alias; aliases={:?}",
+            root_config.channels_by_alias()
         );
 
         let build = |agent_alias: &str| {
@@ -2373,6 +2396,10 @@ mod tests {
             .iter()
             .map(|t| t.name().to_string())
             .collect();
+        let disabled_names: Vec<String> = build("disabled_only")
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
 
         assert!(
             owner_names.iter().any(|n| n == "discord_search"),
@@ -2381,6 +2408,10 @@ mod tests {
         assert!(
             !bystander_names.iter().any(|n| n == "discord_search"),
             "an agent without an archiving Discord binding must not get discord_search"
+        );
+        assert!(
+            !disabled_names.iter().any(|n| n == "discord_search"),
+            "an agent bound only to a disabled Discord alias must not get discord_search"
         );
     }
 

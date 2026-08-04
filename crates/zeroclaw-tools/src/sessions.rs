@@ -4,11 +4,15 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::fmt::Write;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_infra::session_backend::{SessionBackend, SessionMetadata};
+
+static SESSIONS_LIST_DESCRIPTION: OnceLock<String> = OnceLock::new();
+static SESSIONS_HISTORY_DESCRIPTION: OnceLock<String> = OnceLock::new();
+static SESSIONS_SEND_DESCRIPTION: OnceLock<String> = OnceLock::new();
 
 /// Validate that a session ID is non-empty and contains at least one
 /// alphanumeric character (prevents blank keys after sanitization).
@@ -177,7 +181,9 @@ impl Tool for SessionsListTool {
     }
 
     fn description(&self) -> &str {
-        "List this agent's active conversation sessions with their channel, last activity time, and message count."
+        SESSIONS_LIST_DESCRIPTION
+            .get_or_init(|| crate::i18n::get_required_tool_string("tool-sessions-list"))
+            .as_str()
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -289,7 +295,9 @@ impl Tool for SessionsHistoryTool {
     }
 
     fn description(&self) -> &str {
-        "Read the message history of a specific session by its session ID. Returns the last N messages. Only sessions this agent owns are readable."
+        SESSIONS_HISTORY_DESCRIPTION
+            .get_or_init(|| crate::i18n::get_required_tool_string("tool-sessions-history"))
+            .as_str()
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -429,7 +437,9 @@ impl Tool for SessionsSendTool {
     }
 
     fn description(&self) -> &str {
-        "Send a message to a specific session by its session ID. The message is appended to the session's conversation history as a 'user' message. Only sessions this agent owns are writable."
+        SESSIONS_SEND_DESCRIPTION
+            .get_or_init(|| crate::i18n::get_required_tool_string("tool-sessions-send"))
+            .as_str()
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1105,6 +1115,7 @@ mod tests {
         let (_tmp, backend) = test_backend();
         let tool = SessionsListTool::new(backend, test_security());
         assert_eq!(tool.name(), "sessions_list");
+        assert!(tool.description().contains("this agent's active"));
         assert!(tool.parameters_schema()["properties"]["limit"].is_object());
     }
 
