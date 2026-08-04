@@ -1,5 +1,5 @@
 //! Authenticated webhook ingress: the typed boundary between transport-level
-//! request verification and shared channel-message dispatch.
+//! request verification and shared gateway-webhook dispatch.
 //!
 //! Channel webhook handlers used to treat "this request was verified" as a
 //! per-handler convention: each handler carried its own signature check and
@@ -16,10 +16,12 @@
 //!   stays with the transport adapter as a closure, but the closure only runs
 //!   after the credential resolves, and only over the exact bytes the proof
 //!   will carry.
-//! - [`dispatch_verified_webhook`] is the single shared lifecycle (inbound
-//!   log, session key, autosave, agent chat, reply/error delivery) and it
-//!   consumes the proof, so a webhook message cannot enter agent dispatch
-//!   without a successful verification result for the same request body.
+//! - [`dispatch_verified_webhook`] is the shared gateway-webhook helper for
+//!   the current inbound log, session key, autosave, agent chat, and
+//!   reply/error-delivery path. It consumes the proof, so a webhook message
+//!   cannot enter agent dispatch without a successful verification result for
+//!   the same request body. It remains an intermediate boundary until gateway
+//!   webhooks enter the shared channel turn lifecycle.
 //! - [`MESSAGE_DISPATCHING_WEBHOOKS`] is the canonical registry of every
 //!   message-dispatching webhook adapter and its authentication mode.
 //!   [`authenticate`] refuses specs that are not registered, and the drift
@@ -28,8 +30,8 @@
 //! Transport adapters keep ownership of route and alias resolution, signature
 //! algorithms and header formats, challenge/verification endpoints, body
 //! decoding, payload parsing, and HTTP response policy for non-authentication
-//! failures. This module owns only the trust decision and the post-trust
-//! message lifecycle.
+//! failures. This module owns only the trust decision and the current
+//! gateway-specific post-trust dispatch path.
 
 use std::sync::Arc;
 
@@ -76,7 +78,7 @@ pub(crate) struct WebhookAdapterSpec {
     /// Only used to report "missing" vs "invalid" in refusal logs.
     pub(crate) signature_header: Option<&'static str>,
     /// Router paths (POST) whose requests dispatch inbound messages.
-    #[allow(dead_code)] // Contract data; only the drift-guard tests read it.
+    #[cfg(test)]
     pub(crate) dispatch_routes: &'static [&'static str],
 }
 
@@ -87,6 +89,7 @@ pub(crate) static WHATSAPP_WEBHOOK: WebhookAdapterSpec = WebhookAdapterSpec {
         display: "app_secret",
     },
     signature_header: Some("X-Hub-Signature-256"),
+    #[cfg(test)]
     dispatch_routes: &["/whatsapp", "/whatsapp/{alias}"],
 };
 
@@ -97,6 +100,7 @@ pub(crate) static LINQ_WEBHOOK: WebhookAdapterSpec = WebhookAdapterSpec {
         display: "signing_secret",
     },
     signature_header: Some("X-Webhook-Signature"),
+    #[cfg(test)]
     dispatch_routes: &["/linq", "/linq/{alias}"],
 };
 
@@ -107,6 +111,7 @@ pub(crate) static WATI_WEBHOOK: WebhookAdapterSpec = WebhookAdapterSpec {
         reason: "inbound webhooks cannot be authenticated; refusing to dispatch",
     },
     signature_header: None,
+    #[cfg(test)]
     dispatch_routes: &["/wati", "/wati/{alias}"],
 };
 
@@ -117,6 +122,7 @@ pub(crate) static NEXTCLOUD_TALK_WEBHOOK: WebhookAdapterSpec = WebhookAdapterSpe
         display: "bot secret",
     },
     signature_header: Some("X-Nextcloud-Talk-Signature"),
+    #[cfg(test)]
     dispatch_routes: &["/nextcloud-talk", "/nextcloud-talk/{alias}"],
 };
 
@@ -320,7 +326,7 @@ pub(crate) fn refuse_unverifiable(
     IngressRefusal::Unverifiable.into_response(spec)
 }
 
-/// Whether the shared lifecycle blocks the webhook response on dispatch.
+/// Whether the shared gateway-webhook helper blocks the response on dispatch.
 pub(crate) enum WebhookDispatchMode {
     /// Process every message before acknowledging the webhook.
     Synchronous,
@@ -329,7 +335,7 @@ pub(crate) enum WebhookDispatchMode {
     FastAck,
 }
 
-/// Handler-supplied wiring for the shared dispatch lifecycle.
+/// Handler-supplied wiring for the shared gateway-webhook dispatch helper.
 pub(crate) struct WebhookDispatchContext {
     /// Reply-delivery channel for agent responses and error fallbacks.
     pub(crate) channel: Arc<dyn Channel>,
@@ -342,12 +348,14 @@ pub(crate) struct WebhookDispatchContext {
     pub(crate) mode: WebhookDispatchMode,
 }
 
-/// The shared webhook message lifecycle: inbound log, session key, autosave,
-/// agent chat, reply delivery, quickstart/error fallback.
+/// The shared gateway-webhook dispatch helper: inbound log, session key,
+/// autosave, agent chat, reply delivery, and quickstart/error fallback.
 ///
 /// Consuming [`VerifiedWebhookIngress`] is the contract: this is the only
 /// path from a channel webhook into gateway agent chat, and it is
 /// unreachable without a successful [`authenticate`] result for the request.
+/// This helper still uses the gateway chat path; it does not replace the
+/// shared channel turn lifecycle.
 pub(crate) async fn dispatch_verified_webhook(
     state: &AppState,
     ingress: VerifiedWebhookIngress,
@@ -401,7 +409,7 @@ pub(crate) async fn dispatch_verified_webhook(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
-/// One verified message through the shared lifecycle.
+/// One verified message through the shared gateway-webhook dispatch helper.
 async fn process_verified_message(
     state: &AppState,
     spec: &'static WebhookAdapterSpec,

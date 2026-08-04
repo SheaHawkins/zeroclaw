@@ -105,7 +105,10 @@ clearest example because slow local models can exceed provider webhook
 timeouts.
 
 That fast acknowledgement requirement should not make the gateway own a
-separate agent lifecycle. A webhook handler follows a fixed order:
+separate agent lifecycle. The current gateway-backed handlers still use a
+gateway-specific post-verification dispatch path. Treat that as migration debt
+and transition context, not as the target pattern for new webhook-backed
+channel work. A webhook handler follows a fixed order:
 
 1. verify the request;
 2. decode the payload;
@@ -127,11 +130,20 @@ authenticated-ingress contract:
   after the credential resolves;
 - a successful check mints a `VerifiedWebhookIngress` proof that carries the
   verified bytes. The proof cannot be constructed or cloned elsewhere;
-- `dispatch_verified_webhook` is the one shared message lifecycle (inbound
-  log, session key, autosave, agent dispatch, quickstart fallback,
-  reply/error delivery, synchronous or fast-ack execution) and it consumes
-  the proof, so webhook content cannot enter agent dispatch without a
-  verification result for the same request.
+- `dispatch_verified_webhook` is the shared gateway-webhook helper for the
+  current inbound log, session key, autosave, agent dispatch, quickstart
+  fallback, reply/error delivery, and synchronous or fast-ack execution. It
+  consumes the proof, so webhook content cannot enter agent dispatch without
+  a verification result for the same request.
+
+That helper removes the duplicated gateway `parse -> autosave -> chat -> send`
+chains and gives authenticated ingress one enforced chokepoint. It still calls
+the gateway chat path, however, so it is not the shared channel turn lifecycle
+described above. Gateway webhooks still need to converge on that lifecycle for
+hooks, self-loop control, passive context, media/link handling, runtime
+commands, cancellation, reply intent, receipts, and cost tracking. That future
+convergence must preserve the authenticated-ingress proof and each transport's
+synchronous or fast-ack response behavior.
 
 An adapter with no inbound credential mechanism does not get optional
 verification; its registry entry is declared unverifiable and every dispatch
@@ -144,9 +156,11 @@ handlers separately:
   behavior, autosave keys, and reply delivery;
 - fast-ack handlers must prove the HTTP acknowledgement happens before the
   model call can block the provider timeout;
-- both shapes must enter dispatch through `dispatch_verified_webhook` rather
-  than adding another `parse -> autosave -> chat -> send` chain. A pinned
-  callsite inventory fails the build when a handler bypasses the funnel.
+- while the gateway-specific path remains, both shapes must enter dispatch
+  through `dispatch_verified_webhook` rather than adding another
+  `parse -> autosave -> chat -> send` chain. A pinned callsite inventory fails
+  the build when a handler bypasses the authenticated funnel. This requirement
+  does not make the helper the target channel lifecycle.
 
 ## Reload and listener lifecycle
 
