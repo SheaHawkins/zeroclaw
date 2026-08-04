@@ -431,6 +431,10 @@ fn scrub_agent_refs(cfg: &mut Config, alias: &str) {
             .workspace
             .read_memory_from
             .retain(|m| m.as_str() != alias); // raw
+        agent
+            .workspace
+            .read_knowledge_from
+            .retain(|m| m.as_str() != alias); // raw
     }
     for group in cfg.peer_groups.values_mut() {
         group.agents.retain(|m| m.as_str() != alias); // raw
@@ -723,6 +727,13 @@ fn rewrite_agent_refs(cfg: &mut Config, old: &str, new: &str) -> Vec<String> {
         }
         // workspace.read_memory_from[] (raw match).
         for m in agent.workspace.read_memory_from.iter_mut() {
+            if m.as_str() == old {
+                *m = AgentAlias::new(new);
+                touched = true;
+            }
+        }
+        // workspace.read_knowledge_from[] (raw match).
+        for m in agent.workspace.read_knowledge_from.iter_mut() {
             if m.as_str() == old {
                 *m = AgentAlias::new(new);
                 touched = true;
@@ -1232,6 +1243,16 @@ fn collect_agent_refs(cfg: &Config, alias: &str, sites: &mut Vec<RefSite>) {
                 ));
             }
         }
+        // workspace.read_knowledge_from[].
+        for (i, m) in agent.workspace.read_knowledge_from.iter().enumerate() {
+            if m.as_str() == alias {
+                sites.push(RefSite::soft(
+                    format!("agents.{name}.workspace.read_knowledge_from[{i}]"),
+                    ScrubAction::DropFromVec { index: i },
+                    alias,
+                ));
+            }
+        }
     }
     // peer_groups.<g>.agents[] — raw match (validate() :17453 does not trim).
     for (gname, group) in sorted_peer_groups(cfg) {
@@ -1429,16 +1450,21 @@ mod tests {
             .workspace
             .read_memory_from
             .push(AgentAlias::new("bot"));
+        referrer
+            .workspace
+            .read_knowledge_from
+            .push(AgentAlias::new("bot"));
         cfg.agents.insert("lead".to_string(), referrer);
         let mut group = PeerGroupConfig::default();
         group.agents.push(AgentAlias::new("bot"));
         cfg.peer_groups.insert("crew".to_string(), group);
 
         let report = plan_delete(&cfg, &AliasKind::Agent, "bot");
-        // heartbeat (hard) + delegates + access + read_memory_from + peer member + acp
+        // heartbeat (hard) + delegates + access + read_memory_from +
+        // read_knowledge_from + peer member + acp
         assert_eq!(report.blockers.len(), 1);
         assert_eq!(report.blockers[0].path, "heartbeat.agent");
-        assert_eq!(report.scrubs.len(), 5);
+        assert_eq!(report.scrubs.len(), 6);
         assert!(!report.allowed);
     }
 
@@ -2049,6 +2075,9 @@ mod tests {
             .access
             .insert(AgentAlias::new("bot"), AccessMode::Read);
         lead.workspace.read_memory_from.push(AgentAlias::new("bot"));
+        lead.workspace
+            .read_knowledge_from
+            .push(AgentAlias::new("bot"));
         cfg.agents.insert("lead".to_string(), lead);
         cfg.peer_groups.insert(
             "crew".to_string(),
@@ -2065,7 +2094,7 @@ mod tests {
             CascadePolicy::RefuseOnHard,
         )
         .expect("soft-only agent delete succeeds");
-        assert_eq!(report.applied.len(), 6);
+        assert_eq!(report.applied.len(), 7);
         assert_eq!(report.deleted_entry.as_deref(), Some("agents.bot"));
         assert!(!cfg.agents.contains_key("bot"));
         assert!(cfg.heartbeat.agent.is_empty());
@@ -2073,6 +2102,7 @@ mod tests {
         assert!(cfg.agents["lead"].delegates.is_empty());
         assert!(cfg.agents["lead"].workspace.access.is_empty());
         assert!(cfg.agents["lead"].workspace.read_memory_from.is_empty());
+        assert!(cfg.agents["lead"].workspace.read_knowledge_from.is_empty());
         assert!(cfg.peer_groups["crew"].agents.is_empty());
         assert!(find_all_references(&cfg, &AliasKind::Agent, "bot").is_empty());
     }
@@ -2397,6 +2427,9 @@ mod tests {
             .access
             .insert(AgentAlias::new("bot"), AccessMode::Read);
         lead.workspace.read_memory_from.push(AgentAlias::new("bot"));
+        lead.workspace
+            .read_knowledge_from
+            .push(AgentAlias::new("bot"));
         cfg.agents.insert("lead".to_string(), lead);
         let mut group = PeerGroupConfig::default();
         group.agents.push(AgentAlias::new("bot"));
@@ -2433,6 +2466,10 @@ mod tests {
         );
         assert_eq!(
             cfg.agents["lead"].workspace.read_memory_from,
+            vec![AgentAlias::new("bot2")]
+        );
+        assert_eq!(
+            cfg.agents["lead"].workspace.read_knowledge_from,
             vec![AgentAlias::new("bot2")]
         );
         assert_eq!(

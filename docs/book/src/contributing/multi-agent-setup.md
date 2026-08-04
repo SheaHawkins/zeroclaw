@@ -47,6 +47,7 @@ The schema validator at config load enforces:
 1. Every member's `channels` list includes the group's `channel` (an agent that doesn't listen there can't peer there).
 2. Every member is a configured agent (no dangling references).
 3. `read_memory_from` does not point at the agent itself.
+4. `read_knowledge_from` names only configured siblings and never the agent itself.
 
 ## Inspect the install
 

@@ -21272,6 +21272,28 @@ impl Config {
                     );
                 }
             }
+
+            // workspace.read_knowledge_from: every alias must exist as a
+            // configured agent. No backend compatibility check applies:
+            // the knowledge graph is one install-wide store shared by
+            // all agents.
+            for (i, target) in agent.workspace.read_knowledge_from.iter().enumerate() {
+                let target_str = target.as_str();
+                if target_str == alias.as_str() {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.workspace.read_knowledge_from[{i}]"),
+                        "agents.{alias}.workspace.read_knowledge_from[{i}] = {target_str:?} but {target_str} is this agent itself; an agent always sees its own knowledge rows, so self-references in the cross-agent allowlist are not permitted",
+                    );
+                }
+                if !self.agents.contains_key(target_str) {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("agents.{alias}.workspace.read_knowledge_from[{i}]"),
+                        "agents.{alias}.workspace.read_knowledge_from[{i}] = {target_str:?} but agents.{target_str} is not configured",
+                    );
+                }
+            }
         }
 
         // Peer groups: every member alias must exist as a configured
@@ -33344,6 +33366,11 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             ".read_memory_from",
             "Cross-agent memory allowlist",
         );
+        assert_description(
+            &workspace,
+            ".read_knowledge_from",
+            "Cross-agent knowledge allowlist",
+        );
 
         let a2a = crate::multi_agent::A2aServerConfig::default().prop_fields();
         assert_description(&a2a, ".public_base_url", "operator-supplied base URL");
@@ -36129,6 +36156,71 @@ allowed_users = []
             msg.contains("same-backend siblings only"),
             "expected cross-backend explanation, got: {msg}"
         );
+    }
+
+    #[test]
+    async fn validate_rejects_read_knowledge_from_self_reference() {
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha
+            .workspace
+            .read_knowledge_from
+            .push(crate::multi_agent::AgentAlias::new("alpha"));
+        let err = config
+            .validate()
+            .expect_err("self-reference must fail validation");
+        assert!(
+            err.to_string().contains("read_knowledge_from[0]"),
+            "expected indexed field path, got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_read_knowledge_from_dangling_reference() {
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha
+            .workspace
+            .read_knowledge_from
+            .push(crate::multi_agent::AgentAlias::new("ghost"));
+        let err = config
+            .validate()
+            .expect_err("dangling target must fail validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("read_knowledge_from[0]")
+                && msg.contains("agents.ghost is not configured"),
+            "expected dangling-ref explanation, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_read_knowledge_from_across_memory_backends() {
+        let mut config = multi_agent_test_config();
+
+        // The knowledge graph is one install-wide store, so unlike
+        // read_memory_from the allowlist is valid across differing
+        // per-agent memory backends.
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".into(),
+            memory: crate::multi_agent::AgentMemoryConfig {
+                backend: crate::multi_agent::MemoryBackendKind::Postgres,
+            },
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha
+            .workspace
+            .read_knowledge_from
+            .push(crate::multi_agent::AgentAlias::new("beta"));
+
+        config
+            .validate()
+            .expect("sibling grant must pass validation regardless of memory backend");
     }
 
     #[test]

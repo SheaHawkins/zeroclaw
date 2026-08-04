@@ -17,6 +17,21 @@ enabled = true
 
 Relationship capture is explicit today. Agents store graph entries through `knowledge` actions such as `capture` and `relate`; enabling the tool does not turn on automatic ingestion. Relationship memory can hold sensitive operational or business context, so operators should choose what gets stored.
 
+## Per-agent scoping
+
+The store is one install-wide database, but entries are attributed per agent. Every `capture` and `relate` is stamped with the calling agent's alias, taken from the runtime registration rather than tool arguments, and every action (search, suggest, expert lookup, stats, neighbors, client network, interaction log) only sees:
+
+- rows the calling agent wrote,
+- rows captured before attribution existed (these have no owner and stay visible to every agent as a shared, read-only base; agents can link their own nodes to them, but such links stay private to the writer), and
+- rows owned by agents the operator explicitly shares via the workspace allowlist:
+
+```toml
+[agents.rowan.workspace]
+read_knowledge_from = ["sable"]
+```
+
+The grant is directional and read-only: `rowan` can read (and privately annotate) `sable`'s entries, while `sable` learns nothing about `rowan`'s. Writes always attribute to the caller. A node another agent owns behaves exactly like a node that does not exist, including in `relate` errors.
+
 ## Concepts
 
 The graph stores nodes and directed edges.

@@ -1380,7 +1380,26 @@ pub fn all_tools_with_runtime(
             root_config.knowledge.max_nodes,
         ) {
             Ok(graph) => {
-                tool_arcs.push(Arc::new(KnowledgeTool::new(Arc::new(graph))));
+                // The scope is bound from the trusted registration alias,
+                // never from tool arguments. Reads widen only through the
+                // validated workspace.read_knowledge_from allowlist.
+                let read_knowledge_from: Vec<String> = root_config
+                    .agents
+                    .get(agent_alias)
+                    .map(|agent| {
+                        agent
+                            .workspace
+                            .read_knowledge_from
+                            .iter()
+                            .map(|target| target.as_str().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let scope = zeroclaw_memory::knowledge_graph::KnowledgeScope::for_agent(
+                    agent_alias,
+                    read_knowledge_from,
+                );
+                tool_arcs.push(Arc::new(KnowledgeTool::new(Arc::new(graph), scope)));
             }
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -2390,6 +2409,112 @@ mod tests {
         assert!(
             !tmp.path().join("new.txt").exists(),
             "file_write must not write anything on ephemeral"
+        );
+    }
+
+    #[tokio::test]
+    async fn knowledge_tool_registration_binds_the_calling_agent_scope() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            ..BrowserConfig::default()
+        };
+
+        let mut cfg = test_config(&tmp);
+        cfg.knowledge.enabled = true;
+        cfg.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .to_string();
+        cfg.agents
+            .insert("rowan".to_string(), AliasedAgentConfig::default());
+        cfg.agents
+            .insert("sable".to_string(), AliasedAgentConfig::default());
+        // Carol is granted read access to rowan's knowledge rows.
+        let mut carol = AliasedAgentConfig::default();
+        carol
+            .workspace
+            .read_knowledge_from
+            .push(zeroclaw_config::multi_agent::AgentAlias::new("rowan"));
+        cfg.agents.insert("carol".to_string(), carol);
+
+        let knowledge_tool_for = |alias: &str| {
+            let tools = all_tools(
+                Arc::new(cfg.clone()),
+                &security,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+                alias,
+                mem.clone(),
+                None,
+                None,
+                &browser,
+                &zeroclaw_config::schema::HttpRequestConfig::default(),
+                &zeroclaw_config::schema::WebFetchConfig::default(),
+                tmp.path(),
+                &HashMap::new(),
+                None,
+                &cfg,
+                None,
+                false,
+                None,
+            )
+            .tools;
+            tools
+                .into_iter()
+                .find(|t| t.name() == "knowledge")
+                .expect("knowledge tool must register when knowledge.enabled")
+        };
+
+        let rowan_tool = knowledge_tool_for("rowan");
+        let sable_tool = knowledge_tool_for("sable");
+        let carol_tool = knowledge_tool_for("carol");
+
+        let captured = rowan_tool
+            .execute(serde_json::json!({
+                "action": "capture",
+                "node_type": "pattern",
+                "title": "Rowan pattern",
+                "content": "Registration scoping proof"
+            }))
+            .await
+            .unwrap();
+        assert!(captured.success);
+
+        async fn search_count(tool: &dyn Tool) -> u64 {
+            let result = tool
+                .execute(serde_json::json!({
+                    "action": "search",
+                    "query": "registration scoping proof"
+                }))
+                .await
+                .unwrap();
+            assert!(result.success);
+            let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+            output["count"].as_u64().unwrap()
+        }
+
+        assert_eq!(
+            search_count(rowan_tool.as_ref()).await,
+            1,
+            "the capturing agent sees its own row"
+        );
+        assert_eq!(
+            search_count(sable_tool.as_ref()).await,
+            0,
+            "a sibling with no grant must not see another agent's rows"
+        );
+        assert_eq!(
+            search_count(carol_tool.as_ref()).await,
+            1,
+            "workspace.read_knowledge_from must widen reads through registration"
         );
     }
 

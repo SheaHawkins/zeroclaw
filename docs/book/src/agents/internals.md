@@ -33,6 +33,8 @@ Each agent has its own `Arc<dyn Memory>` instance. The factory (`zeroclaw_memory
 
 Cross-backend cross-agent memory is not supported: the schema validator at config load rejects `read_memory_from` entries that point at a sibling on a different backend.
 
+The knowledge graph (the `[knowledge]` tool store) follows the same attribution model on one install-wide SQLite file. Every node and edge carries the writing agent's alias in an `owner_agent` column; the tool binds the calling agent's identity at registration and scopes every action to rows that agent owns, rows with no owner (captured before attribution existed, shared read-only with every agent), and rows owned by aliases in the agent's `workspace.read_knowledge_from` allowlist. That allowlist is validated like `read_memory_from` (no self-reference, no dangling alias) but has no backend-compatibility rule because the knowledge store is a single shared file rather than a per-agent backend.
+
 ## Rename and delete lifecycle
 
 Use the gateway dashboard's agent controls or the dedicated `zeroclaw agents` CLI for rename and delete. In the standard build with `gateway` and `agent-runtime` enabled, both surfaces run the reference and owned-state cascades; directly removing or re-keying `agents.<alias>` in TOML or through a generic config setter does not. A reduced-feature CLI still updates config references but warns that owned state was not cascaded, so use a build with both features enabled for lifecycle operations.

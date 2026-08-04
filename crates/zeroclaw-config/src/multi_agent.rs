@@ -68,6 +68,10 @@ pub struct AgentWorkspaceConfig {
     pub unrestricted_filesystem: bool,
     /// Cross-agent memory allowlist. An empty list grants access only to local memory.
     pub read_memory_from: Vec<AgentAlias>,
+    /// Cross-agent knowledge allowlist. Grants read access to the named
+    /// siblings' knowledge-graph rows; an empty list keeps reads scoped
+    /// to this agent's own rows plus shared pre-attribution rows.
+    pub read_knowledge_from: Vec<AgentAlias>,
 }
 
 /// Per-agent memory backend selection and its persistence contract.
@@ -261,6 +265,7 @@ external_peers = ["@user_1", "@user_2"]
         let toml_input = r#"
 unrestricted_filesystem = false
 read_memory_from = ["beta"]
+read_knowledge_from = ["gamma"]
 
 [access]
 beta = "read"
@@ -271,6 +276,8 @@ gamma = "read_write"
         assert!(!parsed.unrestricted_filesystem);
         assert_eq!(parsed.read_memory_from.len(), 1);
         assert_eq!(parsed.read_memory_from[0], "beta");
+        assert_eq!(parsed.read_knowledge_from.len(), 1);
+        assert_eq!(parsed.read_knowledge_from[0], "gamma");
         assert_eq!(parsed.access.len(), 2);
         let beta = AgentAlias::new("beta");
         let gamma = AgentAlias::new("gamma");
@@ -285,6 +292,7 @@ gamma = "read_write"
         assert!(cfg.access.is_empty());
         assert!(!cfg.unrestricted_filesystem);
         assert!(cfg.read_memory_from.is_empty());
+        assert!(cfg.read_knowledge_from.is_empty());
     }
 
     #[test]
