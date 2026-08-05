@@ -69,14 +69,14 @@ Each live case runs inside a sandbox:
 ### Shell is excluded
 
 `shell` can never be part of the live tool surface, even when a case's `tools`
-and `[eval].live_allowed_tools` both request it — `effective_live_tools`
+and `[eval].live_allowed_tools` both request it: `effective_live_tools`
 (`crates/zeroclaw-eval/src/live.rs`) applies a hard denylist to the allowlist
 intersection, so deny always wins. A scripted `shell` tool call in a live case
 reaches the agent's tool-dispatch path and fails there ("tool not available"),
 rather than executing.
 
-This is the ship-safe interim posture chosen on the #9214 review thread. An
-earlier version of this harness wrapped `shell`'s subprocesses in a real OS
+This is the ship-safe interim posture. An earlier version of this harness
+wrapped `shell`'s subprocesses in a real OS
 sandbox backend (Landlock, Firejail, or `sandbox-exec`) instead of excluding
 it outright, but every accepted backend still permitted host *reads* wide
 enough to leak host data back into the conversation sent to a real provider:
@@ -86,7 +86,7 @@ enough to leak host data back into the conversation sent to a real provider:
   with `/usr` and `/bin` readable. Network was NOT restricted (no `AccessNet`
   rule); a sandboxed shell command could still reach the network freely.
 - macOS, `sandbox-exec` (Seatbelt): deny-by-default for writes, but reads were
-  allowed broadly — system paths (`/usr`, `/bin`, `/sbin`, `/Library`,
+  allowed broadly: system paths (`/usr`, `/bin`, `/sbin`, `/Library`,
   `/System`, `/etc`, `/opt`, and others) and the invoking user's dotfile
   directories under `$HOME`.
 - Firejail (Linux, no `sandbox-landlock` feature): `--private=home` with
@@ -96,7 +96,7 @@ enough to leak host data back into the conversation sent to a real provider:
 Confining the *writes* (which those backends do well; see
 `crates/zeroclaw-eval/tests/live_shell_sandbox.rs`'s history for the escape
 tests this proved) was not sufficient, because live-mode tool output becomes
-part of the conversation sent to the configured provider — a confidentiality
+part of the conversation sent to the configured provider, a confidentiality
 boundary, not just an integrity one. Re-admitting `shell` needs an
 eval-specific sandbox contract that also denies sensitive host reads on every
 accepted backend; that is a deliberate, tracked follow-up, not implemented
