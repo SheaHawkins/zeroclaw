@@ -32,7 +32,12 @@ pub async fn finalize(
     opts: FinalizeOpts,
 ) -> Result<i32> {
     let kind = SuiteKind::resolve(suite_path, opts.suite_kind);
-    print_report(&report, opts.format);
+    // Table mode prints incrementally; JSON is one complete document, so it is
+    // deferred until after the baseline comparison (when any) so the artifact
+    // can carry the gate outcome.
+    if opts.format == OutputFormat::Table {
+        println!("{}", report.render_table());
+    }
 
     let wrote_auto = write_dumps(
         &report,
@@ -55,6 +60,9 @@ pub async fn finalize(
             let _ = std::fs::create_dir_all(parent);
         }
         std::fs::write(path, Baseline::from_report(&report).to_json())?;
+        if opts.format == OutputFormat::Json {
+            println!("{}", report.to_json(kind, None));
+        }
         return Ok(report.exit_code(kind, None));
     }
 
@@ -92,6 +100,9 @@ pub async fn finalize(
         }
     };
 
+    if opts.format == OutputFormat::Json {
+        println!("{}", report.to_json(kind, comparison.as_ref()));
+    }
     Ok(report.exit_code(kind, comparison.as_ref()))
 }
 
@@ -296,14 +307,6 @@ pub enum OutputFormat {
     Table,
     /// Machine-readable JSON, for CI artifacts.
     Json,
-}
-
-/// Render a suite report in the requested format.
-pub fn print_report(report: &SuiteReport, format: OutputFormat) {
-    match format {
-        OutputFormat::Json => println!("{}", report.to_json()),
-        OutputFormat::Table => println!("{}", report.render_table()),
-    }
 }
 
 #[cfg(test)]
