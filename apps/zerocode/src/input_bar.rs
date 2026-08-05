@@ -2303,7 +2303,7 @@ mod tests {
     #[test]
     fn alt_arrows_move_by_word_without_changing_input() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("alpha  beta");
 
         assert!(matches!(
@@ -2323,7 +2323,7 @@ mod tests {
     #[test]
     fn alt_b_and_f_move_by_unicode_word() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello 世界");
 
         bar.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
@@ -2335,7 +2335,7 @@ mod tests {
 
     #[test]
     fn insertion_normalizes_cursor_after_joining_emoji_graphemes() {
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("👩👩");
         bar.move_cursor_left();
         bar.push_input_char('\u{200d}');
@@ -2350,7 +2350,7 @@ mod tests {
     #[test]
     fn backspace_normalizes_cursor_after_joining_emoji_graphemes() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("🇺x🇸");
         bar.move_cursor_left();
 
@@ -2364,7 +2364,7 @@ mod tests {
     #[test]
     fn delete_previous_word_normalizes_cursor_after_joining_emoji_graphemes() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("🇺x🇸");
         bar.move_cursor_left();
 
@@ -2378,7 +2378,7 @@ mod tests {
     #[test]
     fn backspace_normalizes_cursor_after_joining_emoji_graphemes_with_selection() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("🇺x🇸");
         let selection_start = "🇺".len();
         bar.selection = Some((selection_start, selection_start + 1));
@@ -2393,7 +2393,7 @@ mod tests {
     #[test]
     fn delete_previous_word_normalizes_cursor_after_joining_emoji_graphemes_with_selection() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("🇺x🇸");
         let selection_start = "🇺".len();
         bar.selection = Some((selection_start, selection_start + 1));
@@ -2408,7 +2408,7 @@ mod tests {
     #[test]
     fn file_explorer_does_not_claim_word_navigation_chords() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("alpha beta");
         let word_left = KeyEvent::new(KeyCode::Left, KeyModifiers::ALT);
         assert!(bar.claims_pane_navigation(&word_left));
@@ -3574,7 +3574,7 @@ mod tests {
     #[test]
     fn typing_over_unicode_selection_preserves_replacement_position() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let mut bar = InputBarState::new();
+        let mut bar = input_bar_with_shared_commands();
         bar.insert_text("🇺x🇸");
         let selection_start = "🇺".len();
         bar.selection = Some((selection_start, selection_start + 1));
