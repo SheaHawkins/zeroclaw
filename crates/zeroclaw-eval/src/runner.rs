@@ -160,15 +160,21 @@ pub async fn run_suite(dir: &Path, deps: &RunDeps) -> anyhow::Result<SuiteReport
                     cluster: trace.cluster.clone(),
                 }
             }
-            Err(e) => CaseReport {
-                name,
-                source,
-                record: None,
-                grades: vec![],
-                error: Some(e.to_string()),
-                repeat: None,
-                cluster: trace.cluster.clone(),
-            },
+            Err(e) => {
+                let error = e.to_string();
+                let (k, _) = crate::stats::effective_repeat(deps.mode, trace.repeat);
+                let repeat = (k > 1)
+                    .then(|| crate::stats::RepeatStats::from_partial_runs(k, &[], error.clone()));
+                CaseReport {
+                    name,
+                    source,
+                    record: None,
+                    grades: vec![],
+                    error: Some(error),
+                    repeat,
+                    cluster: trace.cluster.clone(),
+                }
+            }
         };
         cases.push(report);
     }
@@ -227,8 +233,10 @@ pub async fn run_case_repeated(
         .iter()
         .map(|o| crate::stats::RunSample {
             passed: all_pass(o),
-            total_tokens: o.record.input_tokens + o.record.output_tokens,
+            input_tokens: o.record.input_tokens,
+            output_tokens: o.record.output_tokens,
             duration_ms: o.record.duration_ms,
+            llm_calls: o.record.llm_calls,
             checks: o
                 .grades
                 .iter()
