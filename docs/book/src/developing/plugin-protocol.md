@@ -381,7 +381,12 @@ log-record: func(level: log-level, event: plugin-event);
 
 The call is fire-and-forget: it returns nothing and the host
 (`component_logging.rs`) absorbs all errors, so a failed log write can never
-crash plugin execution. `plugin-action` and `plugin-outcome` mirror the closed
+crash plugin execution. Delivery is asynchronous: the import hands the record
+to a bounded host-side queue drained by a dedicated thread and returns without
+blocking, so a slow or wedged log consumer can never hold a guest export past
+`plugins.limits.call_timeout_ms`. When the queue is full the newest record is
+dropped; the drain thread reports the accumulated drop count so the loss stays
+observable. `plugin-action` and `plugin-outcome` mirror the closed
 `Action` / `EventOutcome` taxonomies in `zeroclaw-log`; there is no escape-hatch
 variant on purpose. Do not call `wasi:logging` directly, plugin events would be
 formatted inconsistently and would not reach all of the destinations
@@ -439,7 +444,10 @@ store. The engine enables fuel metering, and each call is given a fresh fuel
 budget so a runaway or malicious component traps instead of hanging the host.
 The host also applies a wall-clock deadline around the complete export future,
 including time awaiting async host imports such as `wasi:http`; periodic fuel
-yields ensure uninterrupted guest computation cannot starve that timer. A
+yields ensure uninterrupted guest computation cannot starve that timer, and
+guest-reachable host imports never block the executor (log records are handed
+to a bounded queue and written by a dedicated host thread), so the deadline
+stays observable while host work runs. A
 `StoreLimits` ceiling bounds linear memory, table elements, and instance count.
 The tool world gets a fresh store per execute; the warm channel and memory
 stores are refueled before each call so a long-lived plugin gets a fresh budget

@@ -46,6 +46,14 @@ pub struct WasmChannel {
 
 struct ChannelInstanceFactory {
     component: Component,
+    /// Generation-scoped `configure` snapshot. Resolved once at construction
+    /// under the scope's `ConfigRead` grant and replayed verbatim when an
+    /// interrupted instance is reconstructed, so a rebuilt instance can never
+    /// observe different config than the one whose cached metadata it must
+    /// match. When the grant is present this may hold channel secrets in
+    /// plaintext for exactly as long as the owning [`WasmChannel`] lives:
+    /// there is no live config handle to refresh, so a config reload must
+    /// rebuild the channel, which discards this snapshot with it.
     config_json: String,
     limits: crate::component::PluginLimits,
 }
@@ -138,7 +146,11 @@ impl WasmChannel {
     }
 
     /// Rebuild an interrupted warm instance from the host-owned component,
-    /// scope, config snapshot, and limits while preserving the inbound queue.
+    /// scope, generation-scoped config snapshot, and limits, reattaching the
+    /// queued inbound backlog. A message the interrupted call had already
+    /// dequeued through `inbound-poll` is not requeued: inbound delivery to
+    /// the guest is at-most-once across an interruption, and only the
+    /// still-queued backlog survives reconstruction.
     /// This does not lock `state`, so the shared call boundary may invoke it
     /// while holding the slot lock.
     async fn reinstantiate(&self) -> Result<(Store<PluginState>, ChannelPlugin)> {

@@ -12,8 +12,14 @@ mod component {
     use exports::zeroclaw::plugin::tool::{Guest as Tool, ToolResult};
     use waki::bindings::wasi::http::{
         outgoing_handler,
-        types::{Fields, OutgoingBody, OutgoingRequest, RequestOptions, Scheme},
+        types::{ErrorCode, Fields, OutgoingBody, OutgoingRequest, RequestOptions, Scheme},
     };
+    use zeroclaw::plugin::logging::{LogLevel, PluginAction, PluginEvent, PluginOutcome};
+
+    /// Stable classification the host test asserts on when the guest's own
+    /// first-byte deadline fires, so the assertion cannot be satisfied by an
+    /// unrelated pre-request or transport error.
+    const GUEST_FIRST_BYTE_TIMEOUT: &str = "guest-first-byte-timeout";
 
     struct TimeoutTool;
 
@@ -67,6 +73,11 @@ mod component {
                         value = std::hint::black_box(value.wrapping_add(1));
                     }
                 }
+                "log" => {
+                    let message = args["message"].as_str().unwrap_or("plugin log");
+                    log_record_note(message);
+                    "logged".to_string()
+                }
                 _ => return Err("unknown mode".to_string()),
             };
             Ok(ToolResult {
@@ -75,6 +86,22 @@ mod component {
                 error: None,
             })
         }
+    }
+
+    /// Emit one INFO record through the imported host `logging` interface so
+    /// the host tests can exercise the `log-record` boundary end to end.
+    fn log_record_note(message: &str) {
+        zeroclaw::plugin::logging::log_record(
+            LogLevel::Info,
+            &PluginEvent {
+                function_name: "zeroclaw_tool_timeout_fixture::execute".to_string(),
+                action: PluginAction::Note,
+                outcome: Some(PluginOutcome::Success),
+                duration_ms: None,
+                attrs: None,
+                message: message.to_string(),
+            },
+        );
     }
 
     fn raw_first_byte_request(url: &str, timeout_ms: u64) -> Result<(), String> {
@@ -113,7 +140,13 @@ mod component {
             .get()
             .ok_or("response was not ready")?
             .map_err(|()| "response already taken")?
-            .map_err(|error| format!("request failed: {error:?}"))?;
+            .map_err(|error| match error {
+                // The wasi:http mapping of an elapsed first-byte deadline.
+                // Surfaced under a fixture-stable name so host assertions do
+                // not depend on the bindings' Debug formatting.
+                ErrorCode::ConnectionReadTimeout => GUEST_FIRST_BYTE_TIMEOUT.to_string(),
+                other => format!("request failed: {other:?}"),
+            })?;
         drop(response);
         Ok(())
     }

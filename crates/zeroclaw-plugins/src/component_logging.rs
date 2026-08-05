@@ -1,4 +1,18 @@
 //! Host-side `logging` and `types` implementations for all three plugin worlds.
+//!
+//! The `log-record` host import must never block the calling executor thread:
+//! the wall-clock deadline around every guest export is cooperative and can
+//! only fire while the Wasmtime future yields, so a stalled stderr consumer or
+//! JSONL writer inside this import would let an export overrun
+//! `plugins.limits.call_timeout_ms` and skip the store-discard path. Records
+//! are therefore handed to a bounded queue and written by a dedicated host
+//! thread; when the queue is full the newest record is dropped and the drop is
+//! counted and later reported from the drain side. This matches the WIT
+//! contract that `log-record` is fire-and-forget.
+
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 use zeroclaw_log::{Action, Event, EventOutcome, record};
 
@@ -23,8 +37,9 @@ fn plugin_log_attrs(
     attrs
 }
 
-fn do_log_record(
-    instance: &PluginInstanceId,
+/// One guest-emitted log record, owned so it can cross to the drain thread.
+struct QueuedPluginLog {
+    instance: PluginInstanceId,
     level_idx: u8,
     fn_name: String,
     action: Action,
@@ -32,13 +47,73 @@ fn do_log_record(
     duration_ms: Option<u64>,
     raw_attrs: Option<String>,
     msg: String,
-) {
-    let mut ev = Event::new(module_path!(), action).with_outcome(outcome);
-    if let Some(ms) = duration_ms {
+}
+
+/// Bound chosen so a chatty guest can burst without loss while a wedged
+/// consumer caps host memory at roughly one queue of records.
+const PLUGIN_LOG_QUEUE_CAPACITY: usize = 1024;
+
+/// Records dropped because the queue was full (or its drain thread never
+/// started). Incremented on the enqueue side, reported from the drain side,
+/// where blocking on the writer is allowed.
+static DROPPED_PLUGIN_LOGS: AtomicU64 = AtomicU64::new(0);
+
+fn plugin_log_queue() -> &'static SyncSender<QueuedPluginLog> {
+    static QUEUE: OnceLock<SyncSender<QueuedPluginLog>> = OnceLock::new();
+    QUEUE.get_or_init(|| {
+        let (tx, rx) = sync_channel(PLUGIN_LOG_QUEUE_CAPACITY);
+        // If the drain thread cannot spawn, the receiver is dropped and every
+        // enqueue lands in the drop counter: logging degrades but a guest
+        // export still cannot block, which is the invariant that matters.
+        let _ = std::thread::Builder::new()
+            .name("zc-plugin-log".to_string())
+            .spawn(move || drain_plugin_logs(&rx));
+        tx
+    })
+}
+
+/// Enqueue without ever blocking the caller. Full queue drops the newest
+/// record; the drain thread reports the accumulated drop count on its own
+/// schedule so the loss is observable without re-entering the blocked path.
+fn enqueue_plugin_log(log: QueuedPluginLog) {
+    if plugin_log_queue().try_send(log).is_err() {
+        DROPPED_PLUGIN_LOGS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn drain_plugin_logs(rx: &Receiver<QueuedPluginLog>) {
+    let mut reported_drops = 0_u64;
+    while let Ok(log) = rx.recv() {
+        do_log_record(&log);
+        let dropped = DROPPED_PLUGIN_LOGS.load(Ordering::Relaxed);
+        if dropped > reported_drops {
+            record!(
+                WARN,
+                Event::new(module_path!(), Action::Skip)
+                    .with_outcome(EventOutcome::Failure)
+                    .with_attrs(serde_json::json!({
+                        "newly_dropped": dropped - reported_drops,
+                        "total_dropped": dropped,
+                    })),
+                "plugin log queue overflowed; newest records were dropped"
+            );
+            reported_drops = dropped;
+        }
+    }
+}
+
+fn do_log_record(log: &QueuedPluginLog) {
+    let mut ev = Event::new(module_path!(), log.action).with_outcome(log.outcome);
+    if let Some(ms) = log.duration_ms {
         ev = ev.with_duration(ms);
     }
-    ev = ev.with_attrs(plugin_log_attrs(instance, fn_name, raw_attrs));
-    match level_idx {
+    ev = ev.with_attrs(plugin_log_attrs(
+        &log.instance,
+        log.fn_name.clone(),
+        log.raw_attrs.clone(),
+    ));
+    let msg = log.msg.clone();
+    match log.level_idx {
         0 => record!(TRACE, ev, msg),
         1 => record!(DEBUG, ev, msg),
         2 => record!(INFO, ev, msg),
@@ -112,16 +187,18 @@ macro_rules! impl_host {
                     LogLevel::Warn => 3,
                     LogLevel::Error => 4,
                 };
-                do_log_record(
-                    self.scope().id(),
+                // Hand off instead of writing inline: see the module docs for
+                // why this import must never block the executor thread.
+                enqueue_plugin_log(QueuedPluginLog {
+                    instance: self.scope().id().clone(),
                     level_idx,
-                    event.function_name,
+                    fn_name: event.function_name,
                     action,
                     outcome,
-                    event.duration_ms,
-                    event.attrs,
-                    event.message,
-                );
+                    duration_ms: event.duration_ms,
+                    raw_attrs: event.attrs,
+                    msg: event.message,
+                });
             }
         }
     };

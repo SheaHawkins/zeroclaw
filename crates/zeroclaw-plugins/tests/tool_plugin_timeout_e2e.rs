@@ -5,11 +5,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use zeroclaw_plugins::component::PluginLimits;
 use zeroclaw_plugins::host::PluginHost;
 use zeroclaw_plugins::instance::PluginInstanceScope;
@@ -96,15 +98,23 @@ async fn plugin_with_fuel(call_timeout: Duration, call_fuel: u64) -> runtime::Pl
         .expect("instantiate timeout fixture")
 }
 
-async fn server(response: ServerResponse) -> (String, tokio::task::JoinHandle<()>) {
+/// Spawn a one-request server. The returned receiver resolves once the
+/// request has been accepted and read, so a test can prove the guest's HTTP
+/// wait actually reached the server rather than failing before the request
+/// was issued.
+async fn server(
+    response: ServerResponse,
+) -> (String, tokio::task::JoinHandle<()>, oneshot::Receiver<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind fixture server");
     let address = listener.local_addr().expect("fixture server address");
+    let (accepted_tx, accepted_rx) = oneshot::channel();
     let task = ::zeroclaw_spawn::spawn!(async move {
         let (mut stream, _) = listener.accept().await.expect("accept fixture request");
         let mut request = [0_u8; 4096];
         let _ = stream.read(&mut request).await;
+        let _ = accepted_tx.send(());
         match response {
             ServerResponse::Complete => {
                 stream
@@ -129,7 +139,16 @@ async fn server(response: ServerResponse) -> (String, tokio::task::JoinHandle<()
             }
         }
     });
-    (format!("http://{address}/body"), task)
+    (format!("http://{address}/body"), task, accepted_rx)
+}
+
+/// Assert the server-side acceptance handshake completed, proving the guest's
+/// request was accepted and read before the observed outcome.
+async fn assert_request_reached_server(accepted: oneshot::Receiver<()>, context: &str) {
+    tokio::time::timeout(Duration::from_secs(1), accepted)
+        .await
+        .unwrap_or_else(|_| panic!("{context}: request never reached the fixture server"))
+        .unwrap_or_else(|_| panic!("{context}: fixture server exited before acceptance"));
 }
 
 enum ServerResponse {
@@ -152,7 +171,7 @@ async fn execute(
 
 #[tokio::test]
 async fn dripping_response_is_stopped_by_host_deadline() {
-    let (url, server) = server(ServerResponse::Drip).await;
+    let (url, server, _accepted) = server(ServerResponse::Drip).await;
     let mut plugin = plugin(Duration::from_millis(250)).await;
     let started = Instant::now();
     let error = execute(&mut plugin, serde_json::json!({"mode": "http", "url": url}))
@@ -175,7 +194,7 @@ async fn dripping_response_is_stopped_by_host_deadline() {
 
 #[tokio::test]
 async fn normal_response_completes_before_host_deadline() {
-    let (url, server) = server(ServerResponse::Complete).await;
+    let (url, server, _accepted) = server(ServerResponse::Complete).await;
     let mut plugin = plugin(Duration::from_secs(2)).await;
     let result = execute(&mut plugin, serde_json::json!({"mode": "http", "url": url}))
         .await
@@ -186,7 +205,9 @@ async fn normal_response_completes_before_host_deadline() {
 
 #[tokio::test]
 async fn guest_first_byte_timeout_can_shorten_but_not_extend_host_deadline() {
-    let (short_guest_url, short_guest_server) = server(ServerResponse::NoResponse).await;
+    const GUEST_DEADLINE: Duration = Duration::from_millis(100);
+    let (short_guest_url, short_guest_server, guest_accepted) =
+        server(ServerResponse::NoResponse).await;
     let mut guest_first = plugin(Duration::from_secs(2)).await;
     let started = Instant::now();
     let guest_error = execute(
@@ -194,19 +215,35 @@ async fn guest_first_byte_timeout_can_shorten_but_not_extend_host_deadline() {
         serde_json::json!({
             "mode": "raw-first-byte",
             "url": short_guest_url,
-            "guest_timeout_ms": 100
+            "guest_timeout_ms": GUEST_DEADLINE.as_millis() as u64
         }),
     )
     .await
     .expect_err("guest timeout must fire");
+    let elapsed = started.elapsed();
+    // The fixture maps the wasi:http first-byte deadline to this stable
+    // classification; an immediate pre-request or transport failure surfaces
+    // under a different message and must fail this assertion.
+    assert!(
+        guest_error.to_string().contains("guest-first-byte-timeout"),
+        "expected the guest's own first-byte deadline, got: {guest_error:#}"
+    );
     assert!(
         !guest_error.to_string().contains("wall-clock deadline"),
         "guest timeout was incorrectly replaced by the host ceiling: {guest_error:#}"
     );
-    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(
+        elapsed >= GUEST_DEADLINE,
+        "an error faster than the guest deadline is not a guest timeout: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "guest deadline must fire well before the 2 s host ceiling: {elapsed:?}"
+    );
+    assert_request_reached_server(guest_accepted, "guest-shorter deadline").await;
     short_guest_server.abort();
 
-    let (host_url, host_server) = server(ServerResponse::NoResponse).await;
+    let (host_url, host_server, host_accepted) = server(ServerResponse::NoResponse).await;
     let mut host_first = plugin(Duration::from_millis(250)).await;
     let host_error = execute(
         &mut host_first,
@@ -222,6 +259,7 @@ async fn guest_first_byte_timeout_can_shorten_but_not_extend_host_deadline() {
         host_error.to_string().contains("wall-clock deadline"),
         "unexpected error: {host_error:#}"
     );
+    assert_request_reached_server(host_accepted, "host-shorter deadline").await;
     host_server.abort();
 }
 
@@ -237,4 +275,57 @@ async fn uninterrupted_guest_compute_cannot_starve_wall_clock_deadline() {
         "unexpected error: {error:#}"
     );
     assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+/// Regression for the blocking-host-import gap: the host wall-clock deadline
+/// is cooperative, so a `log-record` implementation that writes to a stalled
+/// terminal consumer inline would pin the export inside its first poll and
+/// let it overrun `call_timeout_ms` indefinitely. With the bounded plugin-log
+/// queue, the export hands the record off without blocking and the stall is
+/// absorbed by the dedicated drain thread.
+#[tokio::test]
+async fn blocked_host_log_writer_cannot_stall_export_past_deadline() {
+    const MARKER: &str = "zc-blocked-log-writer-marker";
+    /// Long enough that an inline (blocking) write visibly breaks the timing
+    /// assertion, short enough that a regressed run still terminates.
+    const WRITER_STALL: Duration = Duration::from_secs(10);
+
+    let saw_marker = Arc::new(AtomicBool::new(false));
+    let saw = Arc::clone(&saw_marker);
+    let installed = zeroclaw_log::try_install_line_sink_for_tests(move |line| {
+        if line.contains(MARKER) && !saw.swap(true, Ordering::SeqCst) {
+            std::thread::sleep(WRITER_STALL);
+        }
+    });
+    assert!(
+        installed,
+        "this test must own the process-global subscriber; no other test in \
+         this binary may install one"
+    );
+
+    let mut plugin = plugin(Duration::from_millis(250)).await;
+    let started = Instant::now();
+    let result = execute(
+        &mut plugin,
+        serde_json::json!({"mode": "log", "message": MARKER}),
+    )
+    .await
+    .expect("a logging export must complete despite the stalled writer");
+    assert_eq!(&*result.output, "logged");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a stalled log writer must not extend a guest export: {:?}",
+        started.elapsed()
+    );
+
+    // Delivery is asynchronous but must still happen: the record has to reach
+    // the subscriber (and begin its stall there) shortly after the call.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !saw_marker.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "plugin log record was never delivered to the subscriber"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

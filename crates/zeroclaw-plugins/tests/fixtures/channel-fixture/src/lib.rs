@@ -2,6 +2,7 @@
 
 #[cfg(target_family = "wasm")]
 mod component {
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     wit_bindgen::generate!({
@@ -18,6 +19,10 @@ mod component {
 
     struct FixtureChannel;
     static HTTP_CALL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+    /// Optional handle taken from the host-provided `configure` payload, so
+    /// host tests can observe which config generation an instance was
+    /// configured with (reconstruction must replay the constructor snapshot).
+    static CONFIGURED_HANDLE: Mutex<Option<String>> = Mutex::new(None);
 
     impl PluginInfo for FixtureChannel {
         fn plugin_name() -> String {
@@ -34,7 +39,11 @@ mod component {
             "channel-fixture".to_string()
         }
 
-        fn configure(_config: String) -> Result<(), String> {
+        fn configure(config: String) -> Result<(), String> {
+            let parsed: serde_json::Value = serde_json::from_str(&config).unwrap_or_default();
+            if let Some(handle) = parsed["handle"].as_str() {
+                *CONFIGURED_HANDLE.lock().unwrap() = Some(handle.to_string());
+            }
             Ok(())
         }
 
@@ -55,6 +64,15 @@ mod component {
 
         fn poll_message() -> Option<InboundMessage> {
             let message = zeroclaw::plugin::inbound::inbound_poll()?;
+            // Host tests use this to interrupt a poll after the message has
+            // already been dequeued from the host-owned queue: the spin runs
+            // until the host wall-clock deadline discards this instance.
+            if message.content.starts_with("spin") {
+                let mut value = 0_u64;
+                loop {
+                    value = std::hint::black_box(value.wrapping_add(1));
+                }
+            }
             Some(InboundMessage {
                 id: message.id,
                 sender: message.sender,
@@ -81,7 +99,13 @@ mod component {
         }
 
         fn self_handle() -> Option<String> {
-            Some("@fixture".to_string())
+            Some(
+                CONFIGURED_HANDLE
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "@fixture".to_string()),
+            )
         }
 
         fn self_addressed_mention() -> Option<String> {
