@@ -875,8 +875,10 @@ impl EmailChannel {
     /// Build the outbound `lettre` message for a `SendMessage`, including
     /// subject/body derivation, attachments, and reply threading headers
     /// (`In-Reply-To` / `References`). Pure and side-effect free so it can be
-    /// tested without a live SMTP transport.
-    fn build_email_message(&self, message: &SendMessage) -> Result<Message> {
+    /// tested without a live SMTP transport. `pub(crate)` so orchestrator
+    /// boundary tests can assert the serialized wire form of replies built
+    /// from inbound channel messages.
+    pub(crate) fn build_email_message(&self, message: &SendMessage) -> Result<Message> {
         // Use explicit subject if provided, otherwise fall back to legacy parsing or default
         let default_subject = self.config.default_subject.as_str();
         let (subject, body) = if let Some(ref subj) = message.subject {
