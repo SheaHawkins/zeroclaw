@@ -204,6 +204,11 @@ pub fn validate_workspace_rel_path(path: &str) -> anyhow::Result<()> {
 }
 
 /// Load every `*.json` trace fixture in `dir`, sorted by path for stable ordering.
+///
+/// Fails closed on identity problems: an empty display id (empty `id`, or
+/// missing `id` with an empty `model_name`) or a display id shared by two
+/// fixtures is an error. Duplicate ids would let one case's result silently
+/// mask another's in reports, baselines, and the flaky re-run lookup.
 pub fn load_suite(dir: &Path) -> anyhow::Result<Vec<(PathBuf, LlmTrace)>> {
     let read = std::fs::read_dir(dir)
         .with_context(|| format!("reading eval suite directory {}", dir.display()))?;
@@ -215,9 +220,25 @@ pub fn load_suite(dir: &Path) -> anyhow::Result<Vec<(PathBuf, LlmTrace)>> {
         .collect();
     paths.sort();
 
-    let mut out = Vec::with_capacity(paths.len());
+    let mut out: Vec<(PathBuf, LlmTrace)> = Vec::with_capacity(paths.len());
+    let mut seen: std::collections::BTreeMap<String, PathBuf> = std::collections::BTreeMap::new();
     for path in paths {
         let trace = LlmTrace::from_file(&path)?;
+        let id = trace.display_id();
+        if id.is_empty() {
+            anyhow::bail!(
+                "fixture {} has an empty case id (set `id`, or a non-empty `model_name`)",
+                path.display()
+            );
+        }
+        if let Some(prev) = seen.insert(id.to_string(), path.clone()) {
+            anyhow::bail!(
+                "duplicate case id {id:?} in fixtures {} and {}: one case's result would \
+                 silently mask the other's",
+                prev.display(),
+                path.display()
+            );
+        }
         out.push((path, trace));
     }
     Ok(out)
@@ -360,6 +381,70 @@ mod tests {
         assert_eq!(suite.len(), 2); // the .txt file is ignored
         assert_eq!(suite[0].1.model_name, "a"); // sorted by path
         assert_eq!(suite[1].1.model_name, "b");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_suite_rejects_duplicate_display_ids() {
+        let dir = std::env::temp_dir().join("zeroclaw_eval_case_dup_id_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Different files, same explicit id.
+        std::fs::write(
+            dir.join("a.json"),
+            r#"{"model_name":"m1","id":"same","turns":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.json"),
+            r#"{"model_name":"m2","id":"same","turns":[]}"#,
+        )
+        .unwrap();
+        let err = load_suite(&dir).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("duplicate case id"), "got: {msg}");
+        assert!(
+            msg.contains("a.json") && msg.contains("b.json"),
+            "got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_suite_rejects_id_and_model_name_collision() {
+        let dir = std::env::temp_dir().join("zeroclaw_eval_case_cross_id_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // One case's explicit id collides with another's model_name fallback.
+        std::fs::write(
+            dir.join("a.json"),
+            r#"{"model_name":"x","id":"shared","turns":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("b.json"), r#"{"model_name":"shared","turns":[]}"#).unwrap();
+        let err = load_suite(&dir).unwrap_err();
+        assert!(err.to_string().contains("duplicate case id"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_suite_rejects_empty_display_id() {
+        let dir = std::env::temp_dir().join("zeroclaw_eval_case_empty_id_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Explicit empty id.
+        std::fs::write(
+            dir.join("a.json"),
+            r#"{"model_name":"m","id":"","turns":[]}"#,
+        )
+        .unwrap();
+        let err = load_suite(&dir).unwrap_err();
+        assert!(err.to_string().contains("empty case id"));
+        // Missing id with empty model_name.
+        std::fs::remove_file(dir.join("a.json")).unwrap();
+        std::fs::write(dir.join("b.json"), r#"{"model_name":"","turns":[]}"#).unwrap();
+        let err = load_suite(&dir).unwrap_err();
+        assert!(err.to_string().contains("empty case id"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

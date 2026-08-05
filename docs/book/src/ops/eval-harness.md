@@ -40,7 +40,9 @@ zeroclaw eval run --suite evals/regression --format json
 
 `--suite` overrides `[eval].suite_dir`; `--mode` overrides `[eval].mode`. Suite
 loading is non-recursive: only direct `*.json` children of the suite directory
-are cases.
+are cases. Case identity is the fixture's `id` (falling back to `model_name`);
+loading fails closed on an empty or duplicate identity, since a duplicate would
+let one case's result silently mask another's.
 
 ## Live mode
 
