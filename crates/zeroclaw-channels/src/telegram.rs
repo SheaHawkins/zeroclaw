@@ -7732,6 +7732,75 @@ mod tests {
         );
     }
 
+    /// Pin the real poll/parser/authorization path for captioned pairing.
+    /// Even though this document exceeds the normal attachment-size limit,
+    /// `/bind` is handled before media eligibility: the listener must send
+    /// the deterministic invalid-code response without downloading or
+    /// delivering the document, then advance past the permanent skip.
+    #[tokio::test]
+    async fn listen_routes_captioned_bind_on_oversized_document_without_download() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        mount_telegram_startup_probe(&mock_server).await;
+
+        let uid = 9_100;
+        let chat_id = 2_120;
+        let mut update =
+            telegram_document_update(uid, 51, chat_id, "mallory", "file112", "huge.pdf");
+        update["message"]["document"]["file_size"] =
+            serde_json::json!(TELEGRAM_MAX_FILE_DOWNLOAD_BYTES + 1);
+        update["message"]["caption"] = serde_json::json!("/bind not-a-real-code");
+
+        mount_telegram_get_updates(&mock_server, 0, serde_json::json!([update])).await;
+        mount_telegram_get_updates(&mock_server, uid + 1, serde_json::json!([])).await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {"file_path": "unauthorized/never-downloaded"}
+            })))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        let chat_fragment = format!(r#""chat_id":"{chat_id}""#);
+        mount_telegram_send_message_ok(
+            &mock_server,
+            1,
+            &[chat_fragment.as_str(), "Invalid binding code"],
+        )
+        .await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = Arc::new(
+            TelegramChannel::new(
+                "test-token".into(),
+                "telegram_test_alias",
+                Arc::new(Vec::new),
+                false,
+            )
+            .with_api_base(mock_server.uri())
+            .with_workspace_dir(workspace.path().to_path_buf()),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let listen_ch = Arc::clone(&ch);
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        assert!(
+            telegram_wait_for_main_loop_offset(&mock_server, uid + 1, Duration::from_secs(5)).await,
+            "offset never advanced past the captioned pairing update"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "unauthorized oversized document unexpectedly reached channel dispatch"
+        );
+
+        handle.abort();
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // Live e2e: voice transcription via Groq Whisper + reply cache lookup
     // ─────────────────────────────────────────────────────────────────────
