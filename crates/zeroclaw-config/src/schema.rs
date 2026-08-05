@@ -19168,9 +19168,9 @@ impl Config {
             warnings.push(crate::validation_warnings::ValidationWarning::new(
                 "security_audit_enabled_has_no_effect",
                 "security.audit.enabled=true has no effect: command audit logging is not wired \
-                 into the runtime yet. No commands are being written to audit.log; use an \
-                 external supervisor or logging wrapper that observes the ZeroClaw process, \
-                 or enable OS-level process accounting."
+                 into the runtime yet, so no commands are written to the configured audit \
+                 path. Use an external supervisor or logging wrapper that observes the \
+                 ZeroClaw process, or enable OS-level process accounting."
                     .to_string(),
                 "security.audit.enabled",
             ));
