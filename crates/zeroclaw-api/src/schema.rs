@@ -628,11 +628,11 @@ struct SchemaCleanCacheEntry {
 /// Retired sources are pruned whenever a dirty schema uses the cache, so a
 /// replaced MCP schema does not wait for capacity pressure before its cleaned
 /// tree can be released. Completed entries are additionally bounded per
-/// provider by both count and estimated heap bytes. Retention pressure may
-/// evict completed memos, but never an in-flight single-flight cell; a live
-/// schema can therefore be recomputed after pressure eviction, while
-/// concurrent callers participating in one cold miss still share exactly one
-/// computation.
+/// provider by both count and estimated heap bytes. When a new result would
+/// exceed either bound, admission is declined for that result instead of
+/// evicting the established working set. In-flight single-flight cells are
+/// never evicted; concurrent callers participating in one cold miss still
+/// share exactly one computation.
 ///
 /// Only *rewritten* results are cached. A no-op clean is returned straight
 /// from the pre-scan and never inserted: such an entry's `cleaned` field
@@ -689,8 +689,9 @@ impl SchemaCleanCache {
     /// every caller, winner and waiters alike, ends up with the one
     /// resulting `Arc`. Misses on *different* keys install independent cells
     /// and clean fully concurrently; the map lock is never held while a clean
-    /// itself runs. Capacity enforcement can evict only initialized cells, so
-    /// it cannot split an in-flight computation into competing cells.
+    /// itself runs. Capacity enforcement can decline admission only for the
+    /// just-completed cell, so it cannot split an in-flight computation into
+    /// competing cells or discard the established working set.
     pub fn clean_shared(&self, schema: &Arc<Value>, strategy: CleaningStrategy) -> Arc<Value> {
         if !SchemaCleanr::needs_cleaning(schema, strategy) {
             // No-op: nothing worth caching or single-flighting (see the
@@ -781,17 +782,19 @@ impl SchemaCleanCache {
             return;
         }
 
-        let keep_current = entries.get(&current_key).is_some_and(|entry| {
-            Arc::ptr_eq(&entry.cleaned, current_cell)
-                && entry
-                    .retained_bytes
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    <= SCHEMA_CLEAN_CACHE_MAX_BYTES
-        });
-        entries.retain(|_, entry| {
-            entry.cleaned.get().is_none()
-                || (keep_current && Arc::ptr_eq(&entry.cleaned, current_cell))
-        });
+        // Preserve the already-admitted working set. Clearing every completed
+        // entry here makes a stable roster just one item over the cap thrash:
+        // the last schema evicts all earlier schemas, then the next request
+        // deep-cleans almost the entire roster again. Removing only the
+        // just-completed cell implements admission control: the established
+        // bounded set stays hot, while an over-budget schema is recomputed on
+        // its next use. The identity check prevents an old caller from
+        // removing a replacement entry installed at the same key.
+        if entries.get(&current_key).is_some_and(|entry| {
+            entry.cleaned.get().is_some() && Arc::ptr_eq(&entry.cleaned, current_cell)
+        }) {
+            entries.remove(&current_key);
+        }
     }
 
     #[cfg(test)]
@@ -1035,6 +1038,34 @@ mod tests {
             SCHEMA_CLEAN_CACHE_MAX_ENTRIES,
             cache.len()
         );
+    }
+
+    #[test]
+    fn schema_clean_cache_preserves_working_set_when_roster_exceeds_entry_cap() {
+        let cache = SchemaCleanCache::new();
+        let sources: Vec<Arc<Value>> = (0..=SCHEMA_CLEAN_CACHE_MAX_ENTRIES)
+            .map(|i| Arc::new(json!({ "type": "string", "const": format!("v{i}") })))
+            .collect();
+
+        for source in &sources {
+            cache.clean_shared(source, CleaningStrategy::OpenAI);
+        }
+        assert_eq!(
+            cache.cold_compute_count(),
+            sources.len(),
+            "the first pass must clean each distinct dirty schema once"
+        );
+
+        for source in &sources {
+            cache.clean_shared(source, CleaningStrategy::OpenAI);
+        }
+        assert_eq!(
+            cache.cold_compute_count(),
+            sources.len() + 1,
+            "a stable roster one schema over the cap should recompute only the \
+             unadmitted schema, not evict and rebuild the retained working set"
+        );
+        assert_eq!(cache.len(), SCHEMA_CLEAN_CACHE_MAX_ENTRIES);
     }
 
     #[test]
