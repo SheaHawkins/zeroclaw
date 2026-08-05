@@ -27,7 +27,7 @@ use crate::runner::{CaseProvider, RunDeps};
 /// always wins over both inputs.
 ///
 /// Live-mode tool output becomes part of the conversation sent to a real,
-/// configured provider (see the #9214 review thread). `shell` runs an
+/// configured provider. `shell` runs an
 /// arbitrary subprocess whose command line is only screened by a heuristic
 /// app-layer string scan (`SecurityPolicy::forbidden_path_argument`), not
 /// the structural path-canonicalization confinement the file tools get
@@ -51,11 +51,10 @@ use crate::runner::{CaseProvider, RunDeps};
 /// the live agent then sends to the real provider on the next turn -
 /// confidentiality leakage no amount of sandboxing-the-writes fixes.
 ///
-/// This is the ship-safe interim posture: the reviewer's two accepted
-/// options were "either keep `shell` unavailable in live mode or provide an
-/// eval-specific sandbox contract that denies sensitive host reads as well
-/// as outside writes on every accepted backend." The read-confinement
-/// contract is the deliberate, harder follow-up; `live_shell_sandbox` /
+/// Keep `shell` unavailable in live mode until an eval-specific sandbox
+/// contract denies sensitive host reads as well as outside writes on every
+/// accepted backend. That read-confinement contract is the deliberate,
+/// harder follow-up; `live_shell_sandbox` /
 /// `ensure_real_sandbox` and `live_tool_registry`'s sandboxed-shell
 /// construction below are left in place as building blocks for it, even
 /// though this denylist means `run_live_case` can no longer reach that
@@ -354,11 +353,11 @@ mod tests {
 
     #[test]
     fn live_effective_tools_denies_shell_even_when_case_and_config_both_request_it() {
-        // The exact scenario the #9214 review flagged: a case's `tools` asks
-        // for `shell` *and* the operator's `[eval].live_allowed_tools`
-        // config (the `allowed` argument here) explicitly permits it. The
-        // hard denylist must still win over both, leaving only the
-        // non-denylisted tool in the effective set.
+        // Exercise the adversarial configuration where a case's `tools` asks
+        // for `shell` and the operator's `[eval].live_allowed_tools` config
+        // (the `allowed` argument here) explicitly permits it. The hard
+        // denylist must still win over both, leaving only the non-denylisted
+        // tool in the effective set.
         let requested = ["shell".to_string(), "file_write".to_string()];
         let allowed = ["shell".to_string(), "file_write".to_string()];
         assert_eq!(

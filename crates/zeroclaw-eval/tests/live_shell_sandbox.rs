@@ -1,14 +1,14 @@
 //! Regression coverage for live mode's hard `shell` exclusion (see
-//! `docs/book/src/ops/eval-harness.md`'s "Live mode" table,
-//! `crates/zeroclaw-eval/src/live.rs`'s `LIVE_TOOL_DENYLIST`, and the #9214
-//! review thread): a live case can never make `shell` part of its effective
-//! tool surface, even when both the case's own `tools` and
+//! `docs/book/src/ops/eval-harness.md`'s "Live mode" table and
+//! `crates/zeroclaw-eval/src/live.rs`'s `LIVE_TOOL_DENYLIST`): a live case can
+//! never make `shell` part of its effective tool surface, even when both the
+//! case's own `tools` and
 //! `[eval].live_allowed_tools` explicitly request it.
 //!
 //! This file previously proved that `shell`'s subprocesses were confined by
 //! a real OS sandbox backend (Landlock/Firejail/`sandbox-exec`) when `shell`
-//! was allowlisted. The reviewer found that every accepted backend still
-//! permits host *reads* a real-provider live run must not leak back into the
+//! was allowlisted. Every accepted backend still permits host *reads* that a
+//! real-provider live run must not leak back into the
 //! conversation (Seatbelt allows user dotfile reads; Firejail's
 //! `--private=home` adds no workspace whitelist; Landlock leaves the whole
 //! `/tmp` tree readable and network unrestricted) - wrapping `shell` in the
