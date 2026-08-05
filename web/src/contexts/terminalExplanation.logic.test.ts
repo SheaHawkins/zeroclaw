@@ -6,6 +6,7 @@ import {
   reduceTerminalFrame,
   type TerminalFrame,
   bannerForErrorFrame,
+  contextExhaustedBubblePresentation,
   type TerminalRender,
 } from './terminalExplanation.logic.ts';
 
@@ -180,5 +181,34 @@ test('a notice frame with no text leaves the banner intact', () => {
   const outcome = reduceTerminalFrame({ explained: false }, { type: 'error' });
   assert.deepEqual(bannerForErrorFrame(outcome.render, 'PROVIDER_ERROR'), {
     kind: 'configuration',
+  });
+});
+
+test('a new turn and a valid context notice clear a stale prior banner', () => {
+  assert.equal(
+    reduceTerminalFrame({ explained: false }, { type: 'turn_start' }).clearBanner,
+    true,
+  );
+  assert.equal(
+    reduceTerminalFrame(
+      { explained: false },
+      { type: 'context_exhausted', notice: NOTICE },
+    ).clearBanner,
+    true,
+  );
+  assert.equal(
+    reduceTerminalFrame({ explained: false }, { type: 'context_exhausted' }).clearBanner,
+    false,
+  );
+});
+
+test('context notice presentation survives reload only when server persistence is absent', () => {
+  assert.deepEqual(contextExhaustedBubblePresentation(true), {
+    markdown: true,
+    ephemeral: true,
+  });
+  assert.deepEqual(contextExhaustedBubblePresentation(false), {
+    markdown: true,
+    ephemeral: false,
   });
 });

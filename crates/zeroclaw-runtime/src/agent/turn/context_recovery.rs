@@ -173,20 +173,25 @@ pub(crate) async fn try_recover_context_overflow(
 /// turn is ending on context-window exhaustion, so the caller and user see a clear stop
 /// reason instead of a silent idle return. Returns whether a notice was appended. Mirrors
 /// the adjacent stream-interrupted/cancelled terminal notices.
+pub(crate) fn is_context_exhaustion_error(e: &anyhow::Error) -> bool {
+    if e.downcast_ref::<StreamCancelledAfterOutput>().is_some() {
+        return false;
+    }
+    if let Some(interrupted) = e.downcast_ref::<StreamInterruptedAfterOutput>() {
+        zeroclaw_providers::reliable::is_context_window_exceeded(&anyhow::Error::msg(
+            interrupted.message.clone(),
+        ))
+    } else {
+        zeroclaw_providers::reliable::is_context_window_exceeded(e)
+    }
+}
+
 pub(crate) fn append_context_exhausted_notice(
     e: &anyhow::Error,
     history: &mut Vec<ChatMessage>,
     new_messages_out: Option<&mut Vec<ChatMessage>>,
 ) -> bool {
-    // A stream interruption/cancellation already carries its own terminal notice, and its
-    // Display can embed a provider error that matches the context-window hints below; skip
-    // so a single failure never produces two terminal messages.
-    if e.downcast_ref::<StreamInterruptedAfterOutput>().is_some()
-        || e.downcast_ref::<StreamCancelledAfterOutput>().is_some()
-    {
-        return false;
-    }
-    if !zeroclaw_providers::reliable::is_context_window_exceeded(e) {
+    if !is_context_exhaustion_error(e) {
         return false;
     }
     let msg = ChatMessage::assistant(crate::i18n::get_required_cli_string(
@@ -552,10 +557,10 @@ mod tests {
     }
 
     #[test]
-    fn append_context_exhausted_notice_skips_stream_interrupted_error() {
-        // The stream-interrupted arm already appended its own terminal notice, and its
-        // Display embeds the raw provider message, which can itself look like a
-        // context-window hint. The helper must not append a second notice for it.
+    fn append_context_exhausted_notice_classifies_wrapped_stream_overflow() {
+        // A provider overflow can arrive after visible streamed output. The
+        // wrapper preserves the provider reason, so context exhaustion must
+        // win over the generic stream-interrupted explanation.
         let mut history = vec![ChatMessage::user("only turn")];
         let history_len_before = history.len();
         let mut out: Vec<ChatMessage> = Vec::new();
@@ -567,18 +572,13 @@ mod tests {
 
         let appended = append_context_exhausted_notice(&e, &mut history, Some(&mut out));
 
-        assert!(
-            !appended,
-            "a stream-interrupted error must not get a second terminal notice"
-        );
-        assert!(
-            out.is_empty(),
-            "no message should be mirrored for a stream-interrupted error"
-        );
+        assert!(appended, "the wrapped provider overflow must be classified");
+        assert_eq!(out.len(), 1);
+        assert_eq!(history.len(), history_len_before + 1);
+        let expected = crate::i18n::get_required_cli_string("turn-context-exhausted");
         assert_eq!(
-            history.len(),
-            history_len_before,
-            "history must be unchanged for a stream-interrupted error"
+            history.last().map(|message| message.content.as_str()),
+            Some(expected.as_str())
         );
     }
 }

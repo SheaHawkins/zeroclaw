@@ -27,7 +27,8 @@ pub(crate) mod vision_route;
 pub(crate) use call_prep::{PreparedToolCalls, prepare_tool_calls};
 pub(crate) use context::{TurnCtx, TurnMeta};
 pub(crate) use context_recovery::{
-    append_context_exhausted_notice, record_llm_failure, try_recover_context_overflow,
+    append_context_exhausted_notice, is_context_exhaustion_error, record_llm_failure,
+    try_recover_context_overflow,
 };
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
@@ -39,6 +40,7 @@ pub(crate) use history_window::preflight_history_maintenance;
 pub use knobs::{LoopKnobs, MaxIterationBehavior};
 pub(crate) use max_iter::finish_after_max_iterations;
 pub(crate) use outcome::StreamCancelledAfterOutput;
+pub(crate) use outcome::{ContextExhaustedAfterRecovery, is_context_exhausted_after_recovery};
 pub use outcome::{
     ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, is_model_switch_requested,
     is_tool_loop_cancelled,
@@ -786,6 +788,27 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 if recovered {
                     continue;
                 }
+                // Classify a provider context error wrapped by a streamed
+                // interruption before choosing the generic interruption
+                // marker. The partial remains real assistant output, but the
+                // terminal explanation is context exhaustion, not a generic
+                // stream failure.
+                if is_context_exhaustion_error(&e) {
+                    if let Some(interrupted) =
+                        e.downcast_ref::<outcome::StreamInterruptedAfterOutput>()
+                        && !interrupted.partial_text.is_empty()
+                    {
+                        turn_state
+                            .push_dual(ChatMessage::assistant(interrupted.partial_text.clone()));
+                    }
+                    append_context_exhausted_notice(
+                        &e,
+                        turn_state.history,
+                        turn_state.canonical.as_deref_mut(),
+                    );
+                    turn_state.mark_all_synced();
+                    return Err(ContextExhaustedAfterRecovery::new(&e).into());
+                }
                 // A stream that died after caller-visible output: persist the
                 // partial with the interruption marker so wrappers/channels
                 // can commit what the consumer already saw.
@@ -811,16 +834,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         crate::i18n::get_required_cli_string("turn-interrupted-by-user")
                     ));
                     turn_state.push_dual(msg);
-                }
-                // Recovery could not trim the history further: leave a terminal
-                // notice instead of returning the error with no visible reason,
-                // so the user does not see the agent go idle silently.
-                if append_context_exhausted_notice(
-                    &e,
-                    turn_state.history,
-                    turn_state.canonical.as_deref_mut(),
-                ) {
-                    turn_state.mark_all_synced();
                 }
                 return Err(e);
             }

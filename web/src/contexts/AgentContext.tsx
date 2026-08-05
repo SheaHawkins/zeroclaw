@@ -15,6 +15,7 @@ import {
 } from '@/contexts/turnStream.logic';
 import {
   bannerForErrorFrame,
+  contextExhaustedBubblePresentation,
   initialTerminalExplanationState,
   reduceTerminalFrame,
   type TerminalExplanationState,
@@ -484,6 +485,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         terminalExplanationRef.current = outcome.state;
         if (outcome.render.kind !== 'notice') break;
         const noticeContent = outcome.render.content;
+        if (outcome.clearBanner) setError(null);
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [
           ...prev,
@@ -492,8 +494,8 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
             role: 'agent' as const,
             content: noticeContent,
             timestamp: new Date(),
-            ephemeral: true,
             notice: true,
+            ...contextExhaustedBubblePresentation(msg.persisted),
           },
         ]);
         break;
@@ -690,9 +692,11 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       setTyping(true);
       foldTurnStream({ type: 'turn_start' });
       // Never let a previous turn's notice suppress this turn's error bubble.
-      terminalExplanationRef.current = reduceTerminalFrame(terminalExplanationRef.current, {
+      const turnStart = reduceTerminalFrame(terminalExplanationRef.current, {
         type: 'turn_start',
-      }).state;
+      });
+      terminalExplanationRef.current = turnStart.state;
+      if (turnStart.clearBanner) setError(null);
       localMessageMutationVersionRef.current += 1;
       setMessages((prev) => [
         ...prev,

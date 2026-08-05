@@ -30,6 +30,21 @@ export type TerminalRender =
   /** The generic error bubble. */
   | { kind: 'error' };
 
+export interface TerminalFrameOutcome {
+  state: TerminalExplanationState;
+  render: TerminalRender;
+  /** The frame starts or supplies a new terminal explanation, so a banner
+   *  inherited from an older turn is stale. */
+  clearBanner: boolean;
+}
+
+export function contextExhaustedBubblePresentation(persisted?: boolean) {
+  return {
+    markdown: true,
+    ephemeral: persisted !== false,
+  };
+}
+
 export function initialTerminalExplanationState(): TerminalExplanationState {
   return { explained: false };
 }
@@ -65,22 +80,26 @@ export function bannerForErrorFrame(render: TerminalRender, code?: string): Term
 export function reduceTerminalFrame(
   state: TerminalExplanationState,
   frame: TerminalFrame,
-): { state: TerminalExplanationState; render: TerminalRender } {
+): TerminalFrameOutcome {
   switch (frame.type) {
     case 'turn_start':
       // A new turn must never inherit the previous turn's explanation, or an
       // unrelated later failure would render silently.
-      return { state: { explained: false }, render: { kind: 'none' } };
+      return { state: { explained: false }, render: { kind: 'none' }, clearBanner: true };
     case 'context_exhausted':
       // A frame with no notice text carries nothing to render; leave the turn
       // unexplained so the error frame still surfaces the failure.
-      if (!frame.notice) return { state, render: { kind: 'none' } };
-      return { state: { explained: true }, render: { kind: 'notice', content: frame.notice } };
+      if (!frame.notice) return { state, render: { kind: 'none' }, clearBanner: false };
+      return {
+        state: { explained: true },
+        render: { kind: 'notice', content: frame.notice },
+        clearBanner: true,
+      };
     case 'error':
       if (state.explained) {
         // Consume the explanation: this turn is over.
-        return { state: { explained: false }, render: { kind: 'none' } };
+        return { state: { explained: false }, render: { kind: 'none' }, clearBanner: false };
       }
-      return { state, render: { kind: 'error' } };
+      return { state, render: { kind: 'error' }, clearBanner: false };
   }
 }
