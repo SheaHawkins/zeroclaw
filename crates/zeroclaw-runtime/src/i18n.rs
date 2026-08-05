@@ -559,6 +559,24 @@ mod tests {
     }
 
     #[test]
+    fn telegram_command_description_falls_back_to_english_when_locale_key_is_missing() {
+        let sources = CliFtlSources {
+            locale: "fr".to_string(),
+            disk: None,
+            // A valid non-English catalog that intentionally omits the key
+            // under test, exercising built-in-locale -> English fallback.
+            builtin: Some(
+                "channel-telegram-cmd-clear-desc = Effacer cette session de conversation",
+            ),
+        };
+
+        let rendered = format_cli_string_with_args(&sources, "channel-telegram-cmd-new-desc", &[])
+            .expect("missing French command description should fall back to English");
+
+        assert_eq!(rendered, "Start a new conversation session");
+    }
+
+    #[test]
     fn disk_approval_override_cannot_rewrite_parser_commands() {
         let sources = CliFtlSources {
             locale: "es".to_string(),

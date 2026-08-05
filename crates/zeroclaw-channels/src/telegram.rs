@@ -7728,6 +7728,78 @@ mod tests {
         // Mock expectation assert happens on MockServer drop
     }
 
+    #[test]
+    fn register_bot_commands_sends_independently_pinned_french_payload() {
+        // Locale selection is process-global and immutable after its first
+        // lookup. Run the ignored helper in a fresh process so `init("fr")`
+        // deterministically owns that first lookup without racing unrelated
+        // tests in this binary.
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current test executable should be available"),
+        )
+        .args([
+            "register_bot_commands_french_payload_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .output()
+        .expect("French command-menu child test should start");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "French command-menu child test failed\nstdout:\n{}\nstderr:\n{}",
+            stdout,
+            stderr
+        );
+        assert!(
+            stdout.contains("register_bot_commands_french_payload_helper ... ok"),
+            "French command-menu helper did not run\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "subprocess helper for process-global French locale"]
+    async fn register_bot_commands_french_payload_helper() {
+        zeroclaw_runtime::i18n::init("fr");
+
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let expected_body = serde_json::json!({
+            "commands": [
+                { "command": "new", "description": "Démarrer une nouvelle session de conversation" },
+                { "command": "clear", "description": "Effacer cette session de conversation" },
+                { "command": "stop", "description": "Annuler la tâche en cours" },
+                { "command": "model", "description": "Afficher ou changer le modèle actuel" },
+                { "command": "models", "description": "Lister les fournisseurs de modèles disponibles ou changer de fournisseur" },
+                { "command": "config", "description": "Afficher la configuration actuelle" },
+            ]
+        });
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+            .and(body_json(&expected_body))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(mock_server.uri());
+
+        ch.register_bot_commands().await;
+    }
+
     #[tokio::test]
     async fn register_bot_commands_handles_failure_gracefully() {
         use wiremock::matchers::{method, path_regex};
