@@ -75,7 +75,10 @@ mod component {
                 }
                 "log" => {
                     let message = args["message"].as_str().unwrap_or("plugin log");
-                    log_record_note(message);
+                    let count = args["count"].as_u64().unwrap_or(1);
+                    for _ in 0..count {
+                        log_record_note(message);
+                    }
                     "logged".to_string()
                 }
                 _ => return Err("unknown mode".to_string()),

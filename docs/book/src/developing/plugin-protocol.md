@@ -384,8 +384,13 @@ The call is fire-and-forget: it returns nothing and the host
 crash plugin execution. Delivery is asynchronous: the import hands the record
 to a bounded host-side queue drained by a dedicated thread and returns without
 blocking, so a slow or wedged log consumer can never hold a guest export past
-`plugins.limits.call_timeout_ms`. When the queue is full the newest record is
-dropped; the drain thread reports the accumulated drop count so the loss stays
+`plugins.limits.call_timeout_ms`. The bound is a real memory bound, because
+the event fields are unbounded strings copied to host memory outside the
+guest's `max_memory_mb` ceiling: a record whose guest-controlled bytes exceed
+64 KiB is dropped rather than truncated, and queued records draw on a fixed
+8 MiB aggregate byte budget that is released only after a record is written.
+A full queue, an over-cap record, or an exhausted budget all drop the newest
+record; the drain thread reports the accumulated drop count so the loss stays
 observable. `plugin-action` and `plugin-outcome` mirror the closed
 `Action` / `EventOutcome` taxonomies in `zeroclaw-log`; there is no escape-hatch
 variant on purpose. Do not call `wasi:logging` directly, plugin events would be

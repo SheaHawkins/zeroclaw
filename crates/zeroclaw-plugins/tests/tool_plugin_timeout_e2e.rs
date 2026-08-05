@@ -277,23 +277,58 @@ async fn uninterrupted_guest_compute_cannot_starve_wall_clock_deadline() {
     assert!(started.elapsed() < Duration::from_secs(2));
 }
 
-/// Regression for the blocking-host-import gap: the host wall-clock deadline
-/// is cooperative, so a `log-record` implementation that writes to a stalled
-/// terminal consumer inline would pin the export inside its first poll and
-/// let it overrun `call_timeout_ms` indefinitely. With the bounded plugin-log
-/// queue, the export hands the record off without blocking and the stall is
-/// absorbed by the dedicated drain thread.
+/// Regression for the two failure modes of the `log-record` boundary.
+///
+/// Phase 1 (liveness): the host wall-clock deadline is cooperative, so an
+/// implementation that wrote to a stalled terminal consumer inline would pin
+/// the export inside its first poll and let it overrun `call_timeout_ms`
+/// indefinitely. With the bounded plugin-log queue, the export hands the
+/// record off without blocking and the stall lands on the drain thread.
+///
+/// Phase 2 (memory): the queue bound must be a byte bound, not just a record
+/// count. While the drain thread is stalled, a guest flooding large records
+/// may retain at most the aggregate byte budget on the host; records above
+/// the per-record cap are never queued at all. Both rejections are counted
+/// and reported as drops once the drain resumes.
 #[tokio::test]
-async fn blocked_host_log_writer_cannot_stall_export_past_deadline() {
-    const MARKER: &str = "zc-blocked-log-writer-marker";
-    /// Long enough that an inline (blocking) write visibly breaks the timing
-    /// assertion, short enough that a regressed run still terminates.
+async fn blocked_host_log_writer_cannot_stall_export_or_exhaust_host_memory() {
+    const STALL_MARKER: &str = "zc-blocked-log-writer-marker";
+    const FLOOD_MARKER: &str = "zc-log-flood-marker";
+    const OVERSIZED_MARKER: &str = "zc-log-oversized-marker";
+    /// Long enough that an inline (blocking) write visibly breaks the phase 1
+    /// timing assertion and that phase 2 can flood a stalled queue; short
+    /// enough that a regressed run still terminates.
     const WRITER_STALL: Duration = Duration::from_secs(10);
+    /// Mirror of the crate-private bounds in `component_logging.rs`; keep in
+    /// sync with `MAX_PLUGIN_LOG_RECORD_BYTES` / `PLUGIN_LOG_QUEUE_BYTE_BUDGET`.
+    const RECORD_CAP_BYTES: usize = 64 * 1024;
+    const BYTE_BUDGET: usize = 8 * 1024 * 1024;
+    /// Under the per-record cap so only the aggregate budget limits the flood.
+    const FLOOD_MSG_BYTES: usize = 60 * 1024;
+    const FLOOD_CALLS: usize = 2;
+    const RECORDS_PER_CALL: u64 = 100;
 
-    let saw_marker = Arc::new(AtomicBool::new(false));
-    let saw = Arc::clone(&saw_marker);
+    let saw_stall = Arc::new(AtomicBool::new(false));
+    let flood_delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let oversized_delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let overflow_reported = Arc::new(AtomicBool::new(false));
+    let (saw, flood, oversized, overflow) = (
+        Arc::clone(&saw_stall),
+        Arc::clone(&flood_delivered),
+        Arc::clone(&oversized_delivered),
+        Arc::clone(&overflow_reported),
+    );
     let installed = zeroclaw_log::try_install_line_sink_for_tests(move |line| {
-        if line.contains(MARKER) && !saw.swap(true, Ordering::SeqCst) {
+        if line.contains(FLOOD_MARKER) {
+            flood.fetch_add(1, Ordering::SeqCst);
+        }
+        if line.contains(OVERSIZED_MARKER) {
+            oversized.fetch_add(1, Ordering::SeqCst);
+        }
+        if line.contains("plugin log queue overflowed") {
+            overflow.store(true, Ordering::SeqCst);
+        }
+        if line.contains(STALL_MARKER) && !saw.swap(true, Ordering::SeqCst) {
             std::thread::sleep(WRITER_STALL);
         }
     });
@@ -303,11 +338,14 @@ async fn blocked_host_log_writer_cannot_stall_export_past_deadline() {
          this binary may install one"
     );
 
-    let mut plugin = plugin(Duration::from_millis(250)).await;
+    let mut stall_plugin = plugin(Duration::from_millis(250)).await;
+    let mut flood_plugin = plugin(Duration::from_secs(2)).await;
+
+    // Phase 1: the deadline holds through a stalled writer.
     let started = Instant::now();
     let result = execute(
-        &mut plugin,
-        serde_json::json!({"mode": "log", "message": MARKER}),
+        &mut stall_plugin,
+        serde_json::json!({"mode": "log", "message": STALL_MARKER}),
     )
     .await
     .expect("a logging export must complete despite the stalled writer");
@@ -321,11 +359,96 @@ async fn blocked_host_log_writer_cannot_stall_export_past_deadline() {
     // Delivery is asynchronous but must still happen: the record has to reach
     // the subscriber (and begin its stall there) shortly after the call.
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !saw_marker.load(Ordering::SeqCst) {
+    while !saw_stall.load(Ordering::SeqCst) {
         assert!(
             Instant::now() < deadline,
             "plugin log record was never delivered to the subscriber"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+
+    // Phase 2: with the drain thread stalled, flood roughly twice the byte
+    // budget in under-cap records plus a few over-cap records. Every export
+    // must still return promptly; retention is bounded by the budget.
+    let flood_started = Instant::now();
+    let flood_message = format!("{FLOOD_MARKER} {}", "x".repeat(FLOOD_MSG_BYTES));
+    for _ in 0..FLOOD_CALLS {
+        let result = execute(
+            &mut flood_plugin,
+            serde_json::json!({
+                "mode": "log",
+                "message": flood_message,
+                "count": RECORDS_PER_CALL
+            }),
+        )
+        .await
+        .expect("flooding the stalled log queue must not fail the export");
+        assert_eq!(&*result.output, "logged");
+    }
+    let oversized_message = format!("{OVERSIZED_MARKER} {}", "x".repeat(RECORD_CAP_BYTES + 1024));
+    let result = execute(
+        &mut flood_plugin,
+        serde_json::json!({
+            "mode": "log",
+            "message": oversized_message,
+            "count": 3
+        }),
+    )
+    .await
+    .expect("over-cap records must be absorbed, not fail the export");
+    assert_eq!(&*result.output, "logged");
+    assert!(
+        flood_started.elapsed() < Duration::from_secs(8),
+        "the flood must land while the writer is still stalled for the byte \
+         bound below to be deterministic: {:?}",
+        flood_started.elapsed()
+    );
+
+    // Phase 3: once the stall ends the drain reports the drops and delivers
+    // only what the byte budget admitted.
+    let deadline = Instant::now() + WRITER_STALL + Duration::from_secs(10);
+    while !overflow_reported.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "the drain thread never reported the dropped records"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Let delivery settle: the flood count must be stable for a while.
+    let mut settled = flood_delivered.load(Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let now_delivered = flood_delivered.load(Ordering::SeqCst);
+        if now_delivered == settled {
+            break;
+        }
+        settled = now_delivered;
+        assert!(
+            Instant::now() < deadline,
+            "flood delivery never settled: {now_delivered} records so far"
+        );
+    }
+
+    let delivered = flood_delivered.load(Ordering::SeqCst);
+    let sent = FLOOD_CALLS * RECORDS_PER_CALL as usize;
+    let max_within_budget = BYTE_BUDGET / FLOOD_MSG_BYTES + 2;
+    assert!(
+        delivered > 0,
+        "records inside the byte budget must still be delivered"
+    );
+    assert!(
+        delivered <= max_within_budget,
+        "the stalled queue retained more than its byte budget: \
+         {delivered} of {sent} records delivered (budget admits ~{max_within_budget})"
+    );
+    assert!(
+        delivered < sent,
+        "flooding past the byte budget must drop records, got all {sent}"
+    );
+    assert_eq!(
+        oversized_delivered.load(Ordering::SeqCst),
+        0,
+        "a record above the per-record cap must never be queued or delivered"
+    );
 }
