@@ -13281,7 +13281,7 @@ type = "manual"
         let terminal = engine
             .advance_headless_deterministic_step(&run_id, second)
             .unwrap();
-        assert!(matches!(terminal, SopRunAction::Completed { .. }));
+        assert!(matches!(terminal, SopRunAction::Cancelled { .. }));
         let finished = engine.get_run(&run_id).unwrap();
         assert_eq!(finished.status, SopRunStatus::Cancelled);
         assert_eq!(
