@@ -225,6 +225,107 @@ fn fit_quickstart_selector_row(row: &str, budget: usize) -> String {
 }
 
 #[cfg(feature = "agent-runtime")]
+fn quickstart_selector_resize_error(
+    initial_size: (u16, u16),
+    current_size: (u16, u16),
+) -> anyhow::Error {
+    let (initial_height, initial_width) = initial_size;
+    let (current_height, current_width) = current_size;
+    anyhow::Error::msg(qta(
+        "cli-quickstart-terminal-resized",
+        &[
+            ("initial_width", &initial_width.to_string()),
+            ("initial_height", &initial_height.to_string()),
+            ("current_width", &current_width.to_string()),
+            ("current_height", &current_height.to_string()),
+        ],
+    ))
+}
+
+/// Render the fixed-size Quickstart checklist without dialoguer paging.
+///
+/// The terminal dimensions sampled for fitting are part of this interaction's
+/// contract. Every input event rechecks them before navigation or selection;
+/// a resize clears the stale rendering and exits instead of allowing a redraw
+/// with strings fitted for a different width or a newly paged height.
+#[cfg(feature = "agent-runtime")]
+fn interact_quickstart_selector(
+    term: &console::Term,
+    labels: &[String],
+    prompt: &str,
+    initial_size: (u16, u16),
+) -> Result<Option<usize>> {
+    if labels.is_empty() {
+        bail!(qta("cli-quickstart-empty-checklist", &[]));
+    }
+    let current_size = term.size();
+    if current_size != initial_size {
+        return Err(quickstart_selector_resize_error(initial_size, current_size));
+    }
+
+    fn render(
+        term: &console::Term,
+        labels: &[String],
+        prompt: &str,
+        selected: usize,
+    ) -> std::io::Result<()> {
+        term.write_line(&format!("? {prompt}"))?;
+        for (index, label) in labels.iter().enumerate() {
+            let marker = if index == selected { ">" } else { " " };
+            term.write_line(&format!("{marker} {label}"))?;
+        }
+        term.flush()
+    }
+
+    fn clear(term: &console::Term, labels: &[String]) -> std::io::Result<()> {
+        term.clear_last_lines(labels.len().saturating_add(1))
+    }
+
+    term.hide_cursor()?;
+    let interaction = (|| -> Result<Option<usize>> {
+        let mut selected = 0;
+        render(term, labels, prompt, selected)?;
+
+        loop {
+            let key = term.read_key()?;
+            let current_size = term.size();
+            if current_size != initial_size {
+                term.clear_screen()?;
+                return Err(quickstart_selector_resize_error(initial_size, current_size));
+            }
+
+            match key {
+                console::Key::ArrowDown | console::Key::Tab | console::Key::Char('j') => {
+                    clear(term, labels)?;
+                    selected = (selected + 1) % labels.len();
+                    render(term, labels, prompt, selected)?;
+                }
+                console::Key::ArrowUp | console::Key::BackTab | console::Key::Char('k') => {
+                    clear(term, labels)?;
+                    selected = selected.checked_sub(1).unwrap_or(labels.len() - 1);
+                    render(term, labels, prompt, selected)?;
+                }
+                console::Key::Enter | console::Key::Char(' ') => {
+                    clear(term, labels)?;
+                    return Ok(Some(selected));
+                }
+                console::Key::Escape | console::Key::Char('q') => {
+                    clear(term, labels)?;
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
+    })();
+    let cursor = term.show_cursor().and_then(|()| term.flush());
+    match (interaction, cursor) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Ok(selection), Ok(())) => Ok(selection),
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QuickstartChecklistAction {
     Provider,
@@ -1658,7 +1759,8 @@ async fn run_quickstart_cli(
         ));
 
         let term = console::Term::stderr();
-        let (terminal_height, terminal_width) = term.size();
+        let terminal_size = term.size();
+        let (terminal_height, terminal_width) = terminal_size;
         let terminal_height = usize::from(terminal_height);
         let terminal_width = usize::from(terminal_width);
         let Some(row_budget) = quickstart_selector_row_budget(terminal_width) else {
@@ -1696,16 +1798,9 @@ async fn run_quickstart_cli(
             ),
             row_budget,
         );
-        // Keep this checklist non-searchable and non-paged. FuzzySelect appends
-        // an unbounded search term to the prompt, while a paged Select appends a
-        // dynamic page suffix. The width and height guards above therefore
-        // bound every line rendered by this selector.
-        let pick = Select::new()
-            .with_prompt(prompt)
-            .items(&labels)
-            .default(0)
-            .max_length(labels.len())
-            .interact_on_opt(&term)?;
+        // Keep this checklist non-searchable and non-paged, and fail closed if
+        // its fitted terminal dimensions change while it is active.
+        let pick = interact_quickstart_selector(&term, &labels, &prompt, terminal_size)?;
         let action = quickstart_action_for_pick(&choices, pick);
 
         match action {

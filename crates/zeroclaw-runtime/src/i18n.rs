@@ -486,6 +486,25 @@ mod tests {
             height_message,
             "Quickstart needs a terminal at least 9 rows tall; the current terminal is 8 rows. Make the terminal taller and try again."
         );
+
+        let resized_message = get_english_cli_string_with_args(
+            "cli-quickstart-terminal-resized",
+            &[
+                ("initial_width", "40"),
+                ("initial_height", "9"),
+                ("current_width", "4"),
+                ("current_height", "9"),
+            ],
+        );
+        assert_eq!(
+            resized_message,
+            "The terminal changed from 40x9 to 4x9 while the Quickstart checklist was open. Reopen the checklist to continue."
+        );
+
+        assert_eq!(
+            get_english_cli_string_with_args("cli-quickstart-empty-checklist", &[]),
+            "Quickstart cannot open an empty checklist."
+        );
     }
 
     #[test]
