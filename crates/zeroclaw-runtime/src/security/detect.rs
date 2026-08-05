@@ -6,6 +6,8 @@ use std::sync::Arc;
 use zeroclaw_config::schema::{RuntimeKind, SandboxBackend, SandboxConfig};
 
 const NOOP_DESCRIPTION: &str = "No sandboxing (application-layer security only)";
+const DOCKER_RUNTIME_DESCRIPTION: &str =
+    "Docker runtime container isolation (runtime.kind = \"docker\"; no additional sandbox wrapper)";
 const LANDLOCK_DESCRIPTION: &str = "Linux kernel LSM sandboxing (filesystem access control)";
 const FIREJAIL_DESCRIPTION: &str = "Linux user-space sandbox (requires firejail to be installed)";
 const BUBBLEWRAP_DESCRIPTION: &str = "User namespace sandbox (requires bwrap)";
@@ -52,8 +54,11 @@ fn sandbox_posture_result(
         requested_backend,
         active_backend,
         active_description,
+        // An explicit `backend = "docker"` on the Docker runtime is honored by
+        // the runtime container itself, so it is not a fallback.
         fallback: !matches!(requested_backend, "auto" | "none")
-            && active_backend != requested_backend,
+            && active_backend != requested_backend
+            && !(requested_backend == "docker" && active_backend == "docker-runtime"),
     }
 }
 
@@ -64,6 +69,11 @@ enum SelectedSandboxBackend {
     Firejail,
     Bubblewrap,
     Docker,
+    /// No additional sandbox wrapper is constructed, but containment is not
+    /// lost: `runtime.kind = "docker"` already runs every command inside the
+    /// runtime container. Distinct from `None` so posture reporting does not
+    /// describe this state as application-layer-only.
+    DockerRuntime,
     SandboxExec,
 }
 
@@ -75,6 +85,7 @@ impl SelectedSandboxBackend {
             Self::Firejail => "firejail",
             Self::Bubblewrap => "bubblewrap",
             Self::Docker => "docker",
+            Self::DockerRuntime => "docker-runtime",
             Self::SandboxExec => "sandbox-exec",
         }
     }
@@ -86,6 +97,7 @@ impl SelectedSandboxBackend {
             Self::Firejail => FIREJAIL_DESCRIPTION,
             Self::Bubblewrap => BUBBLEWRAP_DESCRIPTION,
             Self::Docker => DOCKER_DESCRIPTION,
+            Self::DockerRuntime => DOCKER_RUNTIME_DESCRIPTION,
             Self::SandboxExec => SEATBELT_DESCRIPTION,
         }
     }
@@ -109,6 +121,10 @@ fn configured_backend_selection(
 ) -> SelectedSandboxBackend {
     if matches!(backend, SandboxBackend::Auto) {
         return detect_best_backend(runtime_kind, workspace_dir);
+    }
+
+    if matches!(backend, SandboxBackend::Docker) && matches!(runtime_kind, RuntimeKind::Docker) {
+        return SelectedSandboxBackend::DockerRuntime;
     }
 
     SelectedSandboxBackend::from_config(backend)
@@ -181,6 +197,10 @@ fn detect_best_backend_with(
         return SelectedSandboxBackend::Docker;
     }
 
+    if matches!(runtime_kind, RuntimeKind::Docker) {
+        return SelectedSandboxBackend::DockerRuntime;
+    }
+
     SelectedSandboxBackend::None
 }
 
@@ -190,6 +210,9 @@ fn sandbox_backend_available(
 ) -> bool {
     match backend {
         SelectedSandboxBackend::None => true,
+        // Containment comes from the runtime container itself; there is no
+        // host-side wrapper to probe.
+        SelectedSandboxBackend::DockerRuntime => true,
         SelectedSandboxBackend::Landlock => landlock_available(workspace_dir),
         SelectedSandboxBackend::Firejail => {
             #[cfg(target_os = "linux")]
@@ -283,16 +306,14 @@ pub fn create_sandbox(
         }
         requested => {
             let selected = configured_backend_selection(requested, runtime_kind, workspace_dir);
+            if matches!(selected, SelectedSandboxBackend::DockerRuntime) {
+                log_docker_sandbox_redundant_with_docker_runtime();
+                return Arc::new(super::traits::NoopSandbox);
+            }
             if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir) {
                 return sandbox;
             }
-            if matches!(requested, SandboxBackend::Docker)
-                && matches!(runtime_kind, RuntimeKind::Docker)
-            {
-                log_docker_sandbox_redundant_with_docker_runtime();
-            } else {
-                log_requested_backend_unavailable(selected_backend_label(requested));
-            }
+            log_requested_backend_unavailable(selected_backend_label(requested));
             Arc::new(super::traits::NoopSandbox)
         }
     }
@@ -303,6 +324,10 @@ fn detect_best_sandbox(
     workspace_dir: Option<&Path>,
 ) -> Arc<dyn Sandbox> {
     let selected = detect_best_backend(runtime_kind, workspace_dir);
+    if matches!(selected, SelectedSandboxBackend::DockerRuntime) {
+        log_auto_backend_selection(selected, runtime_kind);
+        return Arc::new(super::traits::NoopSandbox);
+    }
     if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir) {
         log_auto_backend_selection(selected, runtime_kind);
         return sandbox;
@@ -318,6 +343,8 @@ fn create_selected_sandbox(
 ) -> Option<Arc<dyn Sandbox>> {
     match selected {
         SelectedSandboxBackend::None => None,
+        // The runtime container owns containment; no wrapper is constructed.
+        SelectedSandboxBackend::DockerRuntime => None,
         SelectedSandboxBackend::Landlock => {
             #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
             {
@@ -430,17 +457,26 @@ fn log_auto_backend_selection(selected: SelectedSandboxBackend, runtime_kind: Ru
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                     "Docker sandbox skipped: runtime.kind = \"native\" overrides auto-detection"
                 );
-            } else if matches!(runtime_kind, RuntimeKind::Docker) {
+            }
+            if matches!(runtime_kind, RuntimeKind::Docker) {
                 ::zeroclaw_log::record!(
-                    DEBUG,
+                    INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                    "Docker sandbox skipped: runtime.kind = \"docker\" already provides container isolation"
+                    "No additional sandbox backend available; Docker runtime still provides container isolation"
+                );
+            } else {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "No sandbox backend available, using application-layer security"
                 );
             }
+        }
+        SelectedSandboxBackend::DockerRuntime => {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                "No sandbox backend available, using application-layer security"
+                "Docker runtime provides container isolation; no additional sandbox wrapper needed"
             );
         }
         SelectedSandboxBackend::Landlock => {
@@ -616,6 +652,20 @@ mod tests {
             matches!(backend, SelectedSandboxBackend::Docker)
         });
 
+        assert_eq!(selected, SelectedSandboxBackend::DockerRuntime);
+    }
+
+    #[test]
+    fn docker_runtime_auto_selection_reports_runtime_containment_when_nothing_available() {
+        let selected = detect_best_backend_with(RuntimeKind::Docker, |_| false);
+
+        assert_eq!(selected, SelectedSandboxBackend::DockerRuntime);
+    }
+
+    #[test]
+    fn native_runtime_auto_selection_reports_none_when_nothing_available() {
+        let selected = detect_best_backend_with(RuntimeKind::Native, |_| false);
+
         assert_eq!(selected, SelectedSandboxBackend::None);
     }
 
@@ -638,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_docker_backend_falls_back_on_docker_runtime() {
+    fn explicit_docker_backend_creates_no_extra_wrapper_on_docker_runtime() {
         let sandbox_cfg = SandboxConfig {
             enabled: None,
             backend: SandboxBackend::Docker,
@@ -651,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_docker_posture_reports_fallback_on_docker_runtime() {
+    fn explicit_docker_posture_reports_runtime_containment_on_docker_runtime() {
         let sandbox_cfg = SandboxConfig {
             enabled: None,
             backend: SandboxBackend::Docker,
@@ -661,8 +711,30 @@ mod tests {
         let posture = sandbox_posture(&sandbox_cfg, RuntimeKind::Docker, None);
 
         assert_eq!(posture.requested_backend, "docker");
-        assert_eq!(posture.active_backend, "none");
-        assert!(posture.fallback);
+        assert_eq!(posture.active_backend, "docker-runtime");
+        assert_eq!(posture.active_description, DOCKER_RUNTIME_DESCRIPTION);
+        assert!(
+            !posture.fallback,
+            "Docker runtime honors the requested containment; it is not a fallback"
+        );
+    }
+
+    #[test]
+    fn docker_runtime_auto_posture_never_reports_application_layer_only() {
+        let sandbox_cfg = SandboxConfig {
+            enabled: None,
+            backend: SandboxBackend::Auto,
+            firejail_args: Vec::new(),
+        };
+
+        let posture = sandbox_posture(&sandbox_cfg, RuntimeKind::Docker, None);
+
+        // Depending on the host an OS-native backend may be active, but the
+        // posture must never degrade to "none" (containment is not lost) nor
+        // nest a second Docker layer.
+        assert_ne!(posture.active_backend, "none");
+        assert_ne!(posture.active_backend, "docker");
+        assert!(!posture.fallback);
     }
 
     #[test]

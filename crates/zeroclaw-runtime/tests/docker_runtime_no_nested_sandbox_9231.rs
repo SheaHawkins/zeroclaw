@@ -12,8 +12,8 @@ use tokio::sync::{Mutex, MutexGuard};
 use zeroclaw_api::tool::Tool;
 use zeroclaw_config::platform::DockerRuntime;
 use zeroclaw_config::schema::{Config, RuntimeKind};
-use zeroclaw_runtime::security::{AutonomyLevel, SecurityPolicy, create_sandbox};
-use zeroclaw_runtime::tools::ShellTool;
+use zeroclaw_runtime::security::{AutonomyLevel, SecurityPolicy, sandbox_posture};
+use zeroclaw_runtime::tools::shell_tool_for_runtime;
 
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -105,16 +105,22 @@ sandbox_backend = "docker"
     let config = Config::load_or_init().await.expect("load config fixture");
     assert_eq!(config.runtime.kind, RuntimeKind::Docker);
 
-    let sandbox_config = config
+    let risk_profile = config
         .risk_profiles
         .get("default")
-        .expect("default risk profile")
-        .sandbox_config();
-    let sandbox = create_sandbox(&sandbox_config, config.runtime.kind, Some(install.path()));
+        .expect("default risk profile");
+    let posture = sandbox_posture(
+        &risk_profile.sandbox_config(),
+        config.runtime.kind,
+        Some(install.path()),
+    );
     assert_eq!(
-        sandbox.name(),
-        "none",
+        posture.active_backend, "docker-runtime",
         "Docker runtime must own the only Docker execution layer"
+    );
+    assert!(
+        !posture.fallback,
+        "runtime-owned containment must not be reported as a lost fallback"
     );
 
     let security = Arc::new(SecurityPolicy {
@@ -125,7 +131,7 @@ sandbox_backend = "docker"
         ..SecurityPolicy::default()
     });
     let runtime = Arc::new(DockerRuntime::new(config.runtime.docker.clone()));
-    let tool = ShellTool::new_with_sandbox(security, runtime, sandbox).with_tui_env(Some(
+    let tool = shell_tool_for_runtime(security, runtime, risk_profile, &config).with_tui_env(Some(
         HashMap::from([("PATH".to_string(), bin_dir.to_string_lossy().into_owned())]),
     ));
 
