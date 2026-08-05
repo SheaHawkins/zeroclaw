@@ -904,17 +904,16 @@ impl Agent {
         AgentBuilder::new()
     }
 
-    /// The full `Config` the agent was constructed from, when available. Sourced
-    /// from `provider_switch_config` - the single canonical config snapshot the
-    /// agent already carries for provider-alias resolution. `None` only on
-    /// configless (test-builder) agents; every production construction path
-    /// (`from_config` / `from_config_with_tui_env`) populates it. Used by the
-    /// vision route to resolve the configured `vision_model_provider`'s
-    /// alias-specific options (the `vision` override, endpoint URI, credentials).
-    fn full_config(&self) -> Option<&zeroclaw_config::schema::Config> {
-        self.provider_switch_config
-            .as_ref()
-            .and_then(|cfg| cfg.config.as_deref())
+    /// Resolve one immutable config snapshot for alias-aware per-turn policy.
+    /// Live agents read the canonical handle at use time; static agents reuse
+    /// their construction snapshot. `None` is reserved for configless test
+    /// builders.
+    fn full_config_snapshot(&self) -> Option<Arc<zeroclaw_config::schema::Config>> {
+        let switch_config = self.provider_switch_config.as_ref()?;
+        match switch_config.live_config.as_ref() {
+            Some(live_config) => Some(Arc::new(live_config.read().clone())),
+            None => switch_config.config.clone(),
+        }
     }
 
     fn tool_loop_cost_tracking_context(&self) -> crate::agent::loop_::ToolLoopCostTrackingContext {
@@ -1592,33 +1591,32 @@ impl Agent {
         };
 
         let provider_ref = format!("{provider_name}.{provider_alias}");
-        let provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
-            config,
-            provider_name,
-            provider_alias,
-        );
-
         let model_provider: Box<dyn ModelProvider> = match live_config.as_ref() {
             Some(live_config) => {
                 zeroclaw_providers::create_routed_model_provider_with_live_config_options(
                     Arc::clone(live_config),
                     &provider_ref,
+                    &model_name,
+                )?
+            }
+            None => {
+                let provider_runtime_options =
+                    zeroclaw_providers::provider_runtime_options_for_alias(
+                        config,
+                        provider_name,
+                        provider_alias,
+                    );
+                zeroclaw_providers::create_routed_model_provider_with_options(
+                    config,
+                    &provider_ref,
                     agent_model_provider.and_then(|e| e.api_key.as_deref()),
                     agent_model_provider.and_then(|e| e.uri.as_deref()),
+                    &config.reliability,
+                    &config.model_routes,
                     &model_name,
                     &provider_runtime_options,
                 )?
             }
-            None => zeroclaw_providers::create_routed_model_provider_with_options(
-                config,
-                &provider_ref,
-                agent_model_provider.and_then(|e| e.api_key.as_deref()),
-                agent_model_provider.and_then(|e| e.uri.as_deref()),
-                &config.reliability,
-                &config.model_routes,
-                &model_name,
-                &provider_runtime_options,
-            )?,
         };
 
         let tool_dispatcher = tool_dispatcher_for_provider(agent_cfg, model_provider.as_ref());
@@ -2229,9 +2227,10 @@ impl Agent {
 
         let active_dispatcher = {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let full_config = self.full_config_snapshot();
             let (vision_provider_box, _degrade_strip_images) =
                 match crate::agent::turn::resolve_vision_provider(
-                    self.full_config(),
+                    full_config.as_deref(),
                     self.model_provider.as_ref(),
                     &base_provider_messages,
                     &self.multimodal_config,
@@ -2309,6 +2308,7 @@ impl Agent {
             &self.config.resolved.tool_receipts,
         );
         let agent_alias_for_loop = self.observer_agent_alias();
+        let full_config = self.full_config_snapshot();
         let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
                 Some(cost_context.clone()),
@@ -2328,12 +2328,7 @@ impl Agent {
                                 silent: false,
                                 approval: self.approval_manager.as_deref(),
                                 multimodal_config: &self.multimodal_config,
-                                // Inlined `full_config()` (per-field borrow) so it coexists with
-                                // the `&mut self.image_cache` in this same ToolLoop expression.
-                                config: self
-                                    .provider_switch_config
-                                    .as_ref()
-                                    .and_then(|c| c.config.as_deref()),
+                                config: full_config.as_deref(),
                                 hooks: self.hook_runner.as_deref(),
                                 activated_tools: self.activated_tools.as_ref(),
                                 model_switch_callback: None,
@@ -2551,9 +2546,10 @@ impl Agent {
 
         let active_dispatcher = {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let full_config = self.full_config_snapshot();
             let (vision_provider_box, _degrade_strip_images) =
                 match crate::agent::turn::resolve_vision_provider(
-                    self.full_config(),
+                    full_config.as_deref(),
                     self.model_provider.as_ref(),
                     &base_provider_messages,
                     &self.multimodal_config,
@@ -2712,6 +2708,7 @@ impl Agent {
                 let enriched = format!("[{now}] {steering_message}");
                 round_added.push(ChatMessage::user(enriched));
             }
+            let full_config = self.full_config_snapshot();
             let round_loop = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 Some(cost_context.clone()),
                 crate::agent::tool_receipts::scope_receipts(
@@ -2730,12 +2727,7 @@ impl Agent {
                                 silent: true,
                                 approval: self.approval_manager.as_deref(),
                                 multimodal_config: &self.multimodal_config,
-                                // Inlined `full_config()` (per-field borrow) so it coexists with
-                                // the `&mut self.image_cache` in this same ToolLoop expression.
-                                config: self
-                                    .provider_switch_config
-                                    .as_ref()
-                                    .and_then(|c| c.config.as_deref()),
+                                config: full_config.as_deref(),
                                 hooks: self.hook_runner.as_deref(),
                                 activated_tools: self.activated_tools.as_ref(),
                                 // `None` here (rather than a shared global) is
@@ -4669,6 +4661,131 @@ mod tests {
                 !system.content.contains(XML_TOOLS_MARKER),
                 "provider-visible transcript must advertise native tools for vision provider"
             );
+        }
+
+        #[tokio::test]
+        async fn live_agent_direct_and_streamed_turns_resolve_vision_alias() {
+            use axum::{
+                Json, Router,
+                extract::State,
+                http::{HeaderMap, StatusCode},
+                response::{IntoResponse, Response},
+                routing::post,
+            };
+            use serde_json::{Value, json};
+
+            type Capture = Arc<Mutex<Vec<(String, String)>>>;
+
+            async fn capture_vision_request(
+                State(capture): State<Capture>,
+                headers: HeaderMap,
+                Json(body): Json<Value>,
+            ) -> Response {
+                let auth = headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                let model = body
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                capture.lock().push((auth, model));
+
+                if body.get("stream").and_then(Value::as_bool) == Some(true) {
+                    return (
+                        StatusCode::OK,
+                        [("content-type", "text/event-stream")],
+                        concat!(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                            "data: [DONE]\n\n"
+                        ),
+                    )
+                        .into_response();
+                }
+
+                Json(json!({
+                    "choices": [{"message": {"content": "ok"}}]
+                }))
+                .into_response()
+            }
+
+            fn live_vision_agent(
+                live_config: Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
+            ) -> Agent {
+                let (base_provider, _) = capturing_provider(true);
+                let multimodal = zeroclaw_config::schema::MultimodalConfig {
+                    vision_model_provider: Some("custom.myvision".to_string()),
+                    ..Default::default()
+                };
+                let mut agent = test_agent_with_provider_and_multimodal(
+                    base_provider,
+                    vec![Box::new(MockTool)],
+                    Some(Box::new(NativeToolDispatcher)),
+                    Some(multimodal),
+                );
+                agent.provider_switch_config = Some(ProviderSwitchConfig {
+                    config: None,
+                    live_config: Some(live_config),
+                });
+                agent
+            }
+
+            let capture: Capture = Arc::new(Mutex::new(Vec::new()));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind vision test server");
+            let addr = listener.local_addr().expect("vision test server addr");
+            let app = Router::new()
+                .route("/v1/chat/completions", post(capture_vision_request))
+                .with_state(Arc::clone(&capture));
+            let server = zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("serve vision test endpoint");
+            });
+
+            let config: zeroclaw_config::schema::Config = toml::from_str(&format!(
+                r#"
+schema_version = 3
+[providers.models.custom.myvision]
+kind = "openai-compatible"
+uri = "http://{addr}/v1"
+api_key = "sk-live-vision"
+model = "vision-model"
+vision = true
+"#
+            ))
+            .expect("live vision config parses");
+            let live_config = Arc::new(parking_lot::RwLock::new(config));
+            let message = "describe [IMAGE:data:image/png;base64,iVBORw0KGgo=]";
+
+            let mut direct_agent = live_vision_agent(Arc::clone(&live_config));
+            assert_eq!(direct_agent.turn(message).await.unwrap(), "ok");
+
+            let mut streamed_agent = live_vision_agent(Arc::clone(&live_config));
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
+            streamed_agent
+                .turn_streamed(message, event_tx, None)
+                .await
+                .expect("streamed live-agent vision turn succeeds");
+
+            assert_eq!(
+                &*capture.lock(),
+                &[
+                    (
+                        "Bearer sk-live-vision".to_string(),
+                        "vision-model".to_string()
+                    ),
+                    (
+                        "Bearer sk-live-vision".to_string(),
+                        "vision-model".to_string()
+                    ),
+                ],
+                "both live-agent entry points must use the alias endpoint, credential, and model"
+            );
+            server.abort();
         }
     }
 

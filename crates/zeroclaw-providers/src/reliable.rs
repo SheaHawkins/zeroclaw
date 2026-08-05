@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub(crate) type CredentialProviderFactory =
-    Arc<dyn Fn() -> anyhow::Result<Box<dyn ModelProvider>> + Send + Sync>;
+    Arc<dyn Fn(&str) -> anyhow::Result<Box<dyn ModelProvider>> + Send + Sync>;
 pub(crate) type CredentialResolver = Arc<dyn Fn() -> Vec<CredentialAttempt> + Send + Sync>;
 
 pub(crate) struct CredentialAttempt {
@@ -25,12 +25,15 @@ pub(crate) struct CredentialAttempt {
 
 impl CredentialAttempt {
     pub(crate) fn new(key: String, build: CredentialProviderFactory) -> Self {
-        Self { key, build }
+        Self {
+            key: key.trim().to_string(),
+            build,
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn build_for_test(&self) -> anyhow::Result<Box<dyn ModelProvider>> {
-        (self.build)()
+        (self.build)(&self.key)
     }
 }
 
@@ -59,27 +62,35 @@ struct ProviderPin {
     model: String,
 }
 
+#[derive(Default)]
+pub(crate) struct CredentialCooldowns {
+    cooldowns: Mutex<HashMap<CredentialId, Instant>>,
+}
+
 pub(crate) struct CredentialRotation {
     resolve: CredentialResolver,
-    cooldowns: Mutex<HashMap<CredentialId, Instant>>,
+    cooldowns: Arc<CredentialCooldowns>,
 }
 
 impl CredentialRotation {
     pub(crate) fn new(resolve: CredentialResolver) -> Arc<Self> {
-        Arc::new(Self {
-            resolve,
-            cooldowns: Mutex::new(HashMap::new()),
-        })
+        Self::with_cooldowns(resolve, Arc::new(CredentialCooldowns::default()))
+    }
+
+    pub(crate) fn with_cooldowns(
+        resolve: CredentialResolver,
+        cooldowns: Arc<CredentialCooldowns>,
+    ) -> Arc<Self> {
+        Arc::new(Self { resolve, cooldowns })
     }
 
     fn pool(&self) -> Vec<CredentialAttempt> {
         let mut pool = Vec::new();
         for attempt in (self.resolve)() {
-            let key = attempt.key.trim();
-            if !key.is_empty()
+            if !attempt.key.is_empty()
                 && !pool
                     .iter()
-                    .any(|existing: &CredentialAttempt| existing.key == key)
+                    .any(|existing: &CredentialAttempt| existing.key == attempt.key)
             {
                 pool.push(attempt);
             }
@@ -96,13 +107,10 @@ impl CredentialRotation {
         let now = Instant::now();
         let mut cooldowns = self
             .cooldowns
+            .cooldowns
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let live_ids: Vec<_> = pool
-            .iter()
-            .map(|attempt| CredentialId::of(&attempt.key))
-            .collect();
-        cooldowns.retain(|id, deadline| now < *deadline && live_ids.contains(id));
+        cooldowns.retain(|_, deadline| now < *deadline);
 
         let first = start_after.map_or(0, |slot| (slot + 1) % pool.len());
         (0..pool.len()).find_map(|offset| {
@@ -126,13 +134,10 @@ impl CredentialRotation {
         let pool = self.pool();
         let mut cooldowns = self
             .cooldowns
+            .cooldowns
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let live_ids: Vec<_> = pool
-            .iter()
-            .map(|attempt| CredentialId::of(&attempt.key))
-            .collect();
-        cooldowns.retain(|id, _| live_ids.contains(id));
+        cooldowns.retain(|_, deadline| Instant::now() < *deadline);
         let current_slot = pool
             .iter()
             .position(|attempt| attempt.key == credential.key);
@@ -147,7 +152,7 @@ impl CredentialRotation {
         selected: SelectedCredential,
         pin: Option<&ProviderPin>,
     ) -> anyhow::Result<BoundProvider> {
-        let provider = (selected.build)()?;
+        let provider = (selected.build)(&selected.key)?;
         let provider: Box<dyn ModelProvider> = match pin {
             Some(pin) => Box::new(
                 crate::model_pin::ModelPinnedProvider::builder(&pin.alias)
@@ -2948,12 +2953,11 @@ mod tests {
             keys.iter()
                 .map(|key| {
                     let attempt_key = key.clone();
-                    let build_key = key.clone();
                     let build_seen = Arc::clone(&resolve_seen);
                     let build_barrier = barrier.clone();
-                    let build: CredentialProviderFactory = Arc::new(move || {
+                    let build: CredentialProviderFactory = Arc::new(move |build_key| {
                         Ok(Box::new(KeyedMock {
-                            key: build_key.clone(),
+                            key: build_key.to_string(),
                             seen: Arc::clone(&build_seen),
                             rate_limit_barrier: build_barrier.clone(),
                         }))
@@ -2967,7 +2971,7 @@ mod tests {
     }
 
     fn unbound_attempt(key: &str) -> CredentialAttempt {
-        CredentialAttempt::new(key.to_string(), Arc::new(|| anyhow::bail!("not used")))
+        CredentialAttempt::new(key.to_string(), Arc::new(|_| anyhow::bail!("not used")))
     }
 
     /// Mock that records which model was used for each call.
@@ -3936,7 +3940,7 @@ mod tests {
     #[test]
     fn credential_pool_deduplicates_blank_and_duplicate_keys() {
         let rotation = CredentialRotation::new(Arc::new(|| {
-            ["primary", " ", "secondary", "primary"]
+            [" primary ", " ", "secondary", "primary"]
                 .into_iter()
                 .map(unbound_attempt)
                 .collect()
@@ -3949,6 +3953,28 @@ mod tests {
                 .map(|attempt| attempt.key)
                 .collect::<Vec<_>>(),
             vec!["primary", "secondary"]
+        );
+    }
+
+    #[tokio::test]
+    async fn whitespace_equivalent_credentials_share_binding_and_cooldown_identity() {
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let provider = keyed_reliable(
+            vec![" bad-primary ".into(), "bad-primary".into()],
+            1,
+            Arc::clone(&seen),
+            None,
+        );
+
+        provider
+            .simple_chat("hello", "test", None)
+            .await
+            .expect_err("the canonical credential is cooled with no healthy alternate");
+
+        assert_eq!(
+            &*seen.lock(),
+            &["bad-primary"],
+            "a whitespace-equivalent spelling must not rebind or retry the same credential"
         );
     }
 
