@@ -277,7 +277,7 @@ async fn uninterrupted_guest_compute_cannot_starve_wall_clock_deadline() {
     assert!(started.elapsed() < Duration::from_secs(2));
 }
 
-/// Regression for the three contracts of the `log-record` boundary.
+/// Regression for the contracts of the `log-record` boundary.
 ///
 /// Phase 0 (attribution): deferring delivery to the drain thread must not
 /// change what an event means. A record emitted under a host attribution
@@ -296,6 +296,10 @@ async fn uninterrupted_guest_compute_cannot_starve_wall_clock_deadline() {
 /// may retain at most the aggregate byte budget on the host; records above
 /// the per-record cap are never queued at all. Both rejections are counted
 /// and reported as drops once the drain resumes.
+///
+/// Phase 4 (loss observability): a rejection must be reported even when no
+/// accepted record ever follows it; the drain thread's idle wake surfaces
+/// the drop count on its own schedule.
 #[tokio::test]
 async fn blocked_host_log_writer_cannot_stall_export_or_exhaust_host_memory() {
     const ATTRIB_MARKER: &str = "zc-log-attribution-marker";
@@ -331,13 +335,13 @@ async fn blocked_host_log_writer_cannot_stall_export_or_exhaust_host_memory() {
     let saw_stall = Arc::new(AtomicBool::new(false));
     let flood_delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let oversized_delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let overflow_reported = Arc::new(AtomicBool::new(false));
+    let overflow_reports = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let attrib_line = Arc::new(std::sync::Mutex::new(None::<String>));
     let (saw, flood, oversized, overflow, attrib) = (
         Arc::clone(&saw_stall),
         Arc::clone(&flood_delivered),
         Arc::clone(&oversized_delivered),
-        Arc::clone(&overflow_reported),
+        Arc::clone(&overflow_reports),
         Arc::clone(&attrib_line),
     );
     let installed = zeroclaw_log::try_install_line_sink_for_tests(move |line| {
@@ -353,7 +357,7 @@ async fn blocked_host_log_writer_cannot_stall_export_or_exhaust_host_memory() {
             oversized.fetch_add(1, Ordering::SeqCst);
         }
         if line.contains("plugin log queue overflowed") {
-            overflow.store(true, Ordering::SeqCst);
+            overflow.fetch_add(1, Ordering::SeqCst);
         }
         if line.contains(STALL_MARKER) && !saw.swap(true, Ordering::SeqCst) {
             std::thread::sleep(WRITER_STALL);
@@ -492,7 +496,7 @@ async fn blocked_host_log_writer_cannot_stall_export_or_exhaust_host_memory() {
     // Phase 3: once the stall ends the drain reports the drops and delivers
     // only what the byte budget admitted.
     let deadline = Instant::now() + WRITER_STALL + Duration::from_secs(10);
-    while !overflow_reported.load(Ordering::SeqCst) {
+    while overflow_reports.load(Ordering::SeqCst) == 0 {
         assert!(
             Instant::now() < deadline,
             "the drain thread never reported the dropped records"
@@ -536,4 +540,29 @@ async fn blocked_host_log_writer_cannot_stall_export_or_exhaust_host_memory() {
         0,
         "a record above the per-record cap must never be queued or delivered"
     );
+
+    // Phase 4: rejections must be reported even when no accepted record ever
+    // follows them. Emit only over-cap records, keep the queue otherwise
+    // idle, and require a fresh overflow report from the drain thread's
+    // idle wake within a couple of its 2 s intervals.
+    let reports_before_idle = overflow_reports.load(Ordering::SeqCst);
+    let result = execute(
+        &mut flood_plugin,
+        serde_json::json!({
+            "mode": "log",
+            "message": oversized_message,
+            "count": 3
+        }),
+    )
+    .await
+    .expect("rejected-only logging export still completes");
+    assert_eq!(&*result.output, "logged");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while overflow_reports.load(Ordering::SeqCst) == reports_before_idle {
+        assert!(
+            Instant::now() < deadline,
+            "drops with no following accepted record were never reported"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }

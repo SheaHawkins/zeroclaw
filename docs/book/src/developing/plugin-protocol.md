@@ -393,8 +393,9 @@ guest's `max_memory_mb` ceiling: a record whose guest-controlled bytes exceed
 64 KiB is dropped rather than truncated, and queued records draw on a fixed
 8 MiB aggregate byte budget that is released only after a record is written.
 A full queue, an over-cap record, or an exhausted budget all drop the newest
-record; the drain thread reports the accumulated drop count so the loss stays
-observable. `plugin-action` and `plugin-outcome` mirror the closed
+record; the drain thread reports the accumulated drop count after each write
+and on an idle wake, so the loss stays observable even when no accepted
+record ever follows the rejected ones. `plugin-action` and `plugin-outcome` mirror the closed
 `Action` / `EventOutcome` taxonomies in `zeroclaw-log`; there is no escape-hatch
 variant on purpose. Do not call `wasi:logging` directly, plugin events would be
 formatted inconsistently and would not reach all of the destinations

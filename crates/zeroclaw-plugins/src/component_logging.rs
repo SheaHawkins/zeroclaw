@@ -17,7 +17,11 @@
 //! is dropped, and queued records reserve from the aggregate
 //! [`PLUGIN_LOG_QUEUE_BYTE_BUDGET`], released only after the drain side has
 //! written them. Every rejected record, whatever the reason, lands in the same
-//! drop counter the drain side reports.
+//! drop counter, and the drain thread reports new drops after each written
+//! record and on an idle-wake interval, so loss is surfaced even when nothing
+//! accepted ever follows the rejected records. The one unreportable corner is
+//! a drain thread that could not spawn at all: rejections are still counted,
+//! but there is no thread left to write the report.
 //!
 //! Deferral must not change what an event means: each record captures the
 //! host span that was current at the guest call site, and the drain thread
@@ -26,7 +30,8 @@
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::time::Duration;
 
 use zeroclaw_log::{Action, Event, EventOutcome, record};
 
@@ -159,15 +164,30 @@ fn enqueue_plugin_log(log: QueuedPluginLog) {
     }
 }
 
+/// How long the drain thread sleeps on an empty queue before checking for
+/// unreported drops. Bounds the delay between a rejection and its report when
+/// no accepted record ever follows; one atomic load per wake keeps the idle
+/// cost negligible.
+const DROP_REPORT_IDLE_INTERVAL: Duration = Duration::from_secs(2);
+
 fn drain_plugin_logs(rx: &Receiver<QueuedPluginLog>) {
     let mut reported_drops = 0_u64;
-    while let Ok(log) = rx.recv() {
-        // Re-enter the captured caller span so subscribers observe the same
-        // attribution scope the record had at the guest call site.
-        log.span.in_scope(|| do_log_record(&log));
-        // Release only after the write: while the drain side is stalled on
-        // this record, its memory is still retained and must stay counted.
-        release_plugin_log_bytes(log.guest_bytes());
+    loop {
+        match rx.recv_timeout(DROP_REPORT_IDLE_INTERVAL) {
+            Ok(log) => {
+                // Re-enter the captured caller span so subscribers observe the
+                // same attribution scope the record had at the guest call site.
+                log.span.in_scope(|| do_log_record(&log));
+                // Release only after the write: while the drain side is
+                // stalled on this record, its memory is still retained and
+                // must stay counted.
+                release_plugin_log_bytes(log.guest_bytes());
+            }
+            // Idle wake: fall through to the drop check so rejected records
+            // are reported even when nothing accepted ever follows them.
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
         let dropped = DROPPED_PLUGIN_LOGS.load(Ordering::Relaxed);
         if dropped > reported_drops {
             record!(
