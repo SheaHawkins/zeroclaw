@@ -277,7 +277,13 @@ async fn uninterrupted_guest_compute_cannot_starve_wall_clock_deadline() {
     assert!(started.elapsed() < Duration::from_secs(2));
 }
 
-/// Regression for the two failure modes of the `log-record` boundary.
+/// Regression for the three contracts of the `log-record` boundary.
+///
+/// Phase 0 (attribution): deferring delivery to the drain thread must not
+/// change what an event means. A record emitted under a host attribution
+/// span has to keep that scope through the queue: the terminal label and the
+/// structured broadcast frame must carry the host attribution, not degrade
+/// to system-level.
 ///
 /// Phase 1 (liveness): the host wall-clock deadline is cooperative, so an
 /// implementation that wrote to a stalled terminal consumer inline would pin
@@ -292,9 +298,23 @@ async fn uninterrupted_guest_compute_cannot_starve_wall_clock_deadline() {
 /// and reported as drops once the drain resumes.
 #[tokio::test]
 async fn blocked_host_log_writer_cannot_stall_export_or_exhaust_host_memory() {
+    const ATTRIB_MARKER: &str = "zc-log-attribution-marker";
+    const ATTRIB_ALIAS: &str = "e2e-plugin-agent";
     const STALL_MARKER: &str = "zc-blocked-log-writer-marker";
     const FLOOD_MARKER: &str = "zc-log-flood-marker";
     const OVERSIZED_MARKER: &str = "zc-log-oversized-marker";
+
+    /// Test-local attributable whose role maps to the `agent_alias`
+    /// attribution field, mirroring how a host agent scope labels events.
+    struct E2eAgent;
+    impl zeroclaw_api::attribution::Attributable for E2eAgent {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Agent
+        }
+        fn alias(&self) -> &str {
+            ATTRIB_ALIAS
+        }
+    }
     /// Long enough that an inline (blocking) write visibly breaks the phase 1
     /// timing assertion and that phase 2 can flood a stalled queue; short
     /// enough that a regressed run still terminates.
@@ -312,13 +332,20 @@ async fn blocked_host_log_writer_cannot_stall_export_or_exhaust_host_memory() {
     let flood_delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let oversized_delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let overflow_reported = Arc::new(AtomicBool::new(false));
-    let (saw, flood, oversized, overflow) = (
+    let attrib_line = Arc::new(std::sync::Mutex::new(None::<String>));
+    let (saw, flood, oversized, overflow, attrib) = (
         Arc::clone(&saw_stall),
         Arc::clone(&flood_delivered),
         Arc::clone(&oversized_delivered),
         Arc::clone(&overflow_reported),
+        Arc::clone(&attrib_line),
     );
     let installed = zeroclaw_log::try_install_line_sink_for_tests(move |line| {
+        if line.contains(ATTRIB_MARKER) {
+            *attrib
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(line.to_string());
+        }
         if line.contains(FLOOD_MARKER) {
             flood.fetch_add(1, Ordering::SeqCst);
         }
@@ -340,6 +367,64 @@ async fn blocked_host_log_writer_cannot_stall_export_or_exhaust_host_memory() {
 
     let mut stall_plugin = plugin(Duration::from_millis(250)).await;
     let mut flood_plugin = plugin(Duration::from_secs(2)).await;
+
+    // Phase 0: a record emitted under a host attribution span keeps that
+    // scope through the queue, on both the structured and terminal outputs.
+    let mut structured_rx = zeroclaw_log::subscribe_or_install();
+    let span = zeroclaw_log::attribution_span!(&E2eAgent);
+    let result = zeroclaw_log::Instrument::instrument(
+        execute(
+            &mut flood_plugin,
+            serde_json::json!({"mode": "log", "message": ATTRIB_MARKER}),
+        ),
+        span,
+    )
+    .await
+    .expect("attributed logging export completes");
+    assert_eq!(&*result.output, "logged");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let attributed_line = loop {
+        if let Some(line) = attrib_line
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            break line;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "attributed plugin record was never delivered"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(
+        attributed_line.contains(&format!("[{ATTRIB_ALIAS}]")),
+        "the terminal label must carry the host attribution, not [system]: \
+         {attributed_line:?}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match structured_rx.try_recv() {
+            Ok(frame) => {
+                let frame = frame.to_string();
+                if frame.contains(ATTRIB_MARKER) {
+                    assert!(
+                        frame.contains(ATTRIB_ALIAS),
+                        "the structured frame must retain host attribution: {frame}"
+                    );
+                    break;
+                }
+            }
+            Err(_) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "attributed record never reached the structured broadcast"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+    drop(structured_rx);
 
     // Phase 1: the deadline holds through a stalled writer.
     let started = Instant::now();

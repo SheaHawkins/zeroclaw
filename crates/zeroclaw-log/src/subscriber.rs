@@ -68,7 +68,11 @@ pub fn try_install_capture_subscriber() {
 /// crate. The sink runs unlocked on whichever thread emits the event, so a
 /// sink that blocks on one event models a wedged consumer of that event
 /// without serializing every other thread's unrelated writes behind it.
-/// Returns `false` when a global subscriber was already installed.
+/// Mirrors the production wiring by stacking [`LogCaptureLayer`] under the
+/// terminal layer, so `attribution_span!` scopes carry their attribution
+/// extensions and both the structured and terminal outputs behave as in a
+/// real daemon. Returns `false` when a global subscriber was already
+/// installed.
 #[doc(hidden)]
 pub fn try_install_line_sink_for_tests(sink: impl Fn(&str) + Send + Sync + 'static) -> bool {
     use std::sync::Arc;
@@ -108,7 +112,9 @@ pub fn try_install_line_sink_for_tests(sink: impl Fn(&str) + Send + Sync + 'stat
         .with_ansi(false)
         .event_format(AgentAliasFormatter::new())
         .with_filter(EnvFilter::new("info"));
-    let subscriber = tracing_subscriber::registry().with(fmt_layer);
+    let subscriber = tracing_subscriber::registry()
+        .with(LogCaptureLayer)
+        .with(fmt_layer);
     tracing::subscriber::set_global_default(subscriber).is_ok()
 }
 

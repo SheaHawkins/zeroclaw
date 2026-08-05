@@ -384,7 +384,10 @@ The call is fire-and-forget: it returns nothing and the host
 crash plugin execution. Delivery is asynchronous: the import hands the record
 to a bounded host-side queue drained by a dedicated thread and returns without
 blocking, so a slow or wedged log consumer can never hold a guest export past
-`plugins.limits.call_timeout_ms`. The bound is a real memory bound, because
+`plugins.limits.call_timeout_ms`. Deferral does not change what an event
+means: each record captures the host span current at the guest call site and
+is written inside that scope, so agent/channel/tool attribution and the
+terminal label match inline emission. The bound is a real memory bound, because
 the event fields are unbounded strings copied to host memory outside the
 guest's `max_memory_mb` ceiling: a record whose guest-controlled bytes exceed
 64 KiB is dropped rather than truncated, and queued records draw on a fixed

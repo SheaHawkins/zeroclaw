@@ -18,6 +18,11 @@
 //! [`PLUGIN_LOG_QUEUE_BYTE_BUDGET`], released only after the drain side has
 //! written them. Every rejected record, whatever the reason, lands in the same
 //! drop counter the drain side reports.
+//!
+//! Deferral must not change what an event means: each record captures the
+//! host span that was current at the guest call site, and the drain thread
+//! re-enters it around the deferred `record!`, so agent/channel/tool
+//! attribution and the terminal label match what inline emission produced.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -48,6 +53,13 @@ fn plugin_log_attrs(
 
 /// One guest-emitted log record, owned so it can cross to the drain thread.
 struct QueuedPluginLog {
+    /// Host tracing span that was current when the guest emitted the record.
+    /// Re-entered around the deferred `record!` so the delivered event keeps
+    /// the same agent/channel/tool attribution scope it had when logging was
+    /// inline; without it every plugin event would degrade to system-level
+    /// attribution on the drain thread. A fixed-size host-owned handle,
+    /// deliberately excluded from [`Self::guest_bytes`].
+    span: zeroclaw_log::Span,
     instance: PluginInstanceId,
     level_idx: u8,
     fn_name: String,
@@ -150,7 +162,9 @@ fn enqueue_plugin_log(log: QueuedPluginLog) {
 fn drain_plugin_logs(rx: &Receiver<QueuedPluginLog>) {
     let mut reported_drops = 0_u64;
     while let Ok(log) = rx.recv() {
-        do_log_record(&log);
+        // Re-enter the captured caller span so subscribers observe the same
+        // attribution scope the record had at the guest call site.
+        log.span.in_scope(|| do_log_record(&log));
         // Release only after the write: while the drain side is stalled on
         // this record, its memory is still retained and must stay counted.
         release_plugin_log_bytes(log.guest_bytes());
@@ -259,6 +273,7 @@ macro_rules! impl_host {
                 // Hand off instead of writing inline: see the module docs for
                 // why this import must never block the executor thread.
                 enqueue_plugin_log(QueuedPluginLog {
+                    span: zeroclaw_log::Span::current(),
                     instance: self.scope().id().clone(),
                     level_idx,
                     fn_name: event.function_name,
@@ -402,6 +417,7 @@ mod tests {
     fn plugin_log_queue_enforces_byte_bounds() {
         let scope = crate::instance::test_scope(PluginCapability::Tool, "bounds", []);
         let record = |msg: String| QueuedPluginLog {
+            span: zeroclaw_log::Span::current(),
             instance: scope.id().clone(),
             level_idx: 2,
             fn_name: "bounds::execute".to_string(),
