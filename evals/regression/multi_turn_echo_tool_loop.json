@@ -1,5 +1,5 @@
 {
-  "model_name": "gh8219-multi-turn-tool-loop",
+  "model_name": "regression-multi-turn-echo-tool-loop",
   "turns": [
     { "user_input": "Echo the word alpha for me.", "steps": [
       { "response": { "type": "tool_calls", "tool_calls": [{ "id": "c1", "name": "echo", "arguments": {"message": "alpha"} }], "input_tokens": 20, "output_tokens": 8 } },
