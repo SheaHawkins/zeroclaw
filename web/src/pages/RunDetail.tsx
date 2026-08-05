@@ -79,8 +79,20 @@ export default function RunDetail() {
     setCancelling(true);
     setCancelError(null);
     cancelSop(sop, runId)
-      .then(() => getRunOverlay(sop, runId))
-      .then(setOverlay)
+      .then((result) => {
+        if (overlay) {
+          setOverlay({
+            ...overlay,
+            status: result.status,
+            waiting: false,
+            paused: false,
+          });
+        }
+        return getRunOverlay(sop, runId).then(setOverlay).catch((e: unknown) => {
+          console.error('run overlay refresh failed after accepted cancellation', e);
+          setCancelError(t('sops.stop_refresh_error'));
+        });
+      })
       .catch((e: unknown) => {
         // Localized, generic message for the user; the backend detail goes to
         // the console rather than leaking raw internals into the page.
@@ -88,7 +100,7 @@ export default function RunDetail() {
         setCancelError(t('sops.stop_error'));
       })
       .finally(() => setCancelling(false));
-  }, [sop, runId, setOverlay]);
+  }, [sop, runId, overlay, setOverlay]);
 
   const gated = overlay ? overlay.waiting || overlay.paused : false;
   const stopping = overlay?.status === 'cancel_requested';

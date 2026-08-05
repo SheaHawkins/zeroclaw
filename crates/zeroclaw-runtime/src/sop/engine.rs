@@ -89,6 +89,12 @@ pub struct SopEngine {
     /// renews the retained claim during maintenance; it must not release the
     /// claim until the operator retries to a durable outcome.
     claims_retained_after_terminal_rollback: std::collections::HashSet<String>,
+    /// Process-local proof that the driver reached a supported cancellation
+    /// boundary. The durable `CancelRequested` status remains the lifecycle
+    /// source of truth; this set only distinguishes a still-running step from
+    /// one whose driver exited at a safe boundary, so maintenance may retry a
+    /// failed terminal write without cancelling work mid-step.
+    cancellation_finalization_ready: std::collections::HashSet<String>,
 }
 
 /// Cap on the in-memory per-message dispatch-dedup window (`SopEngine::dispatch_dedup`).
@@ -112,6 +118,9 @@ pub struct MaintenanceSummary {
     pub reaped_claims: usize,
     /// Terminal runs pruned past the retention policy.
     pub pruned_runs: usize,
+    /// Requested cancellations terminalized after an earlier boundary write
+    /// failed and the store recovered.
+    pub finalized_cancellations: usize,
     /// Timeout actions produced. Mostly self-applied (`Escalate` re-stamps,
     /// `Cancel` finalizes); an opt-in `AutoApprove` yields a resumed `ExecuteStep`
     /// the caller logs until EPIC A2's live executor exists.
@@ -121,7 +130,10 @@ pub struct MaintenanceSummary {
 impl MaintenanceSummary {
     /// True when the pass did nothing (no timeouts, reaps, or prunes).
     pub fn is_empty(&self) -> bool {
-        self.timed_out == 0 && self.reaped_claims == 0 && self.pruned_runs == 0
+        self.timed_out == 0
+            && self.reaped_claims == 0
+            && self.pruned_runs == 0
+            && self.finalized_cancellations == 0
     }
 }
 
@@ -315,6 +327,7 @@ impl SopEngine {
             approval_broker: Arc::new(super::approval::ApprovalBroker::disabled()),
             dispatch_dedup: std::collections::VecDeque::new(),
             claims_retained_after_terminal_rollback: std::collections::HashSet::new(),
+            cancellation_finalization_ready: std::collections::HashSet::new(),
         }
     }
 
@@ -390,6 +403,29 @@ impl SopEngine {
         decision: super::approval::ApprovalDecision,
         principal: super::approval::ApprovalPrincipal,
     ) -> Result<super::approval::BrokerOutcome> {
+        self.resolve_via_broker_inner(run_id, decision, principal, true)
+    }
+
+    /// Resolve a broker-authorized gate without synchronously consuming a
+    /// resumed deterministic capability tail. Headless transports hand the
+    /// returned action to the shared async executor, which reacquires the
+    /// engine lock once per capability so cancellation can interleave.
+    pub fn resolve_via_broker_deferred(
+        &mut self,
+        run_id: &str,
+        decision: super::approval::ApprovalDecision,
+        principal: super::approval::ApprovalPrincipal,
+    ) -> Result<super::approval::BrokerOutcome> {
+        self.resolve_via_broker_inner(run_id, decision, principal, false)
+    }
+
+    fn resolve_via_broker_inner(
+        &mut self,
+        run_id: &str,
+        decision: super::approval::ApprovalDecision,
+        principal: super::approval::ApprovalPrincipal,
+        drive_inline_capability_tail: bool,
+    ) -> Result<super::approval::BrokerOutcome> {
         let broker = Arc::clone(&self.approval_broker);
         if let Some(step) = self.active_runs.get(run_id).and_then(|run| {
             (run.status == SopRunStatus::PausedCheckpoint).then_some(run.current_step)
@@ -410,7 +446,12 @@ impl SopEngine {
                     super::approval::ResolveOutcome::Revised,
                 ));
             }
-            let action = self.decide_checkpoint_with_principal(run_id, decision, principal)?;
+            let action = self.decide_checkpoint_with_principal(
+                run_id,
+                decision,
+                principal,
+                drive_inline_capability_tail,
+            )?;
             return Ok(super::approval::BrokerOutcome::Resolved(
                 super::approval::ResolveOutcome::Resumed(Box::new(action)),
             ));
@@ -2814,8 +2855,11 @@ impl SopEngine {
             .get(run_id)
             .is_none_or(|run| run.status != SopRunStatus::CancelRequested)
         {
+            self.cancellation_finalization_ready.remove(run_id);
             return Ok(None);
         }
+        self.cancellation_finalization_ready
+            .insert(run_id.to_string());
         let request = self
             .run_events(run_id)?
             .into_iter()
@@ -2845,7 +2889,7 @@ impl SopEngine {
         }
         Ok(Some(
             self.get_run(run_id)
-                .map(|run| SopRunAction::Completed {
+                .map(|run| SopRunAction::Cancelled {
                     run_id: run.run_id.clone(),
                     sop_name: run.sop_name.clone(),
                 })
@@ -3344,6 +3388,7 @@ impl SopEngine {
         run_id: &str,
         decision: super::approval::ApprovalDecision,
         principal: super::approval::ApprovalPrincipal,
+        drive_inline_capability_tail: bool,
     ) -> Result<SopRunAction> {
         let prior_run = self
             .active_runs
@@ -3566,7 +3611,11 @@ impl SopEngine {
                 // tail to finish before the broker outcome is returned. Shared
                 // dashboard/manual execution instead uses the async executor, which
                 // advances one action per lock acquisition.
-                self.drive_inline_capability_tail(run_id, action)
+                if drive_inline_capability_tail {
+                    self.drive_inline_capability_tail(run_id, action)
+                } else {
+                    Ok(action)
+                }
             }
         }
     }
@@ -4989,6 +5038,7 @@ impl SopEngine {
         let timeout_actions = self.check_approval_timeouts();
         self.retry_pending_park_persists();
         self.retry_capacity_blocked_gated_pends();
+        let finalized_cancellations = self.retry_ready_cancellation_finalizations();
         self.heartbeat_active_claims();
         let reaped_claims = self.reap_expired_claims();
         let pruned_runs = self.prune_terminal_runs();
@@ -4996,8 +5046,39 @@ impl SopEngine {
             timed_out,
             reaped_claims,
             pruned_runs,
+            finalized_cancellations,
             timeout_actions,
         }
+    }
+
+    fn retry_ready_cancellation_finalizations(&mut self) -> usize {
+        let ready: Vec<String> = self
+            .cancellation_finalization_ready
+            .iter()
+            .cloned()
+            .collect();
+        let mut finalized = 0;
+        for run_id in ready {
+            match self.finish_requested_cancellation(&run_id) {
+                Ok(Some(_)) => finalized += 1,
+                Ok(None) => {
+                    self.cancellation_finalization_ready.remove(&run_id);
+                }
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "error": error.to_string(),
+                            })),
+                        "SOP maintenance: cancellation finalization retry failed"
+                    );
+                }
+            }
+        }
+        finalized
     }
 
     /// Reclaim concurrency-claim leases past their expiry (the holder died without
@@ -5137,6 +5218,7 @@ impl SopEngine {
         self.persist_terminal(&run)?;
         self.claims_pending_persist.remove(run_id);
         self.claims_retained_after_terminal_rollback.remove(run_id);
+        self.cancellation_finalization_ready.remove(run_id);
         self.active_runs.remove(run_id);
         self.metrics.record_run_complete(&run);
         // The park snapshot is purely a rehydration artifact: a terminal run must
@@ -5157,6 +5239,10 @@ impl SopEngine {
                 run_id: run_id_owned,
                 sop_name,
                 reason: reason.unwrap_or_default(),
+            },
+            SopRunStatus::Cancelled => SopRunAction::Cancelled {
+                run_id: run_id_owned,
+                sop_name,
             },
             _ => SopRunAction::Completed {
                 run_id: run_id_owned,
@@ -6165,6 +6251,7 @@ mod tests {
             | SopRunAction::CheckpointWait { run_id, .. }
             | SopRunAction::Pending { run_id, .. }
             | SopRunAction::Completed { run_id, .. }
+            | SopRunAction::Cancelled { run_id, .. }
             | SopRunAction::Failed { run_id, .. } => run_id,
         }
     }
@@ -7693,6 +7780,25 @@ mod tests {
             (1, 1),
             "a failed terminal persist must keep the admission claim"
         );
+
+        store
+            .fail_finish
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let summary = engine.run_maintenance_tick();
+        assert_eq!(
+            summary.finalized_cancellations, 1,
+            "maintenance owns eventual finalization after the boundary retry budget is exhausted"
+        );
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::Cancelled
+        );
+        assert!(!engine.active_runs().contains_key(&run_id));
+        assert_eq!(
+            store.claim_counts("s1").unwrap(),
+            (0, 0),
+            "eventual finalization must release the retained admission claim"
+        );
     }
 
     #[test]
@@ -7715,7 +7821,7 @@ mod tests {
             .expect("the safe boundary should retry a transient terminal failure")
             .expect("the requested cancellation should become terminal");
 
-        assert!(matches!(terminal, SopRunAction::Completed { .. }));
+        assert!(matches!(terminal, SopRunAction::Cancelled { .. }));
         assert_eq!(
             engine.get_run(&run_id).unwrap().status,
             SopRunStatus::Cancelled
@@ -14331,6 +14437,56 @@ type = "manual"
         assert!(
             events.iter().any(|ev| ev.kind == "gate_resolved"),
             "checkpoint resolution must append a gate_resolved ledger row: {events:?}"
+        );
+    }
+
+    #[test]
+    fn deferred_checkpoint_resume_allows_cancel_before_next_capability() {
+        let mut engine = engine_with_sops(vec![capability_checkpoint_sop("cp-deferred")]);
+        let first = engine.start_run("cp-deferred", manual_event()).unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let parked = engine
+            .drive_headless_deterministic(&run_id, first)
+            .expect("drive to checkpoint");
+        assert!(matches!(parked, SopRunAction::CheckpointWait { .. }));
+
+        let outcome = engine
+            .resolve_via_broker_deferred(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("deferred checkpoint approve resolves");
+        let super::super::approval::BrokerOutcome::Resolved(
+            super::super::approval::ResolveOutcome::Resumed(action),
+        ) = outcome
+        else {
+            panic!("expected Resolved(Resumed), got {outcome:?}");
+        };
+        assert!(
+            matches!(*action, SopRunAction::DeterministicStep { ref step, .. } if step.number == 3),
+            "the gateway path must return the next capability without executing it: {action:?}"
+        );
+
+        assert_eq!(
+            engine
+                .cancel_run_idempotent(&run_id, None, Some("gateway:operator".into()))
+                .unwrap(),
+            Some(CancelOutcome::Requested)
+        );
+        let terminal = engine
+            .advance_headless_deterministic_step(&run_id, *action)
+            .expect("the shared executor should observe cancellation first");
+        assert!(matches!(terminal, SopRunAction::Cancelled { .. }));
+        let run = engine
+            .last_finished_run("cp-deferred")
+            .expect("cancelled run retained");
+        assert_eq!(run.status, SopRunStatus::Cancelled);
+        assert!(
+            run.step_results
+                .iter()
+                .all(|result| result.step_number != 3),
+            "the post-checkpoint capability must not dispatch after cancellation"
         );
     }
 

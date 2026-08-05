@@ -962,6 +962,8 @@ pub enum SopRunAction {
     },
     /// The SOP run completed successfully.
     Completed { run_id: String, sop_name: String },
+    /// The SOP run stopped at an operator-requested safe boundary.
+    Cancelled { run_id: String, sop_name: String },
     /// The SOP run failed.
     Failed {
         run_id: String,

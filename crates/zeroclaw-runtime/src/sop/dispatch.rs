@@ -251,6 +251,7 @@ fn extract_run_id_from_action(action: &SopRunAction) -> &str {
         | SopRunAction::CheckpointWait { run_id, .. }
         | SopRunAction::Pending { run_id, .. }
         | SopRunAction::Completed { run_id, .. }
+        | SopRunAction::Cancelled { run_id, .. }
         | SopRunAction::Failed { run_id, .. } => run_id,
     }
 }
@@ -264,6 +265,7 @@ fn action_label(action: &SopRunAction) -> &'static str {
         SopRunAction::CheckpointWait { .. } => "CheckpointWait",
         SopRunAction::Pending { .. } => "Pending",
         SopRunAction::Completed { .. } => "Completed",
+        SopRunAction::Cancelled { .. } => "Cancelled",
         SopRunAction::Failed { .. } => "Failed",
     }
 }
@@ -1060,6 +1062,16 @@ pub fn process_headless_results(results: &[DispatchResult]) {
                         &format!(
                             "SOP headless dispatch: run {run_id} ('{sop_name}') completed immediately"
                         )
+                    );
+                }
+                SopRunAction::Cancelled { .. } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
+                            .with_attrs(
+                                ::serde_json::json!({"run_id": run_id, "sop_name": sop_name})
+                            ),
+                        &format!("SOP headless dispatch: run {run_id} ('{sop_name}') cancelled")
                     );
                 }
                 SopRunAction::Failed { reason, .. } => {

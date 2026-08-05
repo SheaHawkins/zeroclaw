@@ -2116,6 +2116,18 @@ async fn drive_live_sop_actions(
                     );
                     break;
                 }
+                crate::sop::SopRunAction::Cancelled { run_id, sop_name } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "sop_name": sop_name,
+                            })),
+                        "SOP live executor observed cancelled run"
+                    );
+                    break;
+                }
                 crate::sop::SopRunAction::Failed {
                     run_id,
                     sop_name,

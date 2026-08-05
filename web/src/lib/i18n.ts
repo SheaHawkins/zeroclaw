@@ -1157,6 +1157,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'sops.stop': 'Stop',
     'sops.stopping': 'Stopping…',
     'sops.stop_error': 'Failed to stop run. Retry.',
+    'sops.stop_refresh_error': 'Stop accepted, but the latest run state could not be refreshed.',
     'sops.run_state.pending': 'pending',
     'sops.run_state.active': 'active',
     'sops.run_state.completed': 'done',

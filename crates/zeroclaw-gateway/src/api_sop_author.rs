@@ -453,7 +453,7 @@ pub async fn handle_sop_decide(
                 // directly, otherwise this authoring surface would
                 // clear a policied approval gate without enforcing group membership or
                 // quorum. With no `[sop.approval]` policy this is exactly `resolve_gate`.
-                match guard.resolve_via_broker(&run_id, decision, principal) {
+                match guard.resolve_via_broker_deferred(&run_id, decision, principal) {
                     Ok(outcome @ BrokerOutcome::Resolved(ResolveOutcome::Resumed(_))) => {
                         resolved_outcome = Some(outcome);
                     }
@@ -618,7 +618,12 @@ fn authorize_sop_cancel(
             subject,
         ));
     }
-    if peer.ip().is_loopback() {
+    let effective_client_ip = if state.trust_forwarded_headers {
+        super::forwarded_client_ip(headers)
+    } else {
+        Some(peer.ip())
+    };
+    if effective_client_ip.is_some_and(|ip| ip.is_loopback()) {
         return Ok(zeroclaw_runtime::sop::approval::ApprovalPrincipal::cli(
             None,
         ));
@@ -1477,6 +1482,27 @@ mod tests {
             Some(SopRunStatus::CancelRequested),
             "loopback-only access may remain unpaired"
         );
+    }
+
+    #[tokio::test]
+    async fn authoring_cancel_rejects_remote_client_behind_trusted_loopback_proxy() {
+        let (mut state, run_id) = authoring_state_with_running_run("unused");
+        state.pairing = Arc::new(PairingGuard::new(false, &[]));
+        state.trust_forwarded_headers = true;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.17"));
+
+        let response = handle_sop_cancel(
+            State(state.clone()),
+            loopback_peer(),
+            headers,
+            Path(("deploy".to_string(), run_id.clone())),
+            Bytes::new(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(run_status(&state, &run_id), Some(SopRunStatus::Running));
     }
 
     #[tokio::test]

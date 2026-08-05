@@ -424,6 +424,18 @@ async fn drive_headless_run(
                 );
                 return;
             }
+            SopRunAction::Cancelled { run_id, sop_name } => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "sop_name": sop_name,
+                        })),
+                    "SOP headless driver: run cancelled"
+                );
+                return;
+            }
             SopRunAction::Failed {
                 run_id,
                 sop_name,
