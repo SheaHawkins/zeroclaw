@@ -14,9 +14,9 @@ The `topic` is matched exactly against the event topic the channel emits, `git.<
 
 ## Fire it
 
-Route an event type to a SOP on the channel (an `events` entry with `sop = "<name>"`), load a SOP whose `channel` trigger names the matching topic, then cause the forge event: open or comment on an issue/PR, publish a release, or let a workflow run finish. The channel normalizes the event, screens the payload for safety, and dispatches to every loaded SOP whose `topic` matches and whose `condition` (if any) holds. Routing an event type is also what subscribes the channel to that forge endpoint, so only routed event types are polled.
+Route an event type to a SOP on the channel (an `events` entry with `sop = "<name>"`), load a SOP whose `channel` trigger names the channel (`channel = "git"`, optional `alias`), then cause the forge event: open or comment on an issue/PR, publish a release, or let a workflow run finish. The channel normalizes the event, screens the payload for safety, and dispatches to every loaded SOP whose `topic` matches and whose `condition` (if any) holds. Routing an event type is also what subscribes the channel to that forge endpoint, so only routed event types are polled.
 
-If nothing starts, confirm the event type is routed to `sop` (not left at the conversational default), the SOP's `channel` trigger topic matches `git.<alias>:<event_type>` exactly, and the `condition` holds against the payload. See the [fan-in overview troubleshooting table](./overview.md#troubleshooting).
+If nothing starts, confirm the event type is routed to `sop` (not left at the conversational default), the SOP's `channel` trigger names `channel = "git"` (and the right `alias`), and the `condition` holds against the payload. See the [fan-in overview troubleshooting table](./overview.md#troubleshooting).
 
 ## Approve and observe
 
