@@ -10,7 +10,7 @@ Git forge events can start SOP runs. When an event type is routed to `sop` in th
 
 ## Matching
 
-The `topic` is matched exactly against the event topic the channel emits, `git.<alias>:<event_type>` (for example `git.main:pull_request.opened`). The event's structured JSON payload is forwarded into the SOP event and is available to an optional trigger `condition`; step context receives the capped, sanitized, framed form. A JSON-path `condition` such as `$.repo == "octo/repo"` narrows a SOP to one repository. Known event types are `issue_comment.created`, `issues.opened`, `pull_request.opened`, `pull_request.closed`, `pull_request.merged`, `pull_request_review_comment.created`, `workflow_run.completed`, `workflow_run.failed`, and `release.published`.
+A `channel` trigger matches on `channel` (the channel kind, `git`) and an optional `alias` (the configured instance, e.g. `default`); there is no `topic` field on the trigger itself. Which event types reach SOP ingress is decided entirely by the channel's per-event `events` route table, so the trigger selects the source and the route table selects the event. The event's structured JSON payload is forwarded into the SOP event and is available to an optional trigger `condition`; step context receives the capped, sanitized, framed form. A JSON-path `condition` such as `$.repo == "octo/repo"` narrows a SOP to one repository. Known event types are `issue_comment.created`, `issues.opened`, `pull_request.opened`, `pull_request.closed`, `pull_request.merged`, `pull_request_review_comment.created`, `workflow_run.completed`, `workflow_run.failed`, and `release.published`.
 
 ## Fire it
 
