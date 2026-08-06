@@ -528,6 +528,16 @@ manually-triggerable sub-workflow. Re-run the specific one with `dry_run: true`
 first to confirm the fix, then `dry_run: false`. These are nice-to-have: a
 failed distribution job does not invalidate the release itself.
 
+**`Scoop Credential Preflight` failed early in the run:** The bucket token is
+dead or under-scoped. This job runs at the start of the release specifically so
+you can fix it while the build matrix is still running. Rotate the credential
+per [Rotating `SCOOP_BUCKET_TOKEN`](./ci-and-actions.md#rotating-scoop_bucket_token),
+then re-dispatch Scoop Bucket Canary to confirm. If you get to it before the
+post-publish `scoop` job starts, the release publishes to Scoop normally. If
+not, re-run `pub-scoop.yml` with `dry_run: false` at the release tag once the
+token is fixed. A `remote: Permission ... denied to <account>` 403 here is a
+permissions problem, not a manifest problem.
+
 **Homebrew Core is stale:** Homebrew is not a release-workflow job. Check the
 [Homebrew autobump status and documented manual bump
 path](https://docs.brew.sh/Autobump) instead of adding a repository fork token.

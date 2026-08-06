@@ -43,6 +43,14 @@ Runs `npm audit --audit-level=high` daily at 09:23 UTC against `web/package-lock
 
 Scans the published `dist` and `default-features` GHCR images every Saturday and uploads HIGH/CRITICAL findings to the Security tab as SARIF. The scan is report-first (`exit-code: 0` for findings), but a missing expected image fails the job before Trivy setup with the absent tag and the owning publisher workflow named in the error.
 
+### Weekly Scoop Bucket Canary (`scoop-bucket-canary.yml`)
+
+Rehearses the Scoop publish path against the current stable release every Monday, and again at the start of every Release Stable run as the `Scoop Credential Preflight` job. It resolves the latest `vX.Y.Z` tag and calls `pub-scoop.yml` with `dry_run: true`, so it exercises the real `SCOOP_BUCKET_TOKEN` against the real bucket without writing anything.
+
+This exists because `SCOOP_BUCKET_TOKEN` is account-bound: it expires, and it silently loses write when the owning identity's collaborator grant on the bucket changes. Both have happened. Before the canary, the only thing that exercised the credential was the post-publish `scoop` job, so a dead token was discovered after the release was already cut and announced, and the bucket had to be updated by hand.
+
+The preflight is intentionally non-blocking: nothing in Release Stable depends on it. A dead package-manager credential must never stop a release from shipping; it only has to be visible early enough to rotate before the post-publish `scoop` job runs.
+
 ### PR Path Labeler (`pr-path-labeler.yml`)
 
 Auto-applies path and scope labels based on changed files. It runs on PR open, reopen, and every pushed update to the PR branch. Because `sync-labels: true` is enabled, labels defined in `.github/labeler.yml` are recalculated from the current PR file set.
@@ -147,6 +155,43 @@ automatic `GITHUB_TOKEN` cannot write another repository. Keep
 `SCOOP_BUCKET_TOKEN` narrowly scoped to the bucket; do not reuse a maintainer's
 broad CLI token. The publisher checks write access with `git push --dry-run`,
 then uses the same Git transport for the real update.
+
+### Rotating `SCOOP_BUCKET_TOKEN`
+
+Because deploy keys are unavailable, this credential is a personal access token
+and therefore has two independent failure modes, both of which have bitten a
+release:
+
+1. **The token expires.** Fine-grained PATs have a maximum lifetime, so this
+   recurs on a fixed schedule whether or not anything else changes.
+2. **The owning identity loses write on the bucket.** The token can still be
+   valid while the account behind it is only a `read` collaborator. This
+   produces `remote: Permission to zeroclaw-labs/scoop-zeroclaw.git denied to
+   <account>` and HTTP 403, not an auth error, so it reads as a code problem
+   when it is a permissions problem.
+
+Own the token with the `ZeroClaw-Bot` account, never a personal account, so the
+release path does not depend on one maintainer's credentials. To rotate:
+
+1. As `ZeroClaw-Bot`, create a fine-grained PAT with **Resource owner**
+   `zeroclaw-labs`, **Repository access** limited to the single repository
+   `zeroclaw-labs/scoop-zeroclaw`, and **Repository permissions → Contents:
+   Read and write**. Nothing else.
+2. Confirm the org approved the token. Fine-grained PATs against an org
+   resource owner stay pending until approved, and a pending token authenticates
+   but cannot push.
+3. Confirm `ZeroClaw-Bot` still has `write` on the bucket:
+   `gh api repos/zeroclaw-labs/scoop-zeroclaw/collaborators/ZeroClaw-Bot/permission --jq '.role_name'`.
+   Step 1 does not grant repository access; it only scopes what the token may
+   use. A token cannot exceed the permissions its owner already holds.
+4. Set the secret:
+   `gh secret set SCOOP_BUCKET_TOKEN --repo zeroclaw-labs/zeroclaw`.
+5. Verify without touching the bucket by dispatching
+   [Scoop Bucket Canary](#weekly-scoop-bucket-canary-scoop-bucket-canaryyml).
+   A green run proves the new token can push.
+
+Record the expiry date somewhere durable when you rotate. The canary will catch
+an expired token within a week regardless, but only after it has already broken.
 
 ### AUR package ownership
 
