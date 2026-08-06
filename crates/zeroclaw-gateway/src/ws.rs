@@ -843,18 +843,81 @@ fn session_queue_ws_error_code(error: &crate::session_queue::SessionQueueError) 
     }
 }
 
+/// Outcome of a best-effort conversation persistence pass.
+///
+/// Callers that surface a `persisted` signal to the client must derive it from
+/// this result rather than from the mere existence of a session backend: a
+/// deleted session or a failing `append` both leave the transcript without the
+/// messages the client was told were saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+struct PersistOutcome {
+    /// Whether the session row still existed when persistence was attempted.
+    session_existed: bool,
+    /// Number of messages eligible for persistence (non-system chat messages).
+    attempted: usize,
+    /// Number of messages the backend accepted.
+    committed: usize,
+}
+
+impl PersistOutcome {
+    /// True only when the session existed and every eligible message committed.
+    ///
+    /// Deliberately conservative: a partial failure reports `false` so a client
+    /// keeps its own fallback copy. Over-reporting success loses data, while
+    /// over-reporting failure only costs a redundant local copy.
+    fn all_committed(&self) -> bool {
+        self.session_existed && self.committed == self.attempted
+    }
+
+    /// Log when a best-effort persistence pass did not fully commit.
+    ///
+    /// Used by callers that have no client-facing `persisted` signal to derive
+    /// but still must not drop a write failure on the floor. Distinguishes a
+    /// missing session (expected lifecycle race) from an append failure (I/O).
+    fn warn_if_incomplete(self, session_key: &str, site: &str) {
+        if self.all_committed() {
+            return;
+        }
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
+                .with_category(::zeroclaw_log::EventCategory::Session)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "reason": if self.session_existed {
+                        "append_failed"
+                    } else {
+                        "session_missing"
+                    },
+                    "site": site,
+                    "session_key": session_key,
+                    "attempted": self.attempted,
+                    "committed": self.committed,
+                })),
+            "gateway_ws_persist"
+        );
+    }
+}
+
 fn persist_conversation_messages(
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_key: &str,
     messages: &[zeroclaw_providers::ConversationMessage],
-) {
+) -> PersistOutcome {
     // if the user deleted the session between the turn starting and
     // the post-turn persistence, don't resurrect it. The `aborted` / `done`
     // / `error` frames are still sent to the client; we just refuse to
     // re-create the row that `DELETE /api/sessions/{id}` just wiped.
     if !backend.session_exists(session_key) {
-        return;
+        return PersistOutcome {
+            session_existed: false,
+            attempted: 0,
+            committed: 0,
+        };
     }
+    let mut attempted = 0usize;
+    let mut committed = 0usize;
     for message in messages {
         let zeroclaw_providers::ConversationMessage::Chat(message) = message else {
             continue;
@@ -862,7 +925,15 @@ fn persist_conversation_messages(
         if message.role == "system" {
             continue;
         }
-        let _ = backend.append(session_key, message);
+        attempted += 1;
+        if backend.append(session_key, message).is_ok() {
+            committed += 1;
+        }
+    }
+    PersistOutcome {
+        session_existed: true,
+        attempted,
+        committed,
     }
 }
 
@@ -1296,7 +1367,8 @@ async fn process_chat_message(
                             backend.as_ref(),
                             session_key,
                             &error.new_messages,
-                        );
+                        )
+                        .warn_if_incomplete(session_key, "cancelled_turn");
                         if !has_assistant_chat_message(&error.new_messages) {
                             let marker = zeroclaw_runtime::i18n::get_required_cli_string(
                                 "turn-interrupted-by-user",
@@ -1375,7 +1447,8 @@ async fn process_chat_message(
     match result {
         Ok(outcome) => {
             if let Some(ref backend) = state.session_backend {
-                persist_conversation_messages(backend.as_ref(), session_key, &outcome.new_messages);
+                persist_conversation_messages(backend.as_ref(), session_key, &outcome.new_messages)
+                    .warn_if_incomplete(session_key, "completed_turn");
             }
 
             // Fire-and-forget memory consolidation so facts from WS sessions
@@ -1480,17 +1553,24 @@ async fn process_chat_message(
             );
         }
         Err(e) => {
+            // Whether the notice this turn produced was actually committed.
+            // Starts `false` so every path that skips persistence (no backend,
+            // empty delta) reports "not saved" and the client keeps its copy.
+            let mut notice_persisted = false;
             if let Some(ref backend) = state.session_backend
                 && !e.new_messages.is_empty()
             {
-                persist_conversation_messages(backend.as_ref(), session_key, &e.new_messages);
+                let outcome =
+                    persist_conversation_messages(backend.as_ref(), session_key, &e.new_messages);
+                notice_persisted = outcome.all_committed();
+                outcome.warn_if_incomplete(session_key, "failed_turn");
             }
 
             // Deliver the context-exhaustion notice to the live conversation.
             // Sent before the error frame so the transcript reads in causal
             // order: the reason the turn stopped, then the failure itself.
             if let Some(notice) = context_exhausted_notice(e.terminal_reason, &e.new_messages) {
-                let frame = context_exhausted_ws_frame(notice, state.session_backend.is_some());
+                let frame = context_exhausted_ws_frame(notice, notice_persisted);
                 let _ = sender.send(Message::Text(frame.to_string().into())).await;
             }
 
@@ -2198,13 +2278,132 @@ mod tests {
             ConversationMessage::Chat(ChatMessage::assistant("[interrupted by user]")),
         ];
 
-        persist_conversation_messages(&backend, "gw_deleted", &messages);
+        let outcome = persist_conversation_messages(&backend, "gw_deleted", &messages);
 
+        assert!(
+            !outcome.session_existed,
+            "a deleted session must report session_existed == false"
+        );
+        assert!(
+            !outcome.all_committed(),
+            "a deleted session must never report a fully-committed persist"
+        );
         assert!(
             backend.append_calls.lock().unwrap().is_empty(),
             "persist_conversation_messages must not resurrect a session whose \
              session_exists() returned false (see #7126)"
         );
+    }
+
+    /// A live session whose backend rejects every append (disk full, locked db).
+    struct FailingAppendBackend;
+
+    impl zeroclaw_infra::session_backend::SessionBackend for FailingAppendBackend {
+        fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            Vec::new()
+        }
+        fn append(
+            &self,
+            _session_key: &str,
+            _message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            Err(std::io::Error::other("backend unavailable"))
+        }
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn session_exists(&self, _session_key: &str) -> bool {
+            true
+        }
+    }
+
+    /// A healthy backend that accepts every append.
+    struct HealthyBackend;
+
+    impl zeroclaw_infra::session_backend::SessionBackend for HealthyBackend {
+        fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            Vec::new()
+        }
+        fn append(
+            &self,
+            _session_key: &str,
+            _message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn session_exists(&self, _session_key: &str) -> bool {
+            true
+        }
+    }
+
+    /// A configured backend is not proof that this turn was persisted: when
+    /// every append fails, the client must be told the notice was NOT saved so
+    /// it keeps its own fallback copy instead of dropping it on reload.
+    #[test]
+    fn persist_outcome_reports_failure_when_appends_fail() {
+        use zeroclaw_providers::{ChatMessage, ConversationMessage};
+        let messages = vec![
+            ConversationMessage::Chat(ChatMessage::user("hi")),
+            ConversationMessage::Chat(ChatMessage::assistant("context exhausted notice")),
+        ];
+
+        let outcome = persist_conversation_messages(&FailingAppendBackend, "gw_live", &messages);
+
+        assert!(
+            outcome.session_existed,
+            "the session existed; only the appends failed"
+        );
+        assert_eq!(outcome.attempted, 2, "both chat messages are eligible");
+        assert_eq!(outcome.committed, 0, "no append succeeded");
+        assert!(
+            !outcome.all_committed(),
+            "a persisted=true flag here would make the browser discard its \
+             fallback copy and lose the notice on reload"
+        );
+    }
+
+    /// The success path still reports success, so the conservative flag does
+    /// not degrade into a constant `false`.
+    #[test]
+    fn persist_outcome_reports_success_when_all_appends_commit() {
+        use zeroclaw_providers::{ChatMessage, ConversationMessage};
+        let messages = vec![
+            ConversationMessage::Chat(ChatMessage::user("hi")),
+            ConversationMessage::Chat(ChatMessage::assistant("context exhausted notice")),
+        ];
+
+        let outcome = persist_conversation_messages(&HealthyBackend, "gw_live", &messages);
+
+        assert!(outcome.all_committed(), "every eligible message committed");
+        assert_eq!(outcome.committed, outcome.attempted);
+    }
+
+    /// System messages are skipped, so they must not inflate `attempted` and
+    /// turn a fully-successful persist into a reported partial failure.
+    #[test]
+    fn persist_outcome_ignores_system_messages() {
+        use zeroclaw_providers::{ChatMessage, ConversationMessage};
+        let messages = vec![
+            ConversationMessage::Chat(ChatMessage::system("prompt")),
+            ConversationMessage::Chat(ChatMessage::user("hi")),
+        ];
+
+        let outcome = persist_conversation_messages(&HealthyBackend, "gw_live", &messages);
+
+        assert_eq!(
+            outcome.attempted, 1,
+            "only the non-system message is eligible"
+        );
+        assert!(outcome.all_committed());
     }
 
     /// A `Sink<Message>` that just collects the text frames sent to it, so a handler

@@ -3001,6 +3001,10 @@ impl Agent {
                                 error,
                                 committed_response,
                                 new_messages: new_msgs,
+                                // A failed system-prompt rebuild after a model
+                                // switch is a configuration/build failure, not a
+                                // context-window terminal condition.
+                                terminal_reason: None,
                             });
                         }
                         let notice = self.trim_history(Some(&turn_id));
