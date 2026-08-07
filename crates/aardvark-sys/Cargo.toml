@@ -7,8 +7,14 @@ license = "MIT OR Apache-2.0"
 description = "Low-level bindings for the Total Phase Aardvark I2C/SPI/GPIO USB adapter"
 repository = "https://github.com/zeroclaw-labs/zeroclaw"
 
-# NOTE: This crate is the ONLY place in ZeroClaw where unsafe code is permitted.
-# The rest of the workspace remains #![forbid(unsafe_code)].
+# RETIRING: this crate is being deleted, not kept as a permanent unsafe carve-out.
+# See RFC #8043 for the plan and #7130 for the unsafe-policy decision. Do not add
+# call sites; new peripheral work belongs in zeroclaw-hardware. Any unsafe that
+# must outlive the deletion needs its own narrow, reviewed boundary there rather
+# than inheriting this crate's exemption.
+#
+# NOTE: While it exists, this crate is the ONLY place in ZeroClaw where unsafe
+# code is permitted. The rest of the workspace remains #![forbid(unsafe_code)].
 #
 # The Total Phase SDK is loaded at runtime via libloading (see src/lib.rs); the
 # vendored library lives in vendor/aardvark.so and FFI symbols are resolved

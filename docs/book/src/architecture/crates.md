@@ -146,9 +146,20 @@ Derive macros for config schema, tool registration, and channel registration. Sa
 
 Terminal UI, built as a separate app under `apps/zerocode/`. It is its own workspace member with no `zeroclaw-*` crate dependency (see [Docs & Translations → zerocode strings](../maintainers/docs-and-translations.md) for its independent i18n catalogue).
 
-### `aardvark-sys`, `robot-kit`
+### `aardvark-sys`, `zeroclaw-robot-kit`
 
 Specialised hardware support used by the `hardware` submodule. Out-of-scope unless you're bringing up specific peripherals.
+
+Both are being retired, so treat them as closed to new work. `aardvark-sys` is
+being deleted ([RFC #8043](https://github.com/zeroclaw-labs/zeroclaw/issues/8043)),
+and `zeroclaw-robot-kit` is being folded into `zeroclaw-hardware`
+([RFC #9803](https://github.com/zeroclaw-labs/zeroclaw/issues/9803)). New
+peripheral work belongs in `zeroclaw-hardware` directly.
+
+This also settles where `unsafe` lives. `aardvark-sys` is currently the only
+crate permitted to use it, but that exemption disappears with the crate rather
+than transferring to `zeroclaw-hardware` wholesale; see
+[#7130](https://github.com/zeroclaw-labs/zeroclaw/issues/7130).
 
 ## Feature flags
 
