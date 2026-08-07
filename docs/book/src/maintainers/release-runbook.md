@@ -528,15 +528,18 @@ manually-triggerable sub-workflow. Re-run the specific one with `dry_run: true`
 first to confirm the fix, then `dry_run: false`. These are nice-to-have: a
 failed distribution job does not invalidate the release itself.
 
-**`Scoop Credential Preflight` failed early in the run:** The bucket token is
-dead or under-scoped. This job runs at the start of the release specifically so
-you can fix it while the build matrix is still running. Rotate the credential
+**The `scoop` job failed with `remote: Permission ... denied to <account>` (403):**
+A permissions problem, not a manifest problem: the bucket token is dead or
+under-scoped. This is not urgent, because the bucket's excavator republishes
+from the bucket side within its schedule without a credential. Rotate the token
 per [Rotating `SCOOP_BUCKET_TOKEN`](./ci-and-actions.md#rotating-scoop_bucket_token),
-then re-dispatch Scoop Bucket Canary to confirm. If you get to it before the
-post-publish `scoop` job starts, the release publishes to Scoop normally. If
-not, re-run `pub-scoop.yml` with `dry_run: false` at the release tag once the
-token is fixed. A `remote: Permission ... denied to <account>` 403 here is a
-permissions problem, not a manifest problem.
+then dispatch Scoop Bucket Canary to confirm the fix without writing to the
+bucket. Confirm the bucket landed the new version either way, since excavator
+covering for a dead token is easy to miss.
+
+**Weekly `Scoop Bucket Canary` went red:** The token has expired or lost write.
+Same rotation path. Fix it before the next release so layer 1 still works rather
+than leaning on excavator indefinitely.
 
 **Homebrew Core is stale:** Homebrew is not a release-workflow job. Check the
 [Homebrew autobump status and documented manual bump

@@ -45,11 +45,22 @@ Scans the published `dist` and `default-features` GHCR images every Saturday and
 
 ### Weekly Scoop Bucket Canary (`scoop-bucket-canary.yml`)
 
-Rehearses the Scoop publish path against the current stable release every Monday, and again at the start of every Release Stable run as the `Scoop Credential Preflight` job. It resolves the latest `vX.Y.Z` tag and calls `pub-scoop.yml` with `dry_run: true`, so it exercises the real `SCOOP_BUCKET_TOKEN` against the real bucket without writing anything.
+Rehearses the Scoop publish path against the current stable release every Monday. It resolves the latest `vX.Y.Z` tag and calls `pub-scoop.yml` with `dry_run: true`, so it exercises the real `SCOOP_BUCKET_TOKEN` against the real bucket without writing anything.
 
 This exists because `SCOOP_BUCKET_TOKEN` is account-bound: it expires, and it silently loses write when the owning identity's collaborator grant on the bucket changes. Both have happened. Before the canary, the only thing that exercised the credential was the post-publish `scoop` job, so a dead token was discovered after the release was already cut and announced, and the bucket had to be updated by hand.
 
-The preflight is intentionally non-blocking: nothing in Release Stable depends on it. A dead package-manager credential must never stop a release from shipping; it only has to be visible early enough to rotate before the post-publish `scoop` job runs.
+The canary detects credential rot. It is deliberately not what keeps the bucket correct, and it is not wired into Release Stable: a dead package-manager credential must never gate or delay a release.
+
+#### How the Scoop bucket stays correct
+
+Two independent layers, in order of who acts first:
+
+1. **`pub-scoop.yml` pushes on release.** Atomic with the release, so Scoop users see the new version immediately. Needs the cross-repo `SCOOP_BUCKET_TOKEN`, which is the fragile part.
+2. **The bucket's own excavator self-heals.** `zeroclaw-labs/scoop-zeroclaw` runs the standard Scoop excavator, which reads the manifest's `checkver` and `autoupdate` blocks, recomputes `version`, `url`, and `hash` from the GitHub release, and commits from the bucket side using the bucket's own `GITHUB_TOKEN`. No cross-repo credential is involved, so it cannot fail the way layer 1 does.
+
+That ordering is why a failed `scoop` job is no longer urgent: if the push fails for any reason, excavator republishes within its schedule without a human. This mirrors the decision already made for Homebrew, where the project-owned publisher was retired in favor of Homebrew's official autobump service.
+
+The `checkver` and `autoupdate` blocks are therefore load-bearing in two places at once: excavator consumes them, and `scripts/release/scoop_metadata.sh` derives the release URL template from `autoupdate` so the push path and excavator cannot disagree about where the asset lives. Do not remove them, and do not hand-edit them out of `dist/scoop/zeroclaw.json`.
 
 ### PR Path Labeler (`pr-path-labeler.yml`)
 

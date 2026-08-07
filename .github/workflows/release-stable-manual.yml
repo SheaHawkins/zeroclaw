@@ -1192,16 +1192,6 @@ jobs:
           cosign sign --yes \
             "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}"
 
-  # ── Pre-publish: package manager credential rehearsal ────────────────
-  # Deliberately has no `needs`, so it starts immediately and reports within a
-  # minute instead of after the ~1.5h build matrix. Nothing depends on it: a
-  # dead bucket credential must never block shipping a release, it just has to
-  # be visible early enough to rotate before `scoop` runs post-publish.
-  scoop-preflight:
-    name: Scoop Credential Preflight
-    uses: ./.github/workflows/scoop-bucket-canary.yml
-    secrets: inherit
-
   # ── Post-publish: package manager auto-sync ─────────────────────────
   scoop:
     name: Update Scoop Manifest

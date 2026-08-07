@@ -8,8 +8,14 @@ name: Scoop Bucket Canary
 # only thing that exercised it was the `scoop` job in Release Stable, which runs
 # after `publish`, so a dead credential was discovered once the release had
 # already been cut and announced and the bucket then had to be updated by hand.
-# Running the same rehearsal weekly, and again at the start of a release,
-# surfaces a dead credential while there is still time to rotate it.
+# Running the rehearsal weekly surfaces a dead credential between releases,
+# while there is still time to rotate it.
+#
+# This detects credential rot; it is not what keeps the bucket correct. The
+# bucket's own excavator is the self-healing backstop: it reads the manifest's
+# checkver/autoupdate blocks and republishes from the bucket side using the
+# bucket's GITHUB_TOKEN, with no cross-repo credential involved. See
+# zeroclaw-labs/scoop-zeroclaw.
 
 on:
   schedule:
@@ -17,10 +23,9 @@ on:
     # in the middle of a release.
     - cron: "23 7 * * 1"
   workflow_dispatch:
-  workflow_call:
 
 concurrency:
-  group: scoop-canary-${{ github.workflow }}-${{ github.ref }}
+  group: scoop-canary-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
