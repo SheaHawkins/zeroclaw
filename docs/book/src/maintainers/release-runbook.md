@@ -547,10 +547,15 @@ until the weekly check catches it.
 
 **The AUR is newer than a deliberately rolled-back stable release:** Verify the
 rollback tag and package contents. If the published package has a nonzero
-`epoch`, first add the matching `epoch=` assignment to `dist/aur/PKGBUILD`, run
-`cargo generate installers` to regenerate `dist/aur/.SRCINFO`, and review both
-files; never use `allow_downgrade` to cross an epoch boundary. For a rollback
-within the same epoch, run the manual Pub AUR
+`epoch` that the rollback tag does not contain, do not re-dispatch the old tag:
+release metadata comes from the immutable tag, so default-branch edits cannot
+change that run. Instead, prepare a forward-numbered stable release containing
+the reverted code, add the matching `epoch=` assignment to
+`dist/aur/PKGBUILD`, run `cargo generate installers` to regenerate
+`dist/aur/.SRCINFO`, review both files, merge, and cut a new release tag. The
+freshness check remains red until that tag is published. Never use
+`allow_downgrade` to cross an epoch boundary. For a rollback within the same
+epoch, run the manual Pub AUR
 Package workflow once with `dry_run: true` to validate metadata generation and
 the target side of the version guard, then run it with `dry_run: false` and
 `allow_downgrade: true`. The non-dry-run guard additionally compares the fresh
@@ -558,12 +563,13 @@ AUR clone. That override exists only on manual dispatch; the reusable interface
 does not declare the input and therefore cannot request it. Never use it to
 bypass malformed AUR metadata or an unexplained version mismatch.
 
-**Publishing stopped because package files differ at the same version:** Update
-the `pkgrel` assignment in `dist/aur/PKGBUILD`, run
-`cargo generate installers` to regenerate `dist/aur/.SRCINFO`, review both
-files, and merge that bump before re-dispatching. Do not rewrite an
-already-published `epoch:pkgver-pkgrel` tuple; the publisher rejects mismatched
-source metadata and same-version file changes.
+**Publishing stopped because package files differ at the same version:** The
+publisher intentionally refuses to replace different files at an existing
+`epoch:pkgver-pkgrel` tuple. Inspect the diff. An authorized AUR maintainer must
+either restore the canonical PKGBUILD and `.SRCINFO` generated from that release
+tag, or merge a corrected source change and ship it under a new stable release
+tag. Editing the default branch and re-dispatching the old tag cannot work,
+because the publisher reads metadata from the immutable tag.
 
 **Publishing reports a non-numeric or otherwise malformed current AUR
 version:** The automated publisher intentionally fails closed, and

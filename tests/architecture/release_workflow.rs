@@ -158,7 +158,7 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
     );
     for required in [
         "group: aur-publish-${{ github.repository }}-${{ inputs.dry_run }}",
-        "ref: ${{ inputs.release_tag }}\n          path: release-source",
+        "ref: refs/tags/${{ inputs.release_tag }}\n          path: release-source",
         "release-source/dist/aur/PKGBUILD",
         "release-source/dist/aur/.SRCINFO",
         "if: inputs.dry_run == false\n        timeout-minutes: 12",
@@ -172,6 +172,8 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
         "package metadata is missing, malformed, or inconsistent",
         "stopped to prevent a downgrade",
         "package files changed without a version-tuple change",
+        "Release metadata is pinned to the immutable tag",
+        "corrected source change must ship under a new release tag",
     ] {
         assert!(
             aur.contains(required),
@@ -280,7 +282,9 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
             && freshness.contains("source_epoch=\"$(git show")
             && freshness.contains("git show \"${tag}:dist/aur/.SRCINFO\"")
             && freshness.contains("\"$aur_epoch\" != \"$source_epoch\"")
-            && freshness.contains("do not use allow_downgrade across epochs"),
+            && freshness.contains("Do not use allow_downgrade across epochs")
+            && freshness.contains("cut a new release tag")
+            && freshness.contains("this check remains red until that tag is published"),
         "freshness must compare the published epoch and scope downgrade recovery advice"
     );
 }
