@@ -245,7 +245,7 @@ fi
 if [[ "$tuple_order" == 0 ]]; then
   if ! cmp -s "$target_srcinfo" "$current_srcinfo" || \
     ! cmp -s "$target_pkgbuild" "$current_pkgbuild"; then
-    echo "::error::Target and current AUR package files differ at the same version ${target_display}; bump pkgrel instead of rewriting an existing package version." >&2
+    echo "::error::Target and current AUR package files differ at the same version ${target_display}; a changed package must ship under a new version tuple from a new release tag." >&2
     exit 4
   fi
   echo "AUR version guard accepted the unchanged package at ${target_display}."

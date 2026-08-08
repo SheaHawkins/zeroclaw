@@ -412,6 +412,12 @@ fn aur_publisher_rejects_stale_release_downgrades() {
         Some(4),
         "different package files must not reuse an existing version tuple"
     );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "a changed package must ship under a new version tuple from a new release tag"
+        ),
+        "same-version drift guidance must account for immutable release metadata"
+    );
 
     let output = run_guard(&equal, &equal, &changed_build, &same_build, true);
     assert_eq!(
