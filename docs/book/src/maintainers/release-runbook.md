@@ -549,8 +549,15 @@ until the weekly check catches it.
 rollback tag and package contents, run the manual Pub AUR Package workflow once
 with `dry_run: true`, then run it with `dry_run: false` and
 `allow_downgrade: true`. That override exists only on manual dispatch; the
-reusable release workflow cannot request it. Never use it to bypass malformed
-AUR metadata or an unexplained version mismatch.
+reusable interface does not declare the input and therefore cannot request it.
+Never use it to bypass malformed AUR metadata or an unexplained version
+mismatch.
+
+**Publishing stopped because package files differ at the same version:** Update
+both `pkgrel` assignments in `dist/aur/PKGBUILD` and `dist/aur/.SRCINFO` to the
+same larger value, review the package changes, and merge that bump before
+re-dispatching. Do not rewrite an already-published `epoch:pkgver-pkgrel` tuple;
+the publisher rejects mismatched source metadata and same-version file changes.
 
 ---
 

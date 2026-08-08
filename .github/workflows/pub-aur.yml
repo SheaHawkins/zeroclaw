@@ -33,7 +33,7 @@ on:
         type: boolean
 
 concurrency:
-  group: aur-publish-${{ github.repository }}
+  group: aur-publish-${{ github.repository }}-${{ inputs.dry_run }}
   cancel-in-progress: false
 
 permissions:
@@ -131,7 +131,9 @@ jobs:
         timeout-minutes: 12
         shell: bash
         env:
-          ALLOW_DOWNGRADE: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_downgrade || false }}
+          # Safety comes from workflow_call not declaring allow_downgrade; the
+          # architecture test pins that reusable interface closed.
+          ALLOW_DOWNGRADE: ${{ inputs.allow_downgrade || false }}
           AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
           PKGBUILD_FILE: ${{ steps.pkgbuild.outputs.pkgbuild_file }}
           SRCINFO_FILE: ${{ steps.srcinfo.outputs.srcinfo_file }}
@@ -191,14 +193,15 @@ jobs:
             # Reject a delayed older workflow before it can overwrite a newer
             # package. Guard failures are permanent for this run, not transient
             # AUR failures, so the caller must not retry them.
-            guard_args=()
+            guard_command=(bash "$GITHUB_WORKSPACE/scripts/release/aur_version_guard.sh")
             if [[ "$ALLOW_DOWNGRADE" == "true" ]]; then
-              guard_args+=(--allow-downgrade)
+              guard_command+=(--allow-downgrade)
             fi
-            if ! bash "$GITHUB_WORKSPACE/scripts/release/aur_version_guard.sh" \
-              "${guard_args[@]}" \
+            guard_command+=( \
               "$SRCINFO_FILE" "$work_dir/.SRCINFO" \
-              "$PKGBUILD_FILE" "$work_dir/PKGBUILD"; then
+              "$PKGBUILD_FILE" "$work_dir/PKGBUILD" \
+            )
+            if ! "${guard_command[@]}"; then
               return 2
             fi
 
