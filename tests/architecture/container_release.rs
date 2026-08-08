@@ -183,7 +183,10 @@ fn compose_smoke_proves_override_precedence_through_the_published_port() {
     for required in [
         "- docker-compose.yml",
         "- scripts/ci/smoke_docker_compose.sh",
-        "load: ${{ matrix.compose_smoke }}",
+        "matrix: ${{ fromJSON(needs.changes.outputs.source_matrix) }}",
+        "\"gateway_smoke\":true",
+        "load: ${{ matrix.gateway_smoke || (matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64') }}",
+        "if: matrix.gateway_smoke",
         "run: bash scripts/ci/smoke_docker_compose.sh",
     ] {
         assert!(
