@@ -1353,26 +1353,35 @@ struct NativeChatRequest<T = Vec<NativeToolSpec>> {
     extra_body: Option<serde_json::Value>,
 }
 
-/// Override the reasoning effort on the actual serialized request body.
+/// Ensure the serialized request body carries an explicit
+/// `reasoning_effort: "none"`, reporting whether that changed the payload.
 ///
 /// `extra_body` is flattened into [`NativeChatRequest`] and can supply the
 /// canonical top-level value seen by the endpoint, so fallback decisions must
 /// inspect and mutate the wire payload rather than only the typed field.
-fn set_reasoning_effort_none(payload: &mut serde_json::Value) -> bool {
+///
+/// An *absent* `reasoning_effort` is not equivalent to `"none"`: endpoints
+/// default an omitted effort to a non-`none` value, so a payload without the
+/// field is rejected exactly like one carrying `"high"`. The key is therefore
+/// inserted when missing.
+///
+/// Returns `false` once the payload already states `"none"`, which is the
+/// fixed point that bounds the retry to a single additional request.
+fn ensure_reasoning_effort_none(payload: &mut serde_json::Value) -> bool {
     let Some(object) = payload.as_object_mut() else {
         return false;
     };
-    match object.get("reasoning_effort") {
-        None => false,
-        Some(serde_json::Value::String(effort)) if effort.eq_ignore_ascii_case("none") => false,
-        Some(_) => {
-            object.insert(
-                "reasoning_effort".to_string(),
-                serde_json::Value::String("none".to_string()),
-            );
-            true
-        }
+    if matches!(
+        object.get("reasoning_effort"),
+        Some(serde_json::Value::String(effort)) if effort.eq_ignore_ascii_case("none")
+    ) {
+        return false;
     }
+    object.insert(
+        "reasoning_effort".to_string(),
+        serde_json::Value::String("none".to_string()),
+    );
+    true
 }
 
 #[derive(Debug, Serialize)]
@@ -3022,7 +3031,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let error = response.text().await?;
             if tools_count > 0
                 && super::rejects_tools_with_reasoning_effort(status, &error)
-                && set_reasoning_effort_none(&mut payload)
+                && ensure_reasoning_effort_none(&mut payload)
             {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -3168,7 +3177,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
             if tools_count > 0
                 && super::rejects_tools_with_reasoning_effort(status, &error)
-                && set_reasoning_effort_none(&mut payload)
+                && ensure_reasoning_effort_none(&mut payload)
             {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -3395,7 +3404,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 };
                 if tools_count > 0
                     && super::rejects_tools_with_reasoning_effort(status, &error)
-                    && set_reasoning_effort_none(&mut payload)
+                    && ensure_reasoning_effort_none(&mut payload)
                 {
                     ::zeroclaw_log::record!(
                         WARN,
@@ -4486,6 +4495,235 @@ mod tests {
             Some("none")
         );
         assert!(bodies.iter().all(|body| body.get("tools").is_some()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn compatible_retries_once_inserting_reasoning_effort_none_when_unset() {
+        // Regression: a model that receives no reasoning_effort at all (the
+        // common case, since reasoning_effort_for_model returns None outside
+        // GPT-5/o-series/codex) must still recover. An omitted field defaults
+        // to a non-"none" effort server-side, so the retry has to *insert*
+        // the explicit "none" rather than only overwrite an existing value.
+        let (addr, bodies, server) = spawn_reasoning_rejecting_endpoint(false).await;
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(None)
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+
+        let response = provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "gpt-5",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.text.as_deref(), Some("ok"));
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "fallback must be bounded to one retry");
+        assert!(
+            bodies[0].get("reasoning_effort").is_none(),
+            "first request must omit reasoning_effort when none is configured; got: {}",
+            bodies[0]
+        );
+        assert_eq!(
+            bodies[1]
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("none"),
+            "retry must insert an explicit reasoning_effort of none"
+        );
+        assert!(bodies.iter().all(|body| body.get("tools").is_some()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn compatible_streaming_retries_once_inserting_reasoning_effort_none_when_unset() {
+        use futures_util::StreamExt as _;
+
+        let (addr, bodies, server) = spawn_reasoning_rejecting_endpoint(true).await;
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(None)
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+
+        let events = provider
+            .stream_chat(
+                crate::traits::ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "gpt-5",
+                None,
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().all(Result::is_ok));
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "stream fallback must retry exactly once");
+        assert!(bodies[0].get("reasoning_effort").is_none());
+        assert_eq!(
+            bodies[1]
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("none")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_retries_once_inserting_reasoning_effort_none_when_unset() {
+        let (addr, bodies, server) = spawn_reasoning_rejecting_endpoint(false).await;
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(None)
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+
+        let response = provider
+            .chat_with_tools(&messages, &tools, "gpt-5", None)
+            .await
+            .unwrap();
+        assert_eq!(response.text.as_deref(), Some("ok"));
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "fallback must be bounded to one retry");
+        assert!(bodies[0].get("reasoning_effort").is_none());
+        assert_eq!(
+            bodies[1]
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("none")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn bad_reasoning_value_naming_a_tool_model_does_not_retry() {
+        // Interaction of both fixes: the endpoint reports a plain bad-value
+        // error whose text happens to name a model containing "tool". The
+        // classifier must not treat that as a tools conflict, so the
+        // configured effort is preserved and the error propagates unchanged
+        // after exactly one request.
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    bodies.lock().unwrap().push(body);
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": {
+                                "message": "reasoning_effort value 'high' is unsupported for tool-model",
+                                "param": "reasoning_effort"
+                            }
+                        })),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("high".to_string()))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+
+        let result = provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "gpt-5",
+                None,
+            )
+            .await;
+        assert!(result.is_err(), "bad-value errors must propagate unchanged");
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            1,
+            "a bad-value error must not trigger the tools/reasoning fallback"
+        );
+        assert_eq!(
+            bodies[0]
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("high"),
+            "the operator-configured effort must not be downgraded"
+        );
         server.abort();
     }
 
