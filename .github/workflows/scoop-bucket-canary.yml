@@ -63,4 +63,5 @@ jobs:
     with:
       release_tag: ${{ needs.latest-release.outputs.tag }}
       dry_run: true
-    secrets: inherit
+    secrets:
+      SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
