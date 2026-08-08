@@ -891,6 +891,44 @@ pub fn sanitize_api_error(input: &str) -> String {
     format!("{}...", &scrubbed[..end])
 }
 
+/// Whether `message` mentions tools as a standalone word rather than as a
+/// fragment of a larger identifier.
+///
+/// Hyphens and underscores count as word characters so model names and
+/// identifiers such as `tool-model`, `toolformer-v2`, `multi_tool` or
+/// `toolkit` are not mistaken for the endpoint reporting a tools conflict.
+/// Only a bare `tool` / `tools` token matches.
+fn mentions_tools_token(message: &str) -> bool {
+    let is_word_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    let bytes = message.as_bytes();
+    let mut search_from = 0usize;
+
+    while let Some(found) = message[search_from..].find("tool") {
+        let start = search_from + found;
+        let mut end = start + "tool".len();
+        // Accept the plural form as part of the same token.
+        if message[end..].starts_with('s') {
+            end += 1;
+        }
+
+        let preceded_by_word_char = message[..start]
+            .chars()
+            .next_back()
+            .is_some_and(&is_word_char);
+        let followed_by_word_char = bytes
+            .get(end)
+            .map(|byte| *byte as char)
+            .is_some_and(&is_word_char);
+
+        if !preceded_by_word_char && !followed_by_word_char {
+            return true;
+        }
+        search_from = start + "tool".len();
+    }
+
+    false
+}
+
 /// Whether an endpoint explicitly rejected combining function tools with
 /// `reasoning_effort`.
 ///
@@ -928,7 +966,7 @@ pub(crate) fn rejects_tools_with_reasoning_effort(status: reqwest::StatusCode, b
     let mentions_reasoning_effort = parameter == "reasoning_effort"
         || message.contains("reasoning_effort")
         || message.contains("reasoning effort");
-    let mentions_tools = message.contains("tool");
+    let mentions_tools = mentions_tools_token(&message);
     let reports_incompatibility = [
         "not supported",
         "unsupported",
@@ -3606,6 +3644,40 @@ mod tests {
         assert!(rejects_tools_with_reasoning_effort(
             reqwest::StatusCode::UNPROCESSABLE_ENTITY,
             "Function tools with reasoning_effort are incompatible"
+        ));
+    }
+
+    #[test]
+    fn tool_reasoning_rejection_ignores_tool_substrings_in_identifiers() {
+        // A bad-value error that merely names a model containing "tool" must
+        // not be misread as a tools/reasoning capability conflict: retrying
+        // would silently downgrade the operator's configured effort.
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort value 'xhigh' is unsupported for tool-model","param":"reasoning_effort"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort is not allowed for model toolformer-v2","param":"reasoning_effort"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort is not supported for deployment multi_tool_router","param":"reasoning_effort"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort is not supported by toolkit","param":"reasoning_effort"}}"#
+        ));
+
+        // Genuine conflicts still match, including the plural token and
+        // punctuation-adjacent forms.
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort is not supported when tools are provided","param":"reasoning_effort"}}"#
+        ));
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort cannot be used with \"tools\".","param":"reasoning_effort"}}"#
         ));
     }
 
