@@ -6,6 +6,22 @@ credential_canary="${CREDENTIAL_CANARY:-false}"
 bucket_repo="${SCOOP_BUCKET_REPO:-}"
 bucket_token="${GH_TOKEN:-}"
 
+case "$dry_run" in
+  true | false) ;;
+  *)
+    echo "::error::DRY_RUN must be true or false." >&2
+    exit 1
+    ;;
+esac
+
+case "$credential_canary" in
+  true | false) ;;
+  *)
+    echo "::error::CREDENTIAL_CANARY must be true or false." >&2
+    exit 1
+    ;;
+esac
+
 if [[ "$credential_canary" == "true" ]]; then
   if [[ -z "$bucket_repo" ]]; then
     echo "::error::Repository variable SCOOP_BUCKET_REPO is required for the credential canary." >&2

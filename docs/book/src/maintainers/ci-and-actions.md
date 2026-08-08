@@ -45,7 +45,9 @@ Scans the published `dist` and `default-features` GHCR images every Saturday and
 
 ### Weekly Scoop Bucket Canary (`scoop-bucket-canary.yml`)
 
-Rehearses the Scoop publish path against the current stable release every Monday. It resolves the latest `vX.Y.Z` tag and calls `pub-scoop.yml` with `dry_run: true`, so it exercises the real `SCOOP_BUCKET_TOKEN` against the real bucket without writing anything.
+Rehearses the Scoop publish path against the current stable release every Monday. It resolves the latest `vX.Y.Z` tag and calls `pub-scoop.yml` with both `dry_run: true` and `credential_canary: true`, so it exercises the real `SCOOP_BUCKET_TOKEN` against the real bucket without writing anything.
+
+`credential_canary` is the fail-closed part of that contract: a missing `SCOOP_BUCKET_REPO` or `SCOOP_BUCKET_TOKEN` fails the run, and configured credentials must reach the `git push --dry-run` authorization probe. A generic manual `pub-scoop.yml` run with only `dry_run: true` remains permissive for manifest generation and may skip that probe when credentials are unavailable; do not use the generic mode as credential-verification evidence.
 
 This exists because `SCOOP_BUCKET_TOKEN` is account-bound: it expires, and it silently loses write when the owning identity's collaborator grant on the bucket changes. Both have happened. Before the canary, the only thing that exercised the credential was the post-publish `scoop` job, so a dead token was discovered after the release was already cut and announced, and the bucket had to be updated by hand.
 
@@ -56,7 +58,7 @@ The canary detects credential rot. It is deliberately not what keeps the bucket 
 Today the release publisher is the only automated writer:
 
 1. **`pub-scoop.yml` pushes on release.** Scoop users see the new version immediately when this succeeds. It needs the cross-repo `SCOOP_BUCKET_TOKEN`, which is the fragile part.
-2. **Maintainers recover failed pushes.** Rotate or repair the token, dispatch the publisher with `dry_run: true` to verify it, rerun with `dry_run: false`, and confirm the bucket manifest landed the release version.
+2. **Maintainers recover failed pushes.** Rotate or repair the token, dispatch Scoop Bucket Canary to verify it through the fail-closed `credential_canary` path, rerun the publisher with `dry_run: false`, and confirm the bucket manifest landed the release version.
 
 A bucket-side Excavator is proposed in [scoop-zeroclaw#1](https://github.com/zeroclaw-labs/scoop-zeroclaw/pull/1). Once that workflow is merged, the bucket repository grants Actions read/write workflow permission, and a maintainer smoke test proves that it commits an update, it can become a credential-independent recovery layer. Until all three conditions are satisfied, do not assume a failed publisher will self-heal.
 

@@ -526,7 +526,10 @@ restart the workflow.
 **A Scoop or AUR distribution job failed:** Each has a corresponding
 manually-triggerable sub-workflow. Re-run the specific one with `dry_run: true`
 first to confirm the fix, then `dry_run: false`. These are nice-to-have: a
-failed distribution job does not invalidate the release itself.
+failed distribution job does not invalidate the release itself. For Scoop
+credential failures, use Scoop Bucket Canary instead of treating a generic dry
+run as credential proof; the canary enables the fail-closed
+`credential_canary` path.
 
 **The `scoop` job failed with `remote: Permission ... denied to <account>` (403):**
 A permissions problem, not a manifest problem: the bucket token is dead or
