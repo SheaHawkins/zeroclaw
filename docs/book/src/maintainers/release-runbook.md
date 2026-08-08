@@ -62,7 +62,7 @@ Bump `workspace.package.version` in the workspace `Cargo.toml`, then run the two
 This updates README badges, the Tauri config, and workflow description
 examples, then regenerates every spec-driven install surface via
 `cargo generate installers`: install.sh, setup.bat, `dist/aur/PKGBUILD`,
-`dist/scoop/zeroclaw.json`, `flake.nix`, the Dockerfile/Containerfile feature
+`dist/aur/.SRCINFO`, `dist/scoop/zeroclaw.json`, `flake.nix`, the Dockerfile/Containerfile feature
 sets, `dev/ci/docker-tags.toml`, `docs/book/src/_snippets/install.md`, the Unix
 fast-path blocks in README/platform docs, and the Windows prebuilt block in
 `docs/book/src/setup/windows.md`.
@@ -547,9 +547,10 @@ until the weekly check catches it.
 
 **The AUR is newer than a deliberately rolled-back stable release:** Verify the
 rollback tag and package contents. If the published package has a nonzero
-`epoch`, first add matching `epoch=` and `epoch =` assignments to
-`dist/aur/PKGBUILD` and `dist/aur/.SRCINFO`; never use `allow_downgrade` to cross
-an epoch boundary. For a rollback within the same epoch, run the manual Pub AUR
+`epoch`, first add the matching `epoch=` assignment to `dist/aur/PKGBUILD`, run
+`cargo generate installers` to regenerate `dist/aur/.SRCINFO`, and review both
+files; never use `allow_downgrade` to cross an epoch boundary. For a rollback
+within the same epoch, run the manual Pub AUR
 Package workflow once with `dry_run: true` to validate metadata generation and
 the target side of the version guard, then run it with `dry_run: false` and
 `allow_downgrade: true`. The non-dry-run guard additionally compares the fresh
@@ -558,10 +559,11 @@ does not declare the input and therefore cannot request it. Never use it to
 bypass malformed AUR metadata or an unexplained version mismatch.
 
 **Publishing stopped because package files differ at the same version:** Update
-both `pkgrel` assignments in `dist/aur/PKGBUILD` and `dist/aur/.SRCINFO` to the
-same larger value, review the package changes, and merge that bump before
-re-dispatching. Do not rewrite an already-published `epoch:pkgver-pkgrel` tuple;
-the publisher rejects mismatched source metadata and same-version file changes.
+the `pkgrel` assignment in `dist/aur/PKGBUILD`, run
+`cargo generate installers` to regenerate `dist/aur/.SRCINFO`, review both
+files, and merge that bump before re-dispatching. Do not rewrite an
+already-published `epoch:pkgver-pkgrel` tuple; the publisher rejects mismatched
+source metadata and same-version file changes.
 
 **Publishing reports a non-numeric or otherwise malformed current AUR
 version:** The automated publisher intentionally fails closed, and

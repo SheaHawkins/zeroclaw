@@ -48,9 +48,16 @@ jobs:
       RELEASE_TAG: ${{ inputs.release_tag }}
       DRY_RUN: ${{ inputs.dry_run }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Check out publisher automation
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+
+      - name: Check out release package metadata
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.release_tag }}
+          path: release-source
 
       - name: Validate and compute metadata
         id: meta
@@ -97,7 +104,7 @@ jobs:
           pkgbuild_file="$(mktemp)"
           sed -e "s/^pkgver=.*/pkgver=${VERSION}/" \
               -e "s/^sha256sums=.*/sha256sums=('${TARBALL_SHA}')/" \
-              dist/aur/PKGBUILD > "$pkgbuild_file"
+              release-source/dist/aur/PKGBUILD > "$pkgbuild_file"
 
           echo "pkgbuild_file=$pkgbuild_file" >> "$GITHUB_OUTPUT"
 
@@ -122,7 +129,7 @@ jobs:
               -e "s/sha256sums = .*/sha256sums = ${TARBALL_SHA}/" \
               -e "s|zeroclawlabs-[0-9.]*.tar.gz|zeroclawlabs-${VERSION}.tar.gz|g" \
               -e "s|/v[0-9.]*\.tar\.gz|/v${VERSION}.tar.gz|g" \
-              dist/aur/.SRCINFO > "$srcinfo_file"
+              release-source/dist/aur/.SRCINFO > "$srcinfo_file"
 
           echo "srcinfo_file=$srcinfo_file" >> "$GITHUB_OUTPUT"
 

@@ -158,6 +158,9 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
     );
     for required in [
         "group: aur-publish-${{ github.repository }}-${{ inputs.dry_run }}",
+        "ref: ${{ inputs.release_tag }}\n          path: release-source",
+        "release-source/dist/aur/PKGBUILD",
+        "release-source/dist/aur/.SRCINFO",
         "if: inputs.dry_run == false\n        timeout-minutes: 12",
         "\"${guard_command[@]}\" || return $?",
         "case \"$attempt_status\" in",

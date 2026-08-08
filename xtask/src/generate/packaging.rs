@@ -72,6 +72,49 @@ fn assignment<'a>(pkgbuild: &'a str, key: &str) -> anyhow::Result<Option<&'a str
     Ok(values.first().copied())
 }
 
+fn validate_top_level_assignments(pkgbuild: &str) -> anyhow::Result<()> {
+    const KNOWN: &[&str] = &[
+        "pkgname",
+        "pkgver",
+        "pkgrel",
+        "epoch",
+        "pkgdesc",
+        "arch",
+        "url",
+        "license",
+        "depends",
+        "makedepends",
+        "provides",
+        "conflicts",
+        "source",
+        "sha256sums",
+    ];
+
+    for line in pkgbuild.lines() {
+        let Some((key, _)) = line.split_once('=') else {
+            continue;
+        };
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            continue;
+        }
+        if !key.starts_with('_') && !KNOWN.contains(&key) {
+            anyhow::bail!("unsupported top-level AUR PKGBUILD assignment `{key}`");
+        }
+    }
+    Ok(())
+}
+
+fn reject_dynamic_value(key: &str, value: &str) -> anyhow::Result<()> {
+    if value.contains('$') || value.contains('`') {
+        anyhow::bail!("dynamic `{key}` AUR PKGBUILD values are not supported");
+    }
+    Ok(())
+}
+
 fn scalar(pkgbuild: &str, key: &str) -> anyhow::Result<String> {
     let raw = assignment(pkgbuild, key)?
         .ok_or_else(|| anyhow::Error::msg(format!("missing `{key}` in AUR PKGBUILD")))?;
@@ -83,12 +126,14 @@ fn scalar(pkgbuild: &str, key: &str) -> anyhow::Result<String> {
             if value.as_bytes().contains(&first) {
                 anyhow::bail!("unsupported quote in `{key}` AUR PKGBUILD assignment");
             }
+            reject_dynamic_value(key, value)?;
             return Ok(value.to_owned());
         }
     }
     if raw.is_empty() || raw.chars().any(char::is_whitespace) {
         anyhow::bail!("unsupported scalar `{key}` AUR PKGBUILD assignment");
     }
+    reject_dynamic_value(key, raw)?;
     Ok(raw.to_owned())
 }
 
@@ -115,6 +160,9 @@ fn array(pkgbuild: &str, key: &str) -> anyhow::Result<Vec<String>> {
         if value.contains('\\') {
             anyhow::bail!("escaped `{key}` array entries are not supported");
         }
+        if key != "source" {
+            reject_dynamic_value(key, value)?;
+        }
         values.push(value.to_owned());
         rest = tail[end + 1..].trim_start();
     }
@@ -131,6 +179,7 @@ fn push_srcinfo_values(rendered: &mut String, key: &str, values: &[String]) {
 }
 
 fn render_srcinfo_from_pkgbuild(version: &str, pkgbuild: &str) -> anyhow::Result<String> {
+    validate_top_level_assignments(pkgbuild)?;
     let pkgname = scalar(pkgbuild, "pkgname")?;
     let pkgrel = scalar(pkgbuild, "pkgrel")?;
     let pkgdesc = scalar(pkgbuild, "pkgdesc")?;
@@ -150,9 +199,7 @@ fn render_srcinfo_from_pkgbuild(version: &str, pkgbuild: &str) -> anyhow::Result
             let expanded = source
                 .replace("${pkgname}", &pkgname)
                 .replace("${pkgver}", version);
-            if expanded.contains('$') {
-                anyhow::bail!("unsupported variable in AUR PKGBUILD source: {expanded}");
-            }
+            reject_dynamic_value("source", &expanded)?;
             Ok(expanded)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -314,6 +361,10 @@ mod tests {
         assert!(render_srcinfo_from_pkgbuild(&version, &duplicate).is_err());
         let dynamic = pkgbuild.replace("depends=('gcc-libs' 'openssl')", "depends=($EXTRA_DEPS)");
         assert!(render_srcinfo_from_pkgbuild(&version, &dynamic).is_err());
+        let dynamic_scalar = pkgbuild.replace("pkgrel=1", "pkgrel=$REL");
+        assert!(render_srcinfo_from_pkgbuild(&version, &dynamic_scalar).is_err());
+        let unknown = format!("{pkgbuild}\noptdepends=('sqlite: optional database support')\n");
+        assert!(render_srcinfo_from_pkgbuild(&version, &unknown).is_err());
 
         let with_epoch = pkgbuild.replace("pkgver=", "epoch=2\npkgver=");
         let rendered = render_srcinfo_from_pkgbuild(&version, &with_epoch).unwrap();
