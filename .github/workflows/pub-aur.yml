@@ -201,9 +201,7 @@ jobs:
               "$SRCINFO_FILE" "$work_dir/.SRCINFO" \
               "$PKGBUILD_FILE" "$work_dir/PKGBUILD" \
             )
-            if ! "${guard_command[@]}"; then
-              return 2
-            fi
+            "${guard_command[@]}" || return $?
 
             cp "$PKGBUILD_FILE" "$work_dir/PKGBUILD" || return 1
             cp "$SRCINFO_FILE" "$work_dir/.SRCINFO" || return 1
@@ -233,10 +231,20 @@ jobs:
               attempt_status=$?
             fi
 
-            if (( attempt_status == 2 )); then
-              echo "::error::AUR publish stopped because the freshly cloned package failed the monotonic version guard."
-              exit 1
-            fi
+            case "$attempt_status" in
+              2)
+                echo "::error::AUR publish stopped because package metadata is missing, malformed, or inconsistent. Repair the named files; malformed published metadata requires an authorized manual AUR push."
+                exit 1
+                ;;
+              3)
+                echo "::error::AUR publish stopped to prevent a downgrade. Verify the rollback, then use a manual non-dry-run dispatch with allow_downgrade: true."
+                exit 1
+                ;;
+              4)
+                echo "::error::AUR publish stopped because package files changed without a version-tuple change. Bump pkgrel in both source files before retrying."
+                exit 1
+                ;;
+            esac
 
             if (( attempt < max_attempts )); then
               echo "::warning::AUR publish attempt ${attempt}/${max_attempts} failed; retrying in ${delay}s."

@@ -16,6 +16,24 @@ fn workflow(name: &str) -> String {
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", workflow_path.display()))
 }
 
+fn assert_command_failure(
+    output: &std::process::Output,
+    expected_code: i32,
+    expected_stderr: &str,
+    context: &str,
+) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(expected_code),
+        "{context}: {stderr}"
+    );
+    assert!(
+        stderr.contains(expected_stderr),
+        "{context} must report {expected_stderr:?}, got: {stderr}"
+    );
+}
+
 #[test]
 fn macos_desktop_release_notarizes_published_dmg() {
     let workflow_path =
@@ -123,16 +141,29 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
     );
 
     let aur = workflow("pub-aur.yml");
+    let publish_job = aur
+        .split_once("  publish-aur:\n")
+        .map(|(_, job)| job)
+        .expect("AUR publisher must define the publish-aur job");
+    assert!(
+        publish_job
+            .lines()
+            .take(5)
+            .any(|line| line == "    timeout-minutes: 20"),
+        "the publish-aur job must have a bounded job timeout"
+    );
     assert!(
         !aur.contains("ssh -T -o"),
         "AUR clone/push is the authoritative authentication check"
     );
     for required in [
         "group: aur-publish-${{ github.repository }}-${{ inputs.dry_run }}",
-        "timeout-minutes: 20",
         "if: inputs.dry_run == false\n        timeout-minutes: 12",
-        "if (( attempt_status == 2 )); then",
-        "stopped because the freshly cloned package failed the monotonic version guard",
+        "\"${guard_command[@]}\" || return $?",
+        "case \"$attempt_status\" in",
+        "package metadata is missing, malformed, or inconsistent",
+        "stopped to prevent a downgrade",
+        "package files changed without a version-tuple change",
     ] {
         assert!(
             aur.contains(required),
@@ -167,21 +198,7 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
         "manual downgrade authorization must default to false"
     );
 
-    let guard_call = r#"guard_command=(bash "$GITHUB_WORKSPACE/scripts/release/aur_version_guard.sh")
-            if [[ "$ALLOW_DOWNGRADE" == "true" ]]; then
-              guard_command+=(--allow-downgrade)
-            fi
-            guard_command+=( \
-              "$SRCINFO_FILE" "$work_dir/.SRCINFO" \
-              "$PKGBUILD_FILE" "$work_dir/PKGBUILD" \
-            )
-            if ! "${guard_command[@]}"; then
-              return 2
-            fi"#;
-    assert!(
-        aur.contains(guard_call),
-        "AUR publisher must map the complete package guard to a permanent failure"
-    );
+    let guard_call = "scripts/release/aur_version_guard.sh";
     assert_eq!(
         aur.matches("scripts/release/aur_version_guard.sh").count(),
         1,
@@ -202,12 +219,34 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
         "the AUR monotonic guard must inspect each fresh clone before package metadata is overwritten"
     );
 
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source_srcinfo = root.join("dist/aur/.SRCINFO");
+    let source_pkgbuild = root.join("dist/aur/PKGBUILD");
+    let source_guard = Command::new("bash")
+        .arg(root.join("scripts/release/aur_version_guard.sh"))
+        .arg(&source_srcinfo)
+        .arg(&source_srcinfo)
+        .arg(&source_pkgbuild)
+        .arg(&source_pkgbuild)
+        .output()
+        .expect("validate checked-in AUR package metadata");
+    assert!(
+        source_guard.status.success(),
+        "checked-in PKGBUILD and .SRCINFO version tuples must agree: {}",
+        String::from_utf8_lossy(&source_guard.stderr)
+    );
+
     let freshness = workflow("aur-freshness-check.yml");
     assert!(
         freshness.contains(
             "aur_version=\"${aur_full%%-*}\"\n          aur_version=\"${aur_version#*:}\""
         ),
         "AUR freshness must remove pkgrel and epoch before comparing pkgver to the release"
+    );
+    assert!(
+        freshness.contains("sort -V | tail -n 1")
+            && freshness.contains("AUR is newer than the release"),
+        "the downgrade recovery hint must only appear when AUR is newer"
     );
 }
 
@@ -344,48 +383,54 @@ fn aur_publisher_rejects_stale_release_downgrades() {
 
     let malformed = srcinfo(None, "not-a-version", "1");
     let output = run_guard(&equal, &malformed, &same_build, &same_build, false);
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "unparseable current AUR state must return a hard validation failure"
+    assert_command_failure(
+        &output,
+        2,
+        "Current AUR pkgver is not numeric",
+        "unparseable current AUR state must return a hard validation failure",
     );
     let output = run_guard(&equal, &malformed, &same_build, &same_build, true);
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "manual downgrade authorization must not permit malformed AUR state"
+    assert_command_failure(
+        &output,
+        2,
+        "Current AUR pkgver is not numeric",
+        "manual downgrade authorization must not permit malformed AUR state",
     );
 
     let extra_equals = equal.replace("pkgver = 1.2.3", "pkgver = 1.2.3 = junk");
     let output = run_guard(&equal, &extra_equals, &same_build, &same_build, false);
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "SRCINFO values with trailing equals data must not be truncated"
+    assert_command_failure(
+        &output,
+        2,
+        "Current AUR pkgver is not numeric",
+        "SRCINFO values with trailing equals data must not be truncated",
     );
 
     let malformed_build = same_build.replace("pkgver=1.2.3", "pkgver=1.2.3=junk");
     let output = run_guard(&equal, &equal, &same_build, &malformed_build, false);
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "PKGBUILD values with trailing equals data must not be truncated"
+    assert_command_failure(
+        &output,
+        2,
+        "Current PKGBUILD pkgver is not numeric",
+        "PKGBUILD values with trailing equals data must not be truncated",
     );
 
     let duplicate = format!("{equal}pkgver = 9.9.9\n");
     let output = run_guard(&equal, &duplicate, &same_build, &same_build, false);
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "multiple pkgver fields must fail closed"
+    assert_command_failure(
+        &output,
+        2,
+        "Expected exactly one pkgver in Current .SRCINFO; found 2",
+        "multiple pkgver fields must fail closed",
     );
 
     let mismatched_build = pkgbuild(None, "1.2.3", "2");
     let output = run_guard(&equal, &equal, &mismatched_build, &same_build, false);
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "generated PKGBUILD and .SRCINFO version tuples must agree"
+    assert_command_failure(
+        &output,
+        2,
+        "Generated AUR .SRCINFO and PKGBUILD disagree",
+        "generated PKGBUILD and .SRCINFO version tuples must agree",
     );
 
     fs::write(&target_srcinfo, &equal).expect("restore target AUR .SRCINFO");
@@ -415,10 +460,11 @@ fn aur_publisher_rejects_stale_release_downgrades() {
         .arg(&current_pkgbuild)
         .output()
         .expect("run AUR guard with partial current metadata");
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "a partially populated cloned package must fail closed"
+    assert_command_failure(
+        &output,
+        2,
+        "cloned AUR repository is partially populated",
+        "a partially populated cloned package must fail closed",
     );
 }
 

@@ -65,7 +65,10 @@ jobs:
           if [[ "$aur_version" != "$release_version" ]]; then
             echo "::error::AUR ${AUR_PACKAGE} is at ${aur_full} but the current release is ${tag}."
             echo "::error::Re-dispatch Pub AUR Package at ${tag} (dry_run: true first) to resync."
-            echo "::error::If this is an intentional rollback and AUR is newer, the manual non-dry-run dispatch must set allow_downgrade: true."
+            if [[ "$aur_version" =~ ^[0-9]+(\.[0-9]+)*$ ]] && \
+              [[ "$(printf '%s\n' "$release_version" "$aur_version" | sort -V | tail -n 1)" == "$aur_version" ]]; then
+              echo "::error::AUR is newer than the release. For an intentional rollback, the manual non-dry-run dispatch must set allow_downgrade: true."
+            fi
             {
               echo "### AUR is stale"
               echo "- package: \`${AUR_PACKAGE}\`"

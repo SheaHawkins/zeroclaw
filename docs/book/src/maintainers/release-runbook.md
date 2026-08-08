@@ -547,17 +547,27 @@ until the weekly check catches it.
 
 **The AUR is newer than a deliberately rolled-back stable release:** Verify the
 rollback tag and package contents, run the manual Pub AUR Package workflow once
-with `dry_run: true`, then run it with `dry_run: false` and
-`allow_downgrade: true`. That override exists only on manual dispatch; the
-reusable interface does not declare the input and therefore cannot request it.
-Never use it to bypass malformed AUR metadata or an unexplained version
-mismatch.
+with `dry_run: true` to validate metadata generation and release inputs, then
+run it with `dry_run: false` and `allow_downgrade: true`. The dry run does not
+clone the AUR package or exercise the version guard; the guard's stderr from the
+non-dry-run is the authoritative rollback result. That override exists only on
+manual dispatch; the reusable interface does not declare the input and
+therefore cannot request it. Never use it to bypass malformed AUR metadata or
+an unexplained version mismatch.
 
 **Publishing stopped because package files differ at the same version:** Update
 both `pkgrel` assignments in `dist/aur/PKGBUILD` and `dist/aur/.SRCINFO` to the
 same larger value, review the package changes, and merge that bump before
 re-dispatching. Do not rewrite an already-published `epoch:pkgver-pkgrel` tuple;
 the publisher rejects mismatched source metadata and same-version file changes.
+
+**Publishing reports a non-numeric or otherwise malformed current AUR
+version:** The automated publisher intentionally fails closed, and
+`allow_downgrade` cannot bypass malformed metadata. An authorized AUR maintainer
+must repair the package with a manual AUR push to a well-formed
+`epoch:pkgver-pkgrel`, verify it through the AUR RPC, and then re-dispatch the
+normal publisher. Do not weaken the guard to make malformed published state
+comparable.
 
 ---
 
