@@ -127,6 +127,79 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
         !aur.contains("ssh -T -o"),
         "AUR clone/push is the authoritative authentication check"
     );
+    for required in [
+        "group: aur-publish-${{ github.repository }}",
+        "timeout-minutes: 20",
+        "scripts/release/aur_version_guard.sh",
+        "if (( attempt_status == 2 )); then",
+        "stopped because the freshly cloned package failed the monotonic version guard",
+    ] {
+        assert!(
+            aur.contains(required),
+            "AUR publisher is missing release-safety invariant: {required}"
+        );
+    }
+
+    let clone_position = aur
+        .find("git clone --quiet ssh://aur@aur.archlinux.org/zeroclawlabs.git")
+        .expect("AUR publisher must clone the authoritative package state");
+    let guard_position = aur
+        .find("scripts/release/aur_version_guard.sh")
+        .expect("AUR publisher must enforce monotonic versions");
+    let overwrite_position = aur
+        .find("cp \"$PKGBUILD_FILE\" \"$work_dir/PKGBUILD\"")
+        .expect("AUR publisher must update PKGBUILD");
+    assert!(
+        clone_position < guard_position && guard_position < overwrite_position,
+        "the AUR monotonic guard must inspect each fresh clone before package metadata is overwritten"
+    );
+}
+
+#[test]
+fn aur_publisher_rejects_stale_release_downgrades() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let guard_script = root.join("scripts/release/aur_version_guard.sh");
+    let temp = tempfile::tempdir().expect("create temporary AUR package directory");
+    let srcinfo = temp.path().join(".SRCINFO");
+
+    let run_guard = |target: &str, current: &str| {
+        fs::write(
+            &srcinfo,
+            format!("pkgbase = zeroclawlabs\npkgver = {current}\npkgrel = 1\n"),
+        )
+        .expect("write temporary AUR .SRCINFO");
+        Command::new("bash")
+            .arg(&guard_script)
+            .arg(target)
+            .arg(&srcinfo)
+            .output()
+            .expect("run AUR monotonic version guard")
+    };
+
+    for (target, current) in [("1.2.3", "1.2.3"), ("1.2.4", "1.2.3"), ("1.10.0", "1.9.9")] {
+        let output = run_guard(target, current);
+        assert!(
+            output.status.success(),
+            "target {target} should be allowed over {current}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let output = run_guard("1.9.9", "1.10.0");
+    assert!(
+        !output.status.success(),
+        "an older workflow must not downgrade a newer AUR package"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Refusing AUR downgrade"),
+        "downgrade rejection must explain why publishing stopped"
+    );
+
+    let output = run_guard("1.2.3", "not-a-version");
+    assert!(
+        !output.status.success(),
+        "unparseable current AUR state must fail closed"
+    );
 }
 
 #[test]

@@ -28,7 +28,7 @@ on:
         type: boolean
 
 concurrency:
-  group: aur-publish-${{ github.run_id }}
+  group: aur-publish-${{ github.repository }}
   cancel-in-progress: false
 
 permissions:
@@ -38,6 +38,7 @@ jobs:
   publish-aur:
     name: Update AUR Package
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       RELEASE_TAG: ${{ inputs.release_tag }}
       DRY_RUN: ${{ inputs.dry_run }}
@@ -147,6 +148,9 @@ jobs:
             IdentityFile ~/.ssh/aur
             User aur
             StrictHostKeyChecking accept-new
+            ConnectTimeout 30
+            ServerAliveInterval 15
+            ServerAliveCountMax 2
           SSH_CONFIG
           chmod 600 ~/.ssh/config
 
@@ -176,6 +180,15 @@ jobs:
             # `ssh -T` response is not a stable machine-readable success contract.
             git clone --quiet ssh://aur@aur.archlinux.org/zeroclawlabs.git "$work_dir" || return 1
 
+            # The clone is the only authoritative view of the AUR at this attempt.
+            # Reject a delayed older workflow before it can overwrite a newer
+            # package. Guard failures are permanent for this run, not transient
+            # AUR failures, so the caller must not retry them.
+            if ! bash "$GITHUB_WORKSPACE/scripts/release/aur_version_guard.sh" \
+              "$VERSION" "$work_dir/.SRCINFO"; then
+              return 2
+            fi
+
             cp "$PKGBUILD_FILE" "$work_dir/PKGBUILD" || return 1
             cp "$SRCINFO_FILE" "$work_dir/.SRCINFO" || return 1
 
@@ -200,6 +213,13 @@ jobs:
           for attempt in $(seq 1 "$max_attempts"); do
             if publish_attempt "$attempt"; then
               exit 0
+            else
+              attempt_status=$?
+            fi
+
+            if (( attempt_status == 2 )); then
+              echo "::error::AUR publish stopped because the freshly cloned package failed the monotonic version guard."
+              exit 1
             fi
 
             if (( attempt < max_attempts )); then
