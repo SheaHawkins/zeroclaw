@@ -3,14 +3,6 @@
 version = 4
 
 [[package]]
-name = "aardvark-sys"
-version = "0.1.0"
-dependencies = [
- "libloading 0.8.9",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "accessory"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13354,7 +13346,6 @@ dependencies = [
 name = "zeroclaw-hardware"
 version = "0.8.4"
 dependencies = [
- "aardvark-sys",
  "anyhow",
  "async-trait",
  "axum",
@@ -13516,28 +13507,6 @@ dependencies = [
  "zeroclaw-config",
  "zeroclaw-log",
  "zeroclaw-spawn",
-]
-
-[[package]]
-name = "zeroclaw-robot-kit"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "chrono",
- "directories",
- "portable-atomic",
- "reqwest 0.12.28",
- "rppal",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "toml 1.1.2+spec-1.1.0",
- "zeroclaw-log",
 ]
 
 [[package]]
