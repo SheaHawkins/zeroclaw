@@ -35,6 +35,13 @@ pub struct AnthropicModelProvider {
     /// non-streaming requests only. Empty means requests are byte-identical to
     /// the pre-opt-in wire format.
     server_fallback_models: Vec<String>,
+    /// Memoized cleaned tool schemas: each registered schema is cleaned once
+    /// per provider instance (not once per request) and the byte-stable
+    /// result keeps the `cache_control` tools block identical across
+    /// requests. Note the memo only pays off while the instance lives —
+    /// paths that rebuild the provider per call (e.g. the per-iteration
+    /// vision route) start it empty each time.
+    schema_cache: zeroclaw_api::schema::SchemaCleanCache,
 }
 
 #[cfg(test)]
@@ -377,6 +384,7 @@ impl AnthropicBuilder {
                 .timeout_secs
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
             server_fallback_models: self.server_fallback_models,
+            schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
         }
     }
 }
@@ -520,7 +528,7 @@ impl AnthropicModelProvider {
         }
     }
 
-    fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
+    fn convert_tools(&self, tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
         let items = tools?;
         if items.is_empty() {
             return None;
@@ -530,7 +538,9 @@ impl AnthropicModelProvider {
             .map(|tool| NativeToolSpec {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
-                input_schema: zeroclaw_api::schema::SchemaCleanr::clean_shared(
+                // Cleaned at most once per registered schema per provider
+                // instance (memoized), then `Arc`-shared into every request body.
+                input_schema: self.schema_cache.clean_shared(
                     &tool.parameters,
                     zeroclaw_api::schema::CleaningStrategy::Anthropic,
                 ),
@@ -1536,7 +1546,7 @@ impl ModelProvider for AnthropicModelProvider {
             .try_with(Clone::clone)
             .ok()
             .flatten();
-        let native_tools = Self::convert_tools(request.tools);
+        let native_tools = self.convert_tools(request.tools);
         let tools_count = native_tools.as_ref().map_or(0, Vec::len);
         let tool_choice = if native_tools.is_some() {
             tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
@@ -1739,7 +1749,7 @@ impl ModelProvider for AnthropicModelProvider {
             .try_with(Clone::clone)
             .ok()
             .flatten();
-        let native_tools = Self::convert_tools(request.tools);
+        let native_tools = self.convert_tools(request.tools);
         let tools_count = native_tools.as_ref().map_or(0, Vec::len);
         let tool_choice = if native_tools.is_some() {
             tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
@@ -2912,6 +2922,41 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(messages.is_empty());
     }
 
+    /// Provider instance for `convert_tools` tests — conversion is a `&self`
+    /// method so each schema is cleaned once through the provider's memo.
+    fn make_convert_provider() -> AnthropicModelProvider {
+        AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build()
+    }
+
+    #[test]
+    fn convert_tools_memoizes_cleaned_schema_across_requests() {
+        let provider = make_convert_provider();
+        let tools = vec![ToolSpec::new(
+            "lookup",
+            "Look something up",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "id": { "$ref": "#/$defs/Id" } },
+                "$defs": { "Id": { "type": "string" } }
+            }),
+        )];
+
+        let first = provider.convert_tools(Some(&tools)).unwrap();
+        let second = provider.convert_tools(Some(&tools)).unwrap();
+
+        assert!(
+            first[0].input_schema.get("$defs").is_none(),
+            "Anthropic strategy must resolve and strip $defs"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&first[0].input_schema, &second[0].input_schema),
+            "dirty schemas must be cleaned once and memoized — a fresh tree per \
+             request would also break tools-block prompt-cache stability"
+        );
+    }
+
     #[test]
     fn convert_tools_adds_cache_to_last_tool() {
         let tools = vec![
@@ -2923,7 +2968,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             ),
         ];
 
-        let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
+        let native_tools = make_convert_provider().convert_tools(Some(&tools)).unwrap();
 
         assert_eq!(native_tools.len(), 2);
         assert!(native_tools[0].cache_control.is_none());
@@ -2938,7 +2983,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             serde_json::json!({"type": "object"}),
         )];
 
-        let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
+        let native_tools = make_convert_provider().convert_tools(Some(&tools)).unwrap();
 
         assert_eq!(native_tools.len(), 1);
         assert!(native_tools[0].cache_control.is_some());
@@ -2967,7 +3012,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             }),
         )];
 
-        let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
+        let native_tools = make_convert_provider().convert_tools(Some(&tools)).unwrap();
         let schema = &native_tools[0].input_schema;
 
         let filter = &schema["properties"]["filter"];
@@ -3000,7 +3045,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             }),
         )];
 
-        let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
+        let native_tools = make_convert_provider().convert_tools(Some(&tools)).unwrap();
         let schema = &native_tools[0].input_schema;
 
         let filter = &schema["properties"]["filter"];
@@ -3015,13 +3060,13 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn convert_tools_empty_tools_returns_none() {
         let tools: Vec<ToolSpec> = vec![];
-        let result = AnthropicModelProvider::convert_tools(Some(&tools));
+        let result = make_convert_provider().convert_tools(Some(&tools));
         assert!(result.is_none());
     }
 
     #[test]
     fn convert_tools_none_returns_none() {
-        let result: Option<Vec<NativeToolSpec>> = AnthropicModelProvider::convert_tools(None);
+        let result: Option<Vec<NativeToolSpec>> = make_convert_provider().convert_tools(None);
         assert!(result.is_none());
     }
 
@@ -3214,6 +3259,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             max_tokens: 4096,
             timeout_secs: 120,
             server_fallback_models: Vec::new(),
+            schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
         };
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)
@@ -3811,6 +3857,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             max_tokens: 4096,
             timeout_secs: 120,
             server_fallback_models: Vec::new(),
+            schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
         }
     }
 
