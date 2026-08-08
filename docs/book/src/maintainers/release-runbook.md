@@ -545,6 +545,13 @@ release tag with `dry_run: true`, then `dry_run: false`. Confirm the result with
 just dispatch AUR Freshness Check. Skipping this leaves the AUR silently behind
 until the weekly check catches it.
 
+**The AUR is newer than a deliberately rolled-back stable release:** Verify the
+rollback tag and package contents, run the manual Pub AUR Package workflow once
+with `dry_run: true`, then run it with `dry_run: false` and
+`allow_downgrade: true`. That override exists only on manual dispatch; the
+reusable release workflow cannot request it. Never use it to bypass malformed
+AUR metadata or an unexplained version mismatch.
+
 ---
 
 ## Removed legacy workflows

@@ -26,6 +26,11 @@ on:
         required: false
         default: true
         type: boolean
+      allow_downgrade:
+        description: "Explicitly allow a manual rollback to an older AUR package version"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: aur-publish-${{ github.repository }}
@@ -60,7 +65,7 @@ jobs:
 
           version="${RELEASE_TAG#v}"
           tarball_url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${RELEASE_TAG}.tar.gz"
-          tarball_sha="$(curl -fsSL "$tarball_url" | sha256sum | awk '{print $1}')"
+          tarball_sha="$(curl --connect-timeout 15 --max-time 120 -fsSL "$tarball_url" | sha256sum | awk '{print $1}')"
 
           if [[ -z "$tarball_sha" ]]; then
             echo "::error::Could not compute SHA256 for source tarball."
@@ -123,8 +128,10 @@ jobs:
 
       - name: Push to AUR
         if: inputs.dry_run == false
+        timeout-minutes: 12
         shell: bash
         env:
+          ALLOW_DOWNGRADE: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_downgrade || false }}
           AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
           PKGBUILD_FILE: ${{ steps.pkgbuild.outputs.pkgbuild_file }}
           SRCINFO_FILE: ${{ steps.srcinfo.outputs.srcinfo_file }}
@@ -184,8 +191,14 @@ jobs:
             # Reject a delayed older workflow before it can overwrite a newer
             # package. Guard failures are permanent for this run, not transient
             # AUR failures, so the caller must not retry them.
+            guard_args=()
+            if [[ "$ALLOW_DOWNGRADE" == "true" ]]; then
+              guard_args+=(--allow-downgrade)
+            fi
             if ! bash "$GITHUB_WORKSPACE/scripts/release/aur_version_guard.sh" \
-              "$VERSION" "$work_dir/.SRCINFO"; then
+              "${guard_args[@]}" \
+              "$SRCINFO_FILE" "$work_dir/.SRCINFO" \
+              "$PKGBUILD_FILE" "$work_dir/PKGBUILD"; then
               return 2
             fi
 

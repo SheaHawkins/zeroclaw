@@ -3,44 +3,79 @@
 set -euo pipefail
 export LC_ALL=C
 
-if (( $# != 2 )); then
-  echo "usage: $0 <target-version> <current-srcinfo>" >&2
+allow_downgrade=false
+if [[ "${1:-}" == "--allow-downgrade" ]]; then
+  allow_downgrade=true
+  shift
+fi
+
+if (( $# != 4 )); then
+  echo "usage: $0 [--allow-downgrade] <target-srcinfo> <current-srcinfo> <target-pkgbuild> <current-pkgbuild>" >&2
   exit 2
 fi
 
-target_version="$1"
-srcinfo_file="$2"
-version_pattern='^[0-9]+(\.[0-9]+)*$'
+target_srcinfo="$1"
+current_srcinfo="$2"
+target_pkgbuild="$3"
+current_pkgbuild="$4"
+dotted_pattern='^[0-9]+(\.[0-9]+)*$'
+integer_pattern='^[0-9]+$'
 
-if [[ ! "$target_version" =~ $version_pattern ]]; then
-  echo "::error::Target AUR version is not a numeric dotted version: ${target_version}" >&2
-  exit 2
-fi
+for package_file in "$target_srcinfo" "$current_srcinfo" "$target_pkgbuild" "$current_pkgbuild"; do
+  if [[ ! -f "$package_file" ]]; then
+    echo "::error::Required AUR package file does not exist: ${package_file}" >&2
+    exit 2
+  fi
+done
 
-if [[ ! -f "$srcinfo_file" ]]; then
-  echo "::error::The cloned AUR package has no .SRCINFO file." >&2
-  exit 2
-fi
+read_srcinfo_field() {
+  local file="$1"
+  local field="$2"
+  local pattern="$3"
+  local default_value="$4"
+  local label="$5"
+  local value
+  local -a values=()
 
-current_versions=()
-while IFS= read -r version; do
-  current_versions+=("$version")
-done < <(
-  awk -F '[[:space:]]*=[[:space:]]*' \
-    '$1 ~ /^[[:space:]]*pkgver[[:space:]]*$/ { print $2 }' \
-    "$srcinfo_file"
-)
+  while IFS= read -r value; do
+    values+=("$value")
+  done < <(
+    awk -F '[[:space:]]*=[[:space:]]*' -v wanted="$field" '
+      $1 ~ "^[[:space:]]*" wanted "[[:space:]]*$" {
+        value = $2
+        sub(/^[[:space:]]+/, "", value)
+        sub(/[[:space:]]+$/, "", value)
+        print value
+      }
+    ' "$file"
+  )
 
-if (( ${#current_versions[@]} != 1 )); then
-  echo "::error::Expected exactly one pkgver in the cloned AUR .SRCINFO; found ${#current_versions[@]}." >&2
-  exit 2
-fi
+  if (( ${#values[@]} == 0 )) && [[ -n "$default_value" ]]; then
+    printf '%s' "$default_value"
+    return 0
+  fi
+  if (( ${#values[@]} != 1 )); then
+    echo "::error::Expected exactly one ${field} in ${label} .SRCINFO; found ${#values[@]}." >&2
+    return 2
+  fi
+  if [[ ! "${values[0]}" =~ $pattern ]]; then
+    echo "::error::${label} AUR ${field} is not numeric: ${values[0]}" >&2
+    return 2
+  fi
 
-current_version="${current_versions[0]}"
-if [[ ! "$current_version" =~ $version_pattern ]]; then
-  echo "::error::Current AUR version is not a numeric dotted version: ${current_version}" >&2
-  exit 2
-fi
+  printf '%s' "${values[0]}"
+}
+
+read_tuple() {
+  local file="$1"
+  local label="$2"
+  local epoch pkgver pkgrel
+
+  epoch="$(read_srcinfo_field "$file" epoch "$integer_pattern" 0 "$label")" || return 2
+  pkgver="$(read_srcinfo_field "$file" pkgver "$dotted_pattern" "" "$label")" || return 2
+  pkgrel="$(read_srcinfo_field "$file" pkgrel "$dotted_pattern" "" "$label")" || return 2
+  printf '%s\t%s\t%s' "$epoch" "$pkgver" "$pkgrel"
+}
 
 normalize_component() {
   local component="$1"
@@ -48,7 +83,7 @@ normalize_component() {
   printf '%s' "${component:-0}"
 }
 
-compare_versions() {
+compare_numeric_dotted() {
   local left="$1"
   local right="$2"
   local index left_component right_component max_components
@@ -66,25 +101,63 @@ compare_versions() {
     right_component="$(normalize_component "${right_parts[index]:-0}")"
 
     if (( ${#left_component} < ${#right_component} )); then
-      return 1
+      printf '%s' -1
+      return 0
     fi
     if (( ${#left_component} > ${#right_component} )); then
+      printf '%s' 1
       return 0
     fi
     if [[ "$left_component" < "$right_component" ]]; then
-      return 1
+      printf '%s' -1
+      return 0
     fi
     if [[ "$left_component" > "$right_component" ]]; then
+      printf '%s' 1
       return 0
     fi
   done
 
-  return 0
+  printf '%s' 0
 }
 
-if ! compare_versions "$target_version" "$current_version"; then
-  echo "::error::Refusing AUR downgrade: target ${target_version} is older than current ${current_version}." >&2
+target_tuple="$(read_tuple "$target_srcinfo" Target)" || exit 2
+current_tuple="$(read_tuple "$current_srcinfo" Current)" || exit 2
+IFS=$'\t' read -r target_epoch target_pkgver target_pkgrel <<< "$target_tuple"
+IFS=$'\t' read -r current_epoch current_pkgver current_pkgrel <<< "$current_tuple"
+
+tuple_order=0
+for pair in \
+  "$target_epoch $current_epoch" \
+  "$target_pkgver $current_pkgver" \
+  "$target_pkgrel $current_pkgrel"; do
+  read -r target_component current_component <<< "$pair"
+  tuple_order="$(compare_numeric_dotted "$target_component" "$current_component")"
+  if [[ "$tuple_order" != 0 ]]; then
+    break
+  fi
+done
+
+target_display="${target_epoch}:${target_pkgver}-${target_pkgrel}"
+current_display="${current_epoch}:${current_pkgver}-${current_pkgrel}"
+
+if [[ "$tuple_order" == -1 ]]; then
+  if [[ "$allow_downgrade" == true ]]; then
+    echo "::warning::Manual AUR downgrade override accepted target ${target_display} over current ${current_display}." >&2
+    exit 0
+  fi
+  echo "::error::Refusing AUR downgrade: target ${target_display} is older than current ${current_display}." >&2
   exit 3
 fi
 
-echo "AUR version guard accepted target ${target_version} (current ${current_version})."
+if [[ "$tuple_order" == 0 ]]; then
+  if ! cmp -s "$target_srcinfo" "$current_srcinfo" || \
+    ! cmp -s "$target_pkgbuild" "$current_pkgbuild"; then
+    echo "::error::Target and current AUR package files differ at the same version ${target_display}; bump pkgrel instead of rewriting an existing package version." >&2
+    exit 4
+  fi
+  echo "AUR version guard accepted the unchanged package at ${target_display}."
+  exit 0
+fi
+
+echo "AUR version guard accepted target ${target_display} (current ${current_display})."
