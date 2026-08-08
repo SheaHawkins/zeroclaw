@@ -157,7 +157,7 @@ authoritative automation.
 | `AUR_SSH_KEY` | `pub-aur.yml` |
 | `DISCORD_WEBHOOK_URL` | `discord-release.yml` |
 | `TWITTER_ACCESS_TOKEN`, `TWITTER_ACCESS_TOKEN_SECRET`, `TWITTER_CONSUMER_API_KEY`, `TWITTER_CONSUMER_API_SECRET_KEY` | `tweet-release.yml` |
-| `SCOOP_BUCKET_TOKEN` | `pub-scoop.yml`; fine-grained PAT limited to `zeroclaw-labs/scoop-zeroclaw` with Contents read/write |
+| `SCOOP_BUCKET_TOKEN` | `pub-scoop.yml`, `release-stable-manual.yml`, `scoop-bucket-canary.yml`; fine-grained PAT limited to `zeroclaw-labs/scoop-zeroclaw` with Contents read/write |
 | `WEBSITE_REPO_PAT` | `release-stable-manual.yml` (triggers the website repo redeploy) |
 | `GITHUB_TOKEN` (automatic) | All workflows that push commits, open PRs, or push images to GHCR |
 

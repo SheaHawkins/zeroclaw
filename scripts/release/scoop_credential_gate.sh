@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-dry_run="${DRY_RUN:-false}"
-credential_canary="${CREDENTIAL_CANARY:-false}"
+dry_run="${DRY_RUN-false}"
+credential_canary="${CREDENTIAL_CANARY-false}"
 bucket_repo="${SCOOP_BUCKET_REPO:-}"
 bucket_token="${GH_TOKEN:-}"
 

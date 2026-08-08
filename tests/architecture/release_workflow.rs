@@ -224,7 +224,9 @@ fn scoop_credential_canary_fails_closed_without_weakening_generic_dry_runs() {
 
     for (dry_run, credential_canary, variable) in [
         ("yes", "false", "DRY_RUN"),
+        ("", "false", "DRY_RUN"),
         ("true", "yes", "CREDENTIAL_CANARY"),
+        ("true", "", "CREDENTIAL_CANARY"),
     ] {
         let invalid = run_gate(
             dry_run,
@@ -239,7 +241,29 @@ fn scoop_credential_canary_fails_closed_without_weakening_generic_dry_runs() {
     }
 
     let canary_workflow = workflow("scoop-bucket-canary.yml");
+    let canary_triggers = yaml_block(&canary_workflow, "on:\n");
+    assert!(
+        canary_triggers.contains("- cron: \"23 7 * * 1\""),
+        "the Scoop canary must keep its weekly schedule trigger"
+    );
+    assert!(
+        canary_triggers.contains("  workflow_dispatch:"),
+        "the Scoop canary must stay manually dispatchable for credential rotation proof"
+    );
+    let canary_resolve_job = yaml_block(&canary_workflow, "  latest-release:\n");
+    assert!(
+        !canary_resolve_job.lines().any(|line| {
+            line.starts_with("    if:") || line.starts_with("    continue-on-error:")
+        }),
+        "the Scoop canary tag resolver must run and fail closed on every scheduled invocation"
+    );
     let canary_job = yaml_block(&canary_workflow, "  rehearse:\n");
+    assert!(
+        !canary_job.lines().any(|line| {
+            line.starts_with("    if:") || line.starts_with("    continue-on-error:")
+        }),
+        "the Scoop canary rehearsal must run and fail closed on every scheduled invocation"
+    );
     for required in [
         "uses: ./.github/workflows/pub-scoop.yml",
         "dry_run: true",
@@ -294,8 +318,29 @@ fn scoop_credential_canary_fails_closed_without_weakening_generic_dry_runs() {
         ["SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}"],
         "real Scoop caller must map exactly the one secret its callee declares"
     );
+    assert!(
+        !release_scoop_job
+            .lines()
+            .any(|line| line.starts_with("    continue-on-error:")),
+        "real Scoop publisher failures must stay fatal"
+    );
+    let release_scoop_conditions = release_scoop_job
+        .lines()
+        .filter(|line| line.starts_with("    if:"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        release_scoop_conditions,
+        ["    if: ${{ !cancelled() && needs.publish.result == 'success' }}"],
+        "real Scoop publisher must stay gated only on a successful publish"
+    );
 
     let publisher_workflow = workflow("pub-scoop.yml");
+    let publisher_triggers = yaml_block(&publisher_workflow, "on:\n");
+    let publisher_dispatch = yaml_block(publisher_triggers, "  workflow_dispatch:\n");
+    assert!(
+        yaml_block(publisher_dispatch, "      dry_run:\n").contains("default: true"),
+        "manual Scoop publisher dispatch must stay non-destructive by default"
+    );
     let workflow_call = yaml_block(&publisher_workflow, "  workflow_call:\n");
     let workflow_call_secrets = yaml_block(workflow_call, "    secrets:\n");
     let scoop_token = yaml_block(workflow_call_secrets, "      SCOOP_BUCKET_TOKEN:\n");
@@ -314,6 +359,27 @@ fn scoop_credential_canary_fails_closed_without_weakening_generic_dry_runs() {
     );
 
     let publisher_job = yaml_block(&publisher_workflow, "  publish-scoop:\n");
+    assert!(
+        !publisher_job.lines().any(|line| {
+            line.starts_with("    if:") || line.starts_with("    continue-on-error:")
+        }),
+        "the Scoop publisher job must run and fail closed on every invocation, including canary dry runs"
+    );
+    let push_step = yaml_block(publisher_job, "      - name: Push to Scoop bucket\n");
+    assert_eq!(
+        push_step
+            .lines()
+            .filter(|line| line.starts_with("        if:"))
+            .collect::<Vec<_>>(),
+        ["        if: inputs.dry_run == false"],
+        "the bucket write must stay gated on a non-dry-run so canary rehearsals never push"
+    );
+    assert!(
+        !push_step
+            .lines()
+            .any(|line| line.starts_with("        continue-on-error:")),
+        "real bucket write failures must stay fatal"
+    );
     let publisher_env = yaml_block(publisher_job, "    env:\n");
     let canary_env = "CREDENTIAL_CANARY: ${{ inputs.credential_canary }}";
     assert_eq!(
@@ -322,9 +388,20 @@ fn scoop_credential_canary_fails_closed_without_weakening_generic_dry_runs() {
         "publisher job-level env must map credential_canary into the tested gate exactly once"
     );
     assert_eq!(
-        publisher_workflow.matches(canary_env).count(),
+        publisher_workflow.matches("CREDENTIAL_CANARY").count(),
         1,
-        "credential_canary env mapping must not drift outside the publisher job"
+        "credential_canary must have exactly one uppercase env binding, at publisher job scope"
+    );
+    let dry_run_env = "DRY_RUN: ${{ inputs.dry_run }}";
+    assert_eq!(
+        publisher_env.matches(dry_run_env).count(),
+        1,
+        "publisher job-level env must map dry_run into the tested gate exactly once"
+    );
+    assert_eq!(
+        publisher_workflow.matches("DRY_RUN").count(),
+        1,
+        "dry_run must have exactly one uppercase env binding, at publisher job scope"
     );
 
     let validate_step = yaml_block(
@@ -332,10 +409,10 @@ fn scoop_credential_canary_fails_closed_without_weakening_generic_dry_runs() {
         "      - name: Validate Scoop publish configuration\n",
     );
     assert!(
-        !validate_step
-            .lines()
-            .any(|line| line.trim_start().starts_with("if:")),
-        "the Scoop credential gate step must run on every invocation, including canary dry runs"
+        !validate_step.lines().any(|line| {
+            line.starts_with("        if:") || line.starts_with("        continue-on-error:")
+        }),
+        "the Scoop credential gate step must run and fail closed on every invocation, including canary dry runs"
     );
     assert!(
         validate_step.contains("gate_result=\"$(bash scripts/release/scoop_credential_gate.sh)\""),
