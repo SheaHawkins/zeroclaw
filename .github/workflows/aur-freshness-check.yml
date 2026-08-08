@@ -59,13 +59,19 @@ jobs:
 
           aur_full="$(jq -er '.results[0].Version' <<<"$rpc")"
           # AUR versions are epoch:pkgver-pkgrel; only pkgver tracks the release.
-          aur_version="${aur_full%%-*}"
-          aur_version="${aur_version#*:}"
+          aur_epoch_pkgver="${aur_full%%-*}"
+          aur_version="${aur_epoch_pkgver#*:}"
+          aur_epoch=0
+          if [[ "$aur_epoch_pkgver" == *:* ]]; then
+            aur_epoch="${aur_epoch_pkgver%%:*}"
+          fi
 
           if [[ "$aur_version" != "$release_version" ]]; then
             echo "::error::AUR ${AUR_PACKAGE} is at ${aur_full} but the current release is ${tag}."
             echo "::error::Re-dispatch Pub AUR Package at ${tag} (dry_run: true first) to resync."
-            if [[ "$aur_version" =~ ^[0-9]+(\.[0-9]+)*$ ]] && \
+            if [[ "$aur_epoch" =~ ^[0-9]+$ ]] && (( 10#$aur_epoch > 0 )); then
+              echo "::error::AUR has epoch ${aur_epoch}. Add the matching epoch to both source files before publishing; do not use allow_downgrade across epochs."
+            elif [[ "$aur_version" =~ ^[0-9]+(\.[0-9]+)*$ ]] && \
               [[ "$(printf '%s\n' "$release_version" "$aur_version" | sort -V | tail -n 1)" == "$aur_version" ]]; then
               echo "::error::AUR is newer than the release. For an intentional rollback, the manual non-dry-run dispatch must set allow_downgrade: true."
             fi

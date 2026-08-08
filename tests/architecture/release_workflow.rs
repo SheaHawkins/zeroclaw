@@ -161,6 +161,7 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
         "if: inputs.dry_run == false\n        timeout-minutes: 12",
         "\"${guard_command[@]}\" || return $?",
         "case \"$attempt_status\" in",
+        "unexpected status ${attempt_status}",
         "package metadata is missing, malformed, or inconsistent",
         "stopped to prevent a downgrade",
         "package files changed without a version-tuple change",
@@ -201,15 +202,15 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
     let guard_call = "scripts/release/aur_version_guard.sh";
     assert_eq!(
         aur.matches("scripts/release/aur_version_guard.sh").count(),
-        1,
-        "the AUR guard invocation must have one unambiguous source of truth"
+        2,
+        "the AUR guard must validate generated metadata and each fresh clone"
     );
 
     let clone_position = aur
         .find("git clone --quiet ssh://aur@aur.archlinux.org/zeroclawlabs.git")
         .expect("AUR publisher must clone the authoritative package state");
     let guard_position = aur
-        .find(guard_call)
+        .rfind(guard_call)
         .expect("AUR publisher must enforce monotonic versions");
     let overwrite_position = aur
         .find("cp \"$PKGBUILD_FILE\" \"$work_dir/PKGBUILD\"")
@@ -217,6 +218,18 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
     assert!(
         clone_position < guard_position && guard_position < overwrite_position,
         "the AUR monotonic guard must inspect each fresh clone before package metadata is overwritten"
+    );
+
+    let generated_validation = aur
+        .split_once("      - name: Validate generated AUR metadata\n")
+        .and_then(|(_, remainder)| remainder.split_once("      - name: Push to AUR\n"))
+        .map(|(step, _)| step)
+        .expect("generated AUR metadata must be validated before the push step");
+    assert!(
+        generated_validation.contains(guard_call)
+            && generated_validation.contains("\"$SRCINFO_FILE\" \"$SRCINFO_FILE\"")
+            && generated_validation.contains("\"$PKGBUILD_FILE\" \"$PKGBUILD_FILE\""),
+        "dry-run must exercise target-side metadata validation without an AUR clone"
     );
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -239,13 +252,14 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
     let freshness = workflow("aur-freshness-check.yml");
     assert!(
         freshness.contains(
-            "aur_version=\"${aur_full%%-*}\"\n          aur_version=\"${aur_version#*:}\""
+            "aur_epoch_pkgver=\"${aur_full%%-*}\"\n          aur_version=\"${aur_epoch_pkgver#*:}\""
         ),
         "AUR freshness must remove pkgrel and epoch before comparing pkgver to the release"
     );
     assert!(
         freshness.contains("sort -V | tail -n 1")
-            && freshness.contains("AUR is newer than the release"),
+            && freshness.contains("AUR is newer than the release")
+            && freshness.contains("do not use allow_downgrade across epochs"),
         "the downgrade recovery hint must only appear when AUR is newer"
     );
 }

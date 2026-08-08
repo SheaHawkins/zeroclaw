@@ -126,6 +126,17 @@ jobs:
 
           echo "srcinfo_file=$srcinfo_file" >> "$GITHUB_OUTPUT"
 
+      - name: Validate generated AUR metadata
+        shell: bash
+        env:
+          PKGBUILD_FILE: ${{ steps.pkgbuild.outputs.pkgbuild_file }}
+          SRCINFO_FILE: ${{ steps.srcinfo.outputs.srcinfo_file }}
+        run: |
+          set -euo pipefail
+          bash scripts/release/aur_version_guard.sh \
+            "$SRCINFO_FILE" "$SRCINFO_FILE" \
+            "$PKGBUILD_FILE" "$PKGBUILD_FILE"
+
       - name: Push to AUR
         if: inputs.dry_run == false
         timeout-minutes: 12
@@ -232,16 +243,22 @@ jobs:
             fi
 
             case "$attempt_status" in
+              1)
+                ;;
               2)
                 echo "::error::AUR publish stopped because package metadata is missing, malformed, or inconsistent. Repair the named files; malformed published metadata requires an authorized manual AUR push."
                 exit 1
                 ;;
               3)
-                echo "::error::AUR publish stopped to prevent a downgrade. Verify the rollback, then use a manual non-dry-run dispatch with allow_downgrade: true."
+                echo "::error::AUR publish stopped to prevent a downgrade. If epochs differ, add the published epoch to both source files; otherwise verify the rollback before using a manual non-dry-run dispatch with allow_downgrade: true."
                 exit 1
                 ;;
               4)
                 echo "::error::AUR publish stopped because package files changed without a version-tuple change. Bump pkgrel in both source files before retrying."
+                exit 1
+                ;;
+              *)
+                echo "::error::AUR version guard failed with unexpected status ${attempt_status}; refusing to classify it as a retryable AUR outage."
                 exit 1
                 ;;
             esac

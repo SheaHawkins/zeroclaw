@@ -546,14 +546,16 @@ just dispatch AUR Freshness Check. Skipping this leaves the AUR silently behind
 until the weekly check catches it.
 
 **The AUR is newer than a deliberately rolled-back stable release:** Verify the
-rollback tag and package contents, run the manual Pub AUR Package workflow once
-with `dry_run: true` to validate metadata generation and release inputs, then
-run it with `dry_run: false` and `allow_downgrade: true`. The dry run does not
-clone the AUR package or exercise the version guard; the guard's stderr from the
-non-dry-run is the authoritative rollback result. That override exists only on
-manual dispatch; the reusable interface does not declare the input and
-therefore cannot request it. Never use it to bypass malformed AUR metadata or
-an unexplained version mismatch.
+rollback tag and package contents. If the published package has a nonzero
+`epoch`, first add matching `epoch=` and `epoch =` assignments to
+`dist/aur/PKGBUILD` and `dist/aur/.SRCINFO`; never use `allow_downgrade` to cross
+an epoch boundary. For a rollback within the same epoch, run the manual Pub AUR
+Package workflow once with `dry_run: true` to validate metadata generation and
+the target side of the version guard, then run it with `dry_run: false` and
+`allow_downgrade: true`. The non-dry-run guard additionally compares the fresh
+AUR clone. That override exists only on manual dispatch; the reusable interface
+does not declare the input and therefore cannot request it. Never use it to
+bypass malformed AUR metadata or an unexplained version mismatch.
 
 **Publishing stopped because package files differ at the same version:** Update
 both `pkgrel` assignments in `dist/aur/PKGBUILD` and `dist/aur/.SRCINFO` to the

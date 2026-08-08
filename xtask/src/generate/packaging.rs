@@ -45,6 +45,55 @@ pub fn render_pkgbuild(root: &Path, current: &str) -> anyhow::Result<String> {
     )
 }
 
+/// AUR .SRCINFO: keep the checked-in metadata on the canonical crate version.
+/// The release workflow replaces these same fields with the selected release
+/// before publishing, while this renderer prevents version-bump drift in CI.
+pub fn render_srcinfo(root: &Path, current: &str) -> anyhow::Result<String> {
+    let version = spec::resolve_version(root)?;
+    let with_version = rewrite_srcinfo_assignment(current, "pkgver", &version)?;
+    rewrite_srcinfo_assignment(
+        &with_version,
+        "source",
+        &format!(
+            "zeroclawlabs-{version}.tar.gz::https://github.com/zeroclaw-labs/zeroclaw/archive/refs/tags/v{version}.tar.gz"
+        ),
+    )
+}
+
+fn rewrite_srcinfo_assignment(
+    current: &str,
+    key: &str,
+    replacement: &str,
+) -> anyhow::Result<String> {
+    let assignment = format!("{key} = ");
+    let mut matches = 0;
+    let mut rendered = String::with_capacity(current.len());
+
+    for raw_line in current.split_inclusive('\n') {
+        let (line, newline) = raw_line
+            .strip_suffix('\n')
+            .map_or((raw_line, ""), |line| (line, "\n"));
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(&assignment) {
+            matches += 1;
+            let indent = &line[..line.len() - trimmed.len()];
+            rendered.push_str(indent);
+            rendered.push_str(&assignment);
+            rendered.push_str(replacement);
+            rendered.push_str(newline);
+        } else {
+            rendered.push_str(raw_line);
+        }
+    }
+
+    if matches != 1 {
+        anyhow::bail!(
+            "expected exactly one `{assignment}` assignment in AUR .SRCINFO; found {matches}"
+        );
+    }
+    Ok(rendered)
+}
+
 /// Scoop manifest is JSON (no comments). Rewrite the top-level `"version"` and
 /// materialize the primary download URL from the canonical autoupdate template,
 /// preserving formatting everywhere else.
@@ -146,6 +195,25 @@ mod tests {
         let out = splice(&cur, "pkgbuild-version", &format!("pkgver={v}")).unwrap();
         assert!(out.contains(&format!("pkgver={v}")));
         assert!(!out.contains("pkgver=0.0.0"));
+    }
+
+    #[test]
+    fn srcinfo_version_and_source_match_workspace() {
+        let version = spec::resolve_version(&root()).unwrap();
+        let current = "pkgbase = zeroclawlabs\n\tpkgver = 0.1.0\n\tpkgrel = 1\n\tsource = zeroclawlabs-0.1.0.tar.gz::https://example.test/v0.1.0.tar.gz\n";
+        let rendered = render_srcinfo(&root(), current).unwrap();
+        assert!(rendered.contains(&format!("\tpkgver = {version}\n")));
+        assert!(rendered.contains(&format!(
+            "\tsource = zeroclawlabs-{version}.tar.gz::https://github.com/zeroclaw-labs/zeroclaw/archive/refs/tags/v{version}.tar.gz\n"
+        )));
+        assert_eq!(render_srcinfo(&root(), &rendered).unwrap(), rendered);
+    }
+
+    #[test]
+    fn srcinfo_renderer_rejects_missing_or_duplicate_owned_fields() {
+        assert!(render_srcinfo(&root(), "pkgbase = zeroclawlabs\n").is_err());
+        let duplicate = "pkgver = 0.1.0\npkgver = 0.2.0\nsource = old\n";
+        assert!(render_srcinfo(&root(), duplicate).is_err());
     }
 
     #[test]
