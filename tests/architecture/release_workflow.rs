@@ -326,9 +326,31 @@ fn scoop_credential_canary_fails_closed_without_weakening_generic_dry_runs() {
         1,
         "credential_canary env mapping must not drift outside the publisher job"
     );
+
+    let validate_step = yaml_block(
+        publisher_job,
+        "      - name: Validate Scoop publish configuration\n",
+    );
     assert!(
-        publisher_job.contains("gate_result=\"$(bash scripts/release/scoop_credential_gate.sh)\""),
+        !validate_step
+            .lines()
+            .any(|line| line.trim_start().starts_with("if:")),
+        "the Scoop credential gate step must run on every invocation, including canary dry runs"
+    );
+    assert!(
+        validate_step.contains("gate_result=\"$(bash scripts/release/scoop_credential_gate.sh)\""),
         "Scoop publisher must enforce the tested credential gate"
+    );
+    assert!(
+        validate_step.contains("push --dry-run origin HEAD"),
+        "the authorization probe must live in the unconditional credential gate step"
+    );
+    assert_eq!(
+        publisher_workflow
+            .matches("push --dry-run origin HEAD")
+            .count(),
+        1,
+        "Scoop publisher must keep exactly one authoritative authorization probe"
     );
 }
 
