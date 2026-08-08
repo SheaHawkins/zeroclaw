@@ -201,8 +201,8 @@ if [[ "$target_tuple" != "$target_pkgbuild_tuple" ]]; then
 fi
 
 if [[ ! -e "$current_srcinfo" && ! -e "$current_pkgbuild" ]]; then
-  echo "::warning::The cloned AUR repository is empty; accepting an explicit first publish." >&2
-  exit 0
+  echo "::error::The cloned AUR repository is unexpectedly empty; refusing an implicit first publish." >&2
+  exit 2
 fi
 if [[ ! -f "$current_srcinfo" || ! -f "$current_pkgbuild" ]]; then
   echo "::error::The cloned AUR repository is partially populated; both .SRCINFO and PKGBUILD are required." >&2

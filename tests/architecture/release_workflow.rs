@@ -163,6 +163,7 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
         "case \"$attempt_status\" in",
         "unexpected status ${attempt_status}",
         "Generated PKGBUILD is not valid Bash syntax",
+        "tarball_url=\"https://github.com/zeroclaw-labs/zeroclaw/archive/refs/tags/${RELEASE_TAG}.tar.gz\"",
         "require_exact_line \"$PKGBUILD_FILE\" \"$expected_pkgbuild_source\"",
         "require_exact_line \"$SRCINFO_FILE\" \"$expected_srcinfo_source\"",
         "package metadata is missing, malformed, or inconsistent",
@@ -464,10 +465,11 @@ fn aur_publisher_rejects_stale_release_downgrades() {
         .arg(&current_pkgbuild)
         .output()
         .expect("run AUR guard with missing current metadata");
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "a completely empty cloned package must permit first publish"
+    assert_command_failure(
+        &output,
+        2,
+        "cloned AUR repository is unexpectedly empty",
+        "an empty clone must not implicitly authorize a first publish",
     );
 
     fs::write(&current_srcinfo, &equal).expect("restore only current AUR .SRCINFO");

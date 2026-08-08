@@ -64,7 +64,7 @@ jobs:
           fi
 
           version="${RELEASE_TAG#v}"
-          tarball_url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${RELEASE_TAG}.tar.gz"
+          tarball_url="https://github.com/zeroclaw-labs/zeroclaw/archive/refs/tags/${RELEASE_TAG}.tar.gz"
           tarball_sha="$(curl --connect-timeout 15 --max-time 120 -fsSL "$tarball_url" | sha256sum | awk '{print $1}')"
 
           if [[ -z "$tarball_sha" ]]; then
