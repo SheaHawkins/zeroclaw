@@ -208,13 +208,13 @@ fn render_srcinfo_from_pkgbuild(version: &str, pkgbuild: &str) -> anyhow::Result
         anyhow::bail!("AUR PKGBUILD source and sha256sums counts differ");
     }
 
-    let mut rendered = format!("pkgbase = {pkgname}\n\tpkgdesc = {pkgdesc}\n");
+    let mut rendered = format!(
+        "pkgbase = {pkgname}\n\tpkgdesc = {pkgdesc}\n\tpkgver = {version}\n\tpkgrel = {pkgrel}\n"
+    );
     if let Some(epoch) = epoch {
         rendered.push_str(&format!("\tepoch = {epoch}\n"));
     }
-    rendered.push_str(&format!(
-        "\tpkgver = {version}\n\tpkgrel = {pkgrel}\n\turl = {url}\n"
-    ));
+    rendered.push_str(&format!("\turl = {url}\n"));
     push_srcinfo_values(&mut rendered, "arch", &arch);
     push_srcinfo_values(&mut rendered, "license", &license);
     push_srcinfo_values(&mut rendered, "makedepends", &makedepends);
@@ -369,6 +369,8 @@ mod tests {
         let with_epoch = pkgbuild.replace("pkgver=", "epoch=2\npkgver=");
         let rendered = render_srcinfo_from_pkgbuild(&version, &with_epoch).unwrap();
         assert!(rendered.contains("\tepoch = 2\n"));
+        assert!(rendered.find("\tpkgrel = 1\n").unwrap() < rendered.find("\tepoch = 2\n").unwrap());
+        assert!(rendered.find("\tepoch = 2\n").unwrap() < rendered.find("\turl = ").unwrap());
     }
 
     #[test]

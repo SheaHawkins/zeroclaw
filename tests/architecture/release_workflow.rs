@@ -227,6 +227,17 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
         "the AUR monotonic guard must inspect each fresh clone before package metadata is overwritten"
     );
 
+    let input_validation_position = aur
+        .find("      - name: Validate release tag input\n")
+        .expect("release tag input must be validated");
+    let release_checkout_position = aur
+        .find("      - name: Check out release package metadata\n")
+        .expect("release package metadata must use an isolated checkout");
+    assert!(
+        input_validation_position < release_checkout_position,
+        "release_tag must be validated before it is used as a checkout ref"
+    );
+
     let generated_validation = aur
         .split_once("      - name: Validate generated AUR metadata\n")
         .and_then(|(_, remainder)| remainder.split_once("      - name: Push to AUR\n"))
@@ -266,7 +277,8 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
     assert!(
         freshness.contains("sort -V | tail -n 1")
             && freshness.contains("AUR is newer than the release")
-            && freshness.contains("source_epoch=\"$(awk")
+            && freshness.contains("source_epoch=\"$(git show")
+            && freshness.contains("git show \"${tag}:dist/aur/.SRCINFO\"")
             && freshness.contains("\"$aur_epoch\" != \"$source_epoch\"")
             && freshness.contains("do not use allow_downgrade across epochs"),
         "freshness must compare the published epoch and scope downgrade recovery advice"

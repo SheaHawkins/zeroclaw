@@ -44,6 +44,7 @@ jobs:
             exit 1
           fi
           release_version="${tag#v}"
+          git fetch --force --no-tags --depth=1 origin "refs/tags/${tag}:refs/tags/${tag}"
 
           # An unreachable AUR is an upstream availability problem, not package
           # staleness. Warn and pass rather than paging the team about someone
@@ -67,7 +68,7 @@ jobs:
           if [[ "$aur_epoch_pkgver" == *:* ]]; then
             aur_epoch="${aur_epoch_pkgver%%:*}"
           fi
-          source_epoch="$(awk -F '[[:space:]]*=[[:space:]]*' '$1 ~ /^[[:space:]]*epoch[[:space:]]*$/ { print $2 }' dist/aur/.SRCINFO)"
+          source_epoch="$(git show "${tag}:dist/aur/.SRCINFO" | awk -F '[[:space:]]*=[[:space:]]*' '$1 ~ /^[[:space:]]*epoch[[:space:]]*$/ { print $2 }')"
           source_epoch="${source_epoch:-0}"
           if [[ ! "$aur_epoch" =~ ^[0-9]+$ || ! "$source_epoch" =~ ^[0-9]+$ ]]; then
             echo "::error::AUR or checked-in source metadata has an invalid or duplicate epoch."
@@ -75,7 +76,11 @@ jobs:
           fi
 
           if [[ "$aur_epoch" != "$source_epoch" || "$aur_version" != "$release_version" ]]; then
-            echo "::error::AUR ${AUR_PACKAGE} is at ${aur_full} but the current release is ${tag}."
+            if [[ "$aur_epoch" != "$source_epoch" ]]; then
+              echo "::error::AUR epoch ${aur_epoch} does not match release ${tag} source epoch ${source_epoch}."
+            else
+              echo "::error::AUR ${AUR_PACKAGE} is at ${aur_full} but the current release is ${tag}."
+            fi
             echo "::error::Re-dispatch Pub AUR Package at ${tag} (dry_run: true first) to resync."
             if (( 10#$aur_epoch > 10#$source_epoch )); then
               echo "::error::AUR epoch ${aur_epoch} exceeds source epoch ${source_epoch}. Add the matching published epoch to both source files before publishing; do not use allow_downgrade across epochs."
