@@ -4181,6 +4181,86 @@ mod tests {
         );
     }
 
+    /// Spawn a mock `/chat/completions` endpoint that rejects any request
+    /// carrying tools unless `reasoning_effort` is explicitly `"none"`.
+    ///
+    /// This mirrors endpoints that refuse function tools combined with any
+    /// effective reasoning effort: because an omitted `reasoning_effort`
+    /// defaults to a non-`none` effort server-side, an absent field is
+    /// rejected just like `"high"`. Returns the bound address, the recorded
+    /// request bodies, and the server task handle.
+    ///
+    /// `stream` selects an SSE success body instead of a JSON one.
+    fn spawn_reasoning_rejecting_endpoint(
+        stream: bool,
+    ) -> impl std::future::Future<
+        Output = (
+            std::net::SocketAddr,
+            std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+            ::tokio::task::JoinHandle<()>,
+        ),
+    > {
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        async move {
+            let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+            let bodies_for_route = Arc::clone(&bodies);
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let bodies = Arc::clone(&bodies_for_route);
+                    async move {
+                        let rejects = body.get("tools").is_some()
+                            && body
+                                .get("reasoning_effort")
+                                .and_then(serde_json::Value::as_str)
+                                != Some("none");
+                        bodies.lock().unwrap().push(body);
+                        if rejects {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": {
+                                        "message": "Function tools with reasoning effort are not supported",
+                                        "param": "reasoning_effort"
+                                    }
+                                })),
+                            )
+                                .into_response();
+                        }
+                        if stream {
+                            return (
+                                StatusCode::OK,
+                                [("content-type", "text/event-stream")],
+                                concat!(
+                                    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                                    "data: [DONE]\n\n"
+                                ),
+                            )
+                                .into_response();
+                        }
+                        Json(serde_json::json!({
+                            "choices": [{"message": {"content": "ok"}}]
+                        }))
+                        .into_response()
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            (addr, bodies, server)
+        }
+    }
+
     #[tokio::test]
     async fn capable_endpoint_keeps_reasoning_effort_with_tools_without_retry() {
         use axum::Json;
@@ -4251,51 +4331,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejecting_endpoint_retries_once_with_reasoning_disabled() {
-        use axum::Json;
-        use axum::Router;
-        use axum::http::StatusCode;
-        use axum::response::IntoResponse;
-        use axum::routing::post;
-        use std::sync::{Arc, Mutex};
-        use tokio::net::TcpListener;
-
-        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
-        let bodies_for_route = Arc::clone(&bodies);
-        let app = Router::new().route(
-            "/chat/completions",
-            post(move |Json(body): Json<serde_json::Value>| {
-                let bodies = Arc::clone(&bodies_for_route);
-                async move {
-                    let rejects = body.get("tools").is_some()
-                        && body
-                            .get("reasoning_effort")
-                            .and_then(serde_json::Value::as_str)
-                            != Some("none");
-                    bodies.lock().unwrap().push(body);
-                    if rejects {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(serde_json::json!({
-                                "error": {
-                                    "message": "Function tools with reasoning effort are not supported",
-                                    "param": "reasoning_effort"
-                                }
-                            })),
-                        )
-                            .into_response();
-                    }
-                    Json(serde_json::json!({
-                        "choices": [{"message": {"content": "ok"}}]
-                    }))
-                    .into_response()
-                }
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = ::zeroclaw_spawn::spawn!(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        let (addr, bodies, server) = spawn_reasoning_rejecting_endpoint(false).await;
 
         let provider = OpenAiCompatibleModelProvider::builder("test")
             .display_name("test")
@@ -4348,57 +4384,9 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_rejection_retries_once_with_reasoning_disabled() {
-        use axum::Json;
-        use axum::Router;
-        use axum::http::StatusCode;
-        use axum::response::IntoResponse;
-        use axum::routing::post;
         use futures_util::StreamExt as _;
-        use std::sync::{Arc, Mutex};
-        use tokio::net::TcpListener;
 
-        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
-        let bodies_for_route = Arc::clone(&bodies);
-        let app = Router::new().route(
-            "/chat/completions",
-            post(move |Json(body): Json<serde_json::Value>| {
-                let bodies = Arc::clone(&bodies_for_route);
-                async move {
-                    let rejects = body.get("tools").is_some()
-                        && body
-                            .get("reasoning_effort")
-                            .and_then(serde_json::Value::as_str)
-                            != Some("none");
-                    bodies.lock().unwrap().push(body);
-                    if rejects {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(serde_json::json!({
-                                "error": {
-                                    "message": "Function tools with reasoning effort are not supported",
-                                    "param": "reasoning_effort"
-                                }
-                            })),
-                        )
-                            .into_response();
-                    }
-                    (
-                        StatusCode::OK,
-                        [("content-type", "text/event-stream")],
-                        concat!(
-                            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
-                            "data: [DONE]\n\n"
-                        ),
-                    )
-                        .into_response()
-                }
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = ::zeroclaw_spawn::spawn!(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        let (addr, bodies, server) = spawn_reasoning_rejecting_endpoint(true).await;
 
         let provider = OpenAiCompatibleModelProvider::builder("test")
             .display_name("test")
@@ -4458,51 +4446,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_tools_retries_once_with_reasoning_disabled() {
-        use axum::Json;
-        use axum::Router;
-        use axum::http::StatusCode;
-        use axum::response::IntoResponse;
-        use axum::routing::post;
-        use std::sync::{Arc, Mutex};
-        use tokio::net::TcpListener;
-
-        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
-        let bodies_for_route = Arc::clone(&bodies);
-        let app = Router::new().route(
-            "/chat/completions",
-            post(move |Json(body): Json<serde_json::Value>| {
-                let bodies = Arc::clone(&bodies_for_route);
-                async move {
-                    let rejects = body.get("tools").is_some()
-                        && body
-                            .get("reasoning_effort")
-                            .and_then(serde_json::Value::as_str)
-                            != Some("none");
-                    bodies.lock().unwrap().push(body);
-                    if rejects {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(serde_json::json!({
-                                "error": {
-                                    "message": "Function tools with reasoning effort are not supported",
-                                    "param": "reasoning_effort"
-                                }
-                            })),
-                        )
-                            .into_response();
-                    }
-                    Json(serde_json::json!({
-                        "choices": [{"message": {"content": "ok"}}]
-                    }))
-                    .into_response()
-                }
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = ::zeroclaw_spawn::spawn!(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        let (addr, bodies, server) = spawn_reasoning_rejecting_endpoint(false).await;
 
         let provider = OpenAiCompatibleModelProvider::builder("test")
             .display_name("test")
