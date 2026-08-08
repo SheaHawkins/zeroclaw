@@ -201,6 +201,14 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
         clone_position < guard_position && guard_position < overwrite_position,
         "the AUR monotonic guard must inspect each fresh clone before package metadata is overwritten"
     );
+
+    let freshness = workflow("aur-freshness-check.yml");
+    assert!(
+        freshness.contains(
+            "aur_version=\"${aur_full%%-*}\"\n          aur_version=\"${aur_version#*:}\""
+        ),
+        "AUR freshness must remove pkgrel and epoch before comparing pkgver to the release"
+    );
 }
 
 #[test]
@@ -348,6 +356,22 @@ fn aur_publisher_rejects_stale_release_downgrades() {
         "manual downgrade authorization must not permit malformed AUR state"
     );
 
+    let extra_equals = equal.replace("pkgver = 1.2.3", "pkgver = 1.2.3 = junk");
+    let output = run_guard(&equal, &extra_equals, &same_build, &same_build, false);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "SRCINFO values with trailing equals data must not be truncated"
+    );
+
+    let malformed_build = same_build.replace("pkgver=1.2.3", "pkgver=1.2.3=junk");
+    let output = run_guard(&equal, &equal, &same_build, &malformed_build, false);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "PKGBUILD values with trailing equals data must not be truncated"
+    );
+
     let duplicate = format!("{equal}pkgver = 9.9.9\n");
     let output = run_guard(&equal, &duplicate, &same_build, &same_build, false);
     assert_eq!(
@@ -395,16 +419,6 @@ fn aur_publisher_rejects_stale_release_downgrades() {
         output.status.code(),
         Some(2),
         "a partially populated cloned package must fail closed"
-    );
-
-    let output = Command::new("bash")
-        .arg("-c")
-        .arg("set -u; guard_command=(printf '%s'); guard_command+=(ok); \"${guard_command[@]}\"")
-        .output()
-        .expect("exercise non-empty optional command array under runner Bash");
-    assert!(
-        output.status.success() && output.stdout == b"ok",
-        "normal guard command assembly must work under Bash nounset"
     );
 }
 

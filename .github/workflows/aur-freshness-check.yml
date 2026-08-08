@@ -58,8 +58,9 @@ jobs:
           fi
 
           aur_full="$(jq -er '.results[0].Version' <<<"$rpc")"
-          # AUR versions are pkgver-pkgrel; only pkgver tracks the release.
+          # AUR versions are epoch:pkgver-pkgrel; only pkgver tracks the release.
           aur_version="${aur_full%%-*}"
+          aur_version="${aur_version#*:}"
 
           if [[ "$aur_version" != "$release_version" ]]; then
             echo "::error::AUR ${AUR_PACKAGE} is at ${aur_full} but the current release is ${tag}."

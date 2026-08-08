@@ -40,9 +40,19 @@ read_srcinfo_field() {
   while IFS= read -r value; do
     values+=("$value")
   done < <(
-    awk -F '[[:space:]]*=[[:space:]]*' -v wanted="$field" '
-      $1 ~ "^[[:space:]]*" wanted "[[:space:]]*$" {
-        value = $2
+    awk -v wanted="$field" '
+      {
+        separator = index($0, "=")
+        if (separator == 0) {
+          next
+        }
+        key = substr($0, 1, separator - 1)
+        sub(/^[[:space:]]+/, "", key)
+        sub(/[[:space:]]+$/, "", key)
+        if (key != wanted) {
+          next
+        }
+        value = substr($0, separator + 1)
         sub(/^[[:space:]]+/, "", value)
         sub(/[[:space:]]+$/, "", value)
         print value
@@ -89,9 +99,19 @@ read_pkgbuild_field() {
   while IFS= read -r value; do
     values+=("$value")
   done < <(
-    awk -F '=' -v wanted="$field" '
-      $1 ~ "^[[:space:]]*" wanted "[[:space:]]*$" {
-        value = $2
+    awk -v wanted="$field" '
+      {
+        separator = index($0, "=")
+        if (separator == 0) {
+          next
+        }
+        key = substr($0, 1, separator - 1)
+        sub(/^[[:space:]]+/, "", key)
+        sub(/[[:space:]]+$/, "", key)
+        if (key != wanted) {
+          next
+        }
+        value = substr($0, separator + 1)
         sub(/^[[:space:]]+/, "", value)
         sub(/[[:space:]]+$/, "", value)
         if (value ~ /^\".*\"$/ || value ~ /^\047.*\047$/) {
