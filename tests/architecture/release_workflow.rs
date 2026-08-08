@@ -162,6 +162,9 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
         "\"${guard_command[@]}\" || return $?",
         "case \"$attempt_status\" in",
         "unexpected status ${attempt_status}",
+        "Generated PKGBUILD is not valid Bash syntax",
+        "require_exact_line \"$PKGBUILD_FILE\" \"$expected_pkgbuild_source\"",
+        "require_exact_line \"$SRCINFO_FILE\" \"$expected_srcinfo_source\"",
         "package metadata is missing, malformed, or inconsistent",
         "stopped to prevent a downgrade",
         "package files changed without a version-tuple change",
@@ -259,8 +262,10 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
     assert!(
         freshness.contains("sort -V | tail -n 1")
             && freshness.contains("AUR is newer than the release")
+            && freshness.contains("source_epoch=\"$(awk")
+            && freshness.contains("\"$aur_epoch\" != \"$source_epoch\"")
             && freshness.contains("do not use allow_downgrade across epochs"),
-        "the downgrade recovery hint must only appear when AUR is newer"
+        "freshness must compare the published epoch and scope downgrade recovery advice"
     );
 }
 

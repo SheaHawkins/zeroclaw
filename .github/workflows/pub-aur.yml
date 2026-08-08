@@ -131,8 +131,38 @@ jobs:
         env:
           PKGBUILD_FILE: ${{ steps.pkgbuild.outputs.pkgbuild_file }}
           SRCINFO_FILE: ${{ steps.srcinfo.outputs.srcinfo_file }}
+          TARBALL_SHA: ${{ steps.meta.outputs.tarball_sha }}
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
           set -euo pipefail
+
+          if ! bash -n "$PKGBUILD_FILE"; then
+            echo "::error::Generated PKGBUILD is not valid Bash syntax."
+            exit 2
+          fi
+
+          require_exact_line() {
+            local file="$1"
+            local expected="$2"
+            local label="$3"
+            local count
+            count="$(grep -Fxc -- "$expected" "$file" || true)"
+            if [[ "$count" != 1 ]]; then
+              echo "::error::Generated ${label} must contain exactly one canonical line; found ${count}."
+              exit 2
+            fi
+          }
+
+          expected_pkgbuild_source="source=(\"\${pkgname}-\${pkgver}.tar.gz::https://github.com/zeroclaw-labs/zeroclaw/archive/refs/tags/v\${pkgver}.tar.gz\")"
+          expected_pkgbuild_sha="sha256sums=('${TARBALL_SHA}')"
+          printf -v expected_srcinfo_source '\tsource = zeroclawlabs-%s.tar.gz::https://github.com/zeroclaw-labs/zeroclaw/archive/refs/tags/v%s.tar.gz' "$VERSION" "$VERSION"
+          printf -v expected_srcinfo_sha '\tsha256sums = %s' "$TARBALL_SHA"
+
+          require_exact_line "$PKGBUILD_FILE" "$expected_pkgbuild_source" "PKGBUILD source"
+          require_exact_line "$PKGBUILD_FILE" "$expected_pkgbuild_sha" "PKGBUILD checksum"
+          require_exact_line "$SRCINFO_FILE" "$expected_srcinfo_source" ".SRCINFO source"
+          require_exact_line "$SRCINFO_FILE" "$expected_srcinfo_sha" ".SRCINFO checksum"
+
           bash scripts/release/aur_version_guard.sh \
             "$SRCINFO_FILE" "$SRCINFO_FILE" \
             "$PKGBUILD_FILE" "$PKGBUILD_FILE"
