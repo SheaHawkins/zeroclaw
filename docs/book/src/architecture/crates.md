@@ -150,15 +150,20 @@ Terminal UI, built as a separate app under `apps/zerocode/`. It is its own works
 
 Specialised hardware support used by the `hardware` submodule. Out-of-scope unless you're bringing up specific peripherals.
 
-Both are being retired, so treat them as closed to new work. `aardvark-sys` is
-being deleted ([RFC #8043](https://github.com/zeroclaw-labs/zeroclaw/issues/8043)),
-and `zeroclaw-robot-kit` is being folded into `zeroclaw-hardware`
-([RFC #9803](https://github.com/zeroclaw-labs/zeroclaw/issues/9803)). New
-peripheral work belongs in `zeroclaw-hardware` directly.
+Retiring both has been proposed and is still under discussion. Neither proposal
+is accepted, so the contract in [FND-001](../foundations/fnd-001-intentional-architecture.md)
+still holds: both remain intentional independent crates with their own versioning
+cadence. The open proposals are
+[RFC #8043](https://github.com/zeroclaw-labs/zeroclaw/issues/8043), which would
+delete `aardvark-sys`, and
+[RFC #9803](https://github.com/zeroclaw-labs/zeroclaw/issues/9803), which would
+fold `zeroclaw-robot-kit` into `zeroclaw-hardware`. If you are starting new
+peripheral work, read those first and consider whether `zeroclaw-hardware` is
+the better home.
 
-This also settles where `unsafe` lives. `aardvark-sys` is currently the only
-crate permitted to use it, but that exemption disappears with the crate rather
-than transferring to `zeroclaw-hardware` wholesale; see
+Where `unsafe` should live is part of that open question, not a settled one.
+`aardvark-sys` is currently the only crate permitted to use it. Whether that
+exemption ends with the crate or moves elsewhere is being decided in
 [#7130](https://github.com/zeroclaw-labs/zeroclaw/issues/7130).
 
 ## Feature flags

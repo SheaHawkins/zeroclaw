@@ -73,23 +73,27 @@ The stability-tier definitions and versioning policy live in [FND-001](../founda
 | `zeroclaw-macros` | Beta | Tightly coupled to the config schema |
 | `zeroclaw-eval` | Experimental | Agent evaluation harness with deterministic replay of LLM trace fixtures |
 | `zeroclaw-spawn` | Beta | Attribution-propagating `tokio::spawn` wrapper layered on `zeroclaw-log` |
-| `zeroclaw-robot-kit` | Experimental | Robot control toolkit: drive, vision, speech, sensors, and safety. **Being retired** into `zeroclaw-hardware` |
-| `aardvark-sys` | Experimental | Low-level FFI bindings for the Total Phase Aardvark adapter. **Being deleted**; carries the workspace's only `unsafe` |
+| `zeroclaw-robot-kit` | Experimental | Robot control toolkit: drive, vision, speech, sensors, and safety. **Retirement proposed** (RFC #9803) |
+| `aardvark-sys` | Experimental | Low-level FFI bindings for the Total Phase Aardvark adapter; carries the workspace's only `unsafe`. **Retirement proposed** (RFC #8043) |
 
 Stable components follow the breaking-change policy. Beta components may make breaking changes in a MINOR release with changelog notes. Experimental components carry no stability guarantee. Tiers are promoted, never demoted, through deliberate team decision.
 
-Two crates are on the way out and should not be built on. `aardvark-sys` is
-being deleted outright, and `zeroclaw-robot-kit` is being folded into
-`zeroclaw-hardware`. Do not add call sites to either, and do not treat
-`aardvark-sys` as a permanent home for `unsafe` code: the decision on
-[#7130](https://github.com/zeroclaw-labs/zeroclaw/issues/7130) is to delete the
-crate rather than make it a standing carve-out from a workspace-wide
-`forbid(unsafe_code)`. Any `unsafe` that must survive the deletion needs its own
-narrow, reviewed boundary inside `zeroclaw-hardware`, not an inherited exemption.
-See [RFC #8043](https://github.com/zeroclaw-labs/zeroclaw/issues/8043) for the
-`aardvark-sys` plan and
-[RFC #9803](https://github.com/zeroclaw-labs/zeroclaw/issues/9803) for
-`zeroclaw-robot-kit`.
+Retiring two crates has been proposed and neither proposal is decided.
+[RFC #8043](https://github.com/zeroclaw-labs/zeroclaw/issues/8043) would delete
+`aardvark-sys`; [RFC #9803](https://github.com/zeroclaw-labs/zeroclaw/issues/9803)
+would fold `zeroclaw-robot-kit` into `zeroclaw-hardware`. Until they are
+ratified, both crates remain supported and
+[FND-001](../foundations/fnd-001-intentional-architecture.md) continues to list
+them as intentional independent exceptions.
+
+Treat that as a reason to check before investing, not as a prohibition: if you
+are about to add call sites to either, read the open proposals first and
+consider whether `zeroclaw-hardware` is the better home.
+
+Whether `aardvark-sys` stays the permanent home for `unsafe` is part of the same
+open question. [#7130](https://github.com/zeroclaw-labs/zeroclaw/issues/7130)
+proposes a workspace-wide `forbid(unsafe_code)` with `aardvark-sys` as the sole
+carve-out; whether that carve-out survives depends on how RFC #8043 resolves.
 
 Change-risk routing is:
 
