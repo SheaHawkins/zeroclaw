@@ -19,7 +19,10 @@ fn workflow(name: &str) -> String {
 fn yaml_block<'a>(document: &'a str, header: &str) -> &'a str {
     let header_indent = header.len() - header.trim_start().len();
     let start = document
-        .find(header)
+        .match_indices(header)
+        .find_map(|(offset, _)| {
+            (offset == 0 || document.as_bytes().get(offset - 1) == Some(&b'\n')).then_some(offset)
+        })
         .unwrap_or_else(|| panic!("workflow is missing YAML block: {header}"));
     let remainder = &document[start + header.len()..];
     let end = remainder
@@ -311,11 +314,12 @@ fn scoop_credential_canary_fails_closed_without_weakening_generic_dry_runs() {
     );
 
     let publisher_job = yaml_block(&publisher_workflow, "  publish-scoop:\n");
+    let publisher_env = yaml_block(publisher_job, "    env:\n");
     let canary_env = "CREDENTIAL_CANARY: ${{ inputs.credential_canary }}";
     assert_eq!(
-        publisher_job.matches(canary_env).count(),
+        publisher_env.matches(canary_env).count(),
         1,
-        "publisher job must map credential_canary into the tested gate exactly once"
+        "publisher job-level env must map credential_canary into the tested gate exactly once"
     );
     assert_eq!(
         publisher_workflow.matches(canary_env).count(),
