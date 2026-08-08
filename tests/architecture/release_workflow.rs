@@ -405,6 +405,24 @@ fn aur_publisher_rejects_stale_release_downgrades() {
         "epoch must take precedence over pkgver"
     );
 
+    let output = run_guard(
+        &srcinfo(None, "2.0.0", "1"),
+        &srcinfo(Some(1), "1.0.0", "1"),
+        &pkgbuild(None, "2.0.0", "1"),
+        &pkgbuild(Some(1), "1.0.0", "1"),
+        true,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "manual downgrade authorization must not cross an epoch boundary"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Refusing manual AUR downgrade override across an epoch boundary"),
+        "cross-epoch rejection must give actionable recovery guidance"
+    );
+
     let changed_build = format!("{same_build}# changed metadata\n");
     let output = run_guard(&equal, &equal, &changed_build, &same_build, false);
     assert_eq!(

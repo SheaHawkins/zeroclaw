@@ -235,6 +235,10 @@ current_display="${current_epoch}:${current_pkgver}-${current_pkgrel}"
 
 if [[ "$tuple_order" == -1 ]]; then
   if [[ "$allow_downgrade" == true ]]; then
+    if [[ "$(compare_numeric_dotted "$target_epoch" "$current_epoch")" != 0 ]]; then
+      echo "::error::Refusing manual AUR downgrade override across an epoch boundary: target ${target_display}, current ${current_display}. Preserve the published epoch and cut a new release tag." >&2
+      exit 3
+    fi
     echo "::warning::Manual AUR downgrade override accepted target ${target_display} over current ${current_display}." >&2
     exit 0
   fi
