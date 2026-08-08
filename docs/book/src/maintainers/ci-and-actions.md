@@ -12,7 +12,7 @@ Composite job with multiple matrix legs:
 - **fmt**: `cargo fmt --all -- --check`
 - **lint**: `cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`, plus two architecture guards (`cargo test --test architecture`): config-write isolation and Fluent coverage (no bare user-facing strings)
 - **build**: matrix: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`
-- **check**: all features + no-default-features
+- **check**: all features plus a workspace-wide, warnings-fatal no-default-features pass (excluding `zeroclaw-desktop`)
 - **check-32bit**: `i686-unknown-linux-gnu` with no default features
 - **bench**: benchmarks compile check
 - **test**: the standalone firmware protocol host gate from `scripts/ci/firmware_protocol_gate.sh` and `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux
@@ -30,6 +30,8 @@ Fresh required CI is normally the shared evidence for the Cargo surfaces it actu
 - a desktop change did not trigger the desktop workflow;
 - a release target is outside the PR matrix and only covered by release/manual workflows;
 - stale, cancelled, skipped, or unavailable CI is not fresh evidence.
+
+When a definition or import is feature-gated, compare its `cfg` predicate with every consumer. Validate both the enabled configuration and each relevant disabled configuration: an enabled-feature pass proves the consumer still works, while the workspace-wide no-default-features check catches warning-producing mismatches such as unused private definitions or imports. Targeted feature combinations remain necessary when neither required CI configuration exercises the changed predicate.
 
 ### Daily Advisory Scan (`daily-audit.yml`)
 
@@ -67,7 +69,9 @@ Triggered on tag push (and `workflow_dispatch`); builds and publishes versioned 
 
 ### Docker Image PR Check (`docker-image-pr.yml`)
 
-Runs only when Docker image or release-Docker context files change. It prepares a smoke `docker-ctx` with the same helper used by the stable release workflow, then builds the default prebuilt image and the Debian compatibility prebuilt image from `Dockerfile.ci` without pushing either image. This catches image dependency and `COPY` path breakage before release without giving PR runs registry write permission or running on every PR.
+Runs only when Docker image, Compose, or release-Docker context files change. It validates the merged default-plus-Alpine Compose configuration and, for changes beyond Compose-only edits, builds the default and Debian prebuilt smoke images plus the source Dockerfiles without pushing them. The default and Alpine source images build for `linux/amd64` and `linux/arm64`; the Debian source image builds for `linux/amd64`.
+
+The all-features `Containerfile` source image builds for `linux/amd64` when that file or the Docker workflow changes. It uses an isolated cache scope and is neither loaded nor pushed. The Alpine amd64 lane runs both binaries, starts the built image through the merged Compose configuration, and checks the gateway health and dashboard surfaces. The Alpine arm64 lane is compile- and image-assembly coverage only. Compose-only changes use a reduced Alpine amd64 matrix so they still exercise the runtime contract without rebuilding unrelated images. All jobs have read-only repository permissions and no registry write permission.
 
 ### Docker Publish (`docker-publish.yml`)
 
@@ -95,7 +99,7 @@ First triage step for a new issue: check if the reported outdated crates have se
 
 ### Cross-Platform Build (`cross-platform-build-manual.yml`)
 
-Manual trigger for building release binaries across the full target matrix: Linux x86_64/aarch64 GNU plus armv7 and arm hard-float, macOS Intel/ARM, Windows x86_64, and `aarch64-linux-android` (built with the NDK). Use this to verify a branch compiles cleanly on non-Linux targets before tagging.
+Manual trigger for building release binaries across the full target matrix: Linux x86_64/aarch64 GNU and MUSL plus armv7 and arm hard-float, macOS Intel/ARM, Windows x86_64, and `aarch64-linux-android` (built with the NDK). Use this to verify a branch compiles cleanly on non-Linux targets before tagging.
 
 ### Cross-Platform Clippy (`cross-platform-clippy.yml`)
 
@@ -104,6 +108,11 @@ Manual and weekly scheduled advisory lint coverage on macOS aarch64 and Windows 
 ### Release Stable (`release-stable-manual.yml`)
 
 Manual trigger for the full release pipeline. Builds all targets, creates the GitHub Release, pushes the prebuilt `latest`, versioned, and `debian` Docker images to GHCR, calls the generated Docker variant matrix at the release tag, triggers the website redeploy, and invokes the distribution sub-workflows (Scoop, AUR, Discord, tweet). Homebrew Core detects new releases through its own autobump service. Two environment gates require maintainer approval mid-run: `github-releases` (the `publish` job) and `docker`.
+
+Downloadable assets use GitHub-hosted Build Level 2 attestations. Offline
+bundles and trusted-root material ship inside one verification archive, and
+both SBOM formats are checksummed and attested before the release is created.
+Cosign remains limited to GHCR image signing.
 
 See the [Release Runbook](./release-runbook.md) for the full procedure.
 
@@ -184,18 +193,18 @@ All third-party refs are pinned to a full commit SHA with a trailing version com
 |---|---|---|
 | `actions/checkout` (`v6.0.2`) | Most workflows | Repository checkout |
 | `actions/cache` (`v4.2.3`, `v5.0.5`) | `docker-image-pr.yml`, `tweet-release.yml` | Generic dependency and Trivy database caching |
-| `actions/setup-node` (`v6.4.0`) | `release-stable-manual.yml`, `cross-platform-build-manual.yml` | Node toolchain for the web-dashboard build |
+| `actions/setup-node` (`v7.0.0`) | `ci-sbom.yml`, `ci.yml`, `cross-platform-build-manual.yml`, `daily-npm-audit.yml`, `release-stable-manual.yml` | Node toolchain for npm SBOM generation, web tests/audit, and web/desktop builds |
 | `actions/upload-artifact` (`v7.0.1`) | `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `docker-publish.yml`, `trivy-scheduled.yml` | Upload build artifacts and Trivy SARIF handoff artifacts |
 | `actions/download-artifact` (`v8.0.1`) | `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `docker-publish.yml` | Download build artifacts and Trivy SARIF handoff artifacts |
+| `actions/attest` (`v4.2.1`) | `release-stable-manual.yml` | Generate GitHub-hosted Build Level 2 provenance for release assets |
 | `actions/labeler` (`v6.1.0`) | `pr-path-labeler.yml` | Apply path/scope labels from `.github/labeler.yml` |
 | `dtolnay/rust-toolchain` (`stable`) | `ci.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `daily-audit.yml`, `docs-deploy.yml` | Install Rust toolchain |
 | `Swatinem/rust-cache` (`v2.9.1`) | `ci.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `docs-deploy.yml` | Cargo build/dependency caching |
 | `docker/setup-buildx-action` (`v3.11.1`, `v4.0.0`) | `release-stable-manual.yml`, `docker-publish.yml` | Docker Buildx setup |
 | `docker/login-action` (`v3.4.0`, `v4.1.0`) | `release-stable-manual.yml`, `docker-publish.yml`, `trivy-scheduled.yml` | GHCR authentication |
 | `docker/build-push-action` (`v6.18.0`, `v7.1.0`) | `release-stable-manual.yml`, `docker-publish.yml` | Multi-platform image build and push |
-| `sigstore/cosign-installer` (`v3.8.1`) | `release-stable-manual.yml`, `docker-publish.yml` | Install cosign for keyless signing of release assets and container images |
-| `anchore/sbom-action` (`v0.17.9`) | `release-stable-manual.yml` | Generate SPDX + CycloneDX SBOMs for each release |
-| `slsa-framework/slsa-github-generator` (`v2.1.0`) | `release-stable-manual.yml` | Reusable workflow that produces SLSA L2 provenance for release artifacts |
+| `sigstore/cosign-installer` (`v3.8.1`) | `release-stable-manual.yml`, `docker-publish.yml` | Install cosign for keyless GHCR container-image signing |
+| `anchore/sbom-action` (`v0.24.0`) | `release-stable-manual.yml` | Generate SPDX + CycloneDX SBOMs for each release |
 | `aquasecurity/trivy-action` (`v0.36.0`) | `docker-image-pr.yml`, `docker-publish.yml`, `trivy-scheduled.yml` | Report-only container vulnerability scanning |
 | `github/codeql-action/upload-sarif` (`v3.36.2`) | `docker-publish.yml`, `trivy-scheduled.yml` | Upload Trivy SARIF reports to the Security tab |
 | `github/codeql-action/init` (`v3`) | `ci-code-analysis.yml` | Initialize CodeQL Rust analysis |
@@ -212,7 +221,6 @@ Swatinem/rust-cache@*
 docker/*
 sigstore/cosign-installer@*
 anchore/sbom-action@*
-slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@*
 aquasecurity/trivy-action@*
 github/codeql-action/upload-sarif@*
 github/codeql-action/init@*
@@ -240,6 +248,7 @@ Any PR that adds or changes a `uses:` action source must include an allowlist im
 - All third-party action refs must be pinned to a full commit SHA (per the allowlist policy above).
 - Keep `ci.yml`, `dev/ci.sh`, and `.githooks/pre-push` aligned. Shared gates must live in `scripts/ci/`; each caller invokes the helper instead of copying its commands. For the standalone firmware protocol gate, the documented local entry point is `./dev/ci.sh firmware-protocol`.
 - Keep `scripts/ci/prepare_docker_context.sh`, `docker-image-pr.yml`, and the Docker job in `release-stable-manual.yml` aligned so PR validation exercises the same context shape the release workflow publishes.
+- Run `python3 scripts/ci/release_attestation_contract_test.py` after changing the release attestation, checksum, SBOM, or verification-archive sequence.
 - The `docs-style` gate job runs `bash scripts/ci/docs_quality_gate.sh` (markdown lint + em-dash prose check) and `bash scripts/ci/docs_links_gate.sh` (changed-line link gate). Run both scripts locally before pushing docs changes.
 
 ## Emergency rollback

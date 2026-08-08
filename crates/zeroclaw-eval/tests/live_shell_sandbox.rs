@@ -35,9 +35,9 @@ use zeroclaw_eval::live::{live_shell_sandbox, run_live_case};
 use zeroclaw_eval::replay::TraceLlmProvider;
 use zeroclaw_eval::{CaseProvider, LlmTrace, Mode, RunDeps};
 
-/// True if `history` contains a fed-back tool result denying a call (the
-/// non-interactive approval gate's fixed "Denied by user." text -
-/// `crates/zeroclaw-runtime/src/agent/turn/approval_gate.rs`). Because
+/// True if `history` contains a fed-back tool result denying a call through
+/// the non-interactive approval gate
+/// (`crates/zeroclaw-runtime/src/agent/turn/approval_gate.rs`). Because
 /// `shell` is excluded from `effective` (and therefore from
 /// `risk.auto_approve`), a scripted `shell` call is auto-denied *before*
 /// tool dispatch: it never reaches `execute_one_tool`, so it never shows up
@@ -51,7 +51,9 @@ fn history_shows_a_denial(history: &[ConversationMessage]) -> bool {
         matches!(
             msg,
             ConversationMessage::ToolResults(results)
-                if results.iter().any(|r| r.content == "Denied by user.")
+                if results.iter().any(|r| {
+                    r.content.contains("no operator decision was available")
+                })
         )
     })
 }
