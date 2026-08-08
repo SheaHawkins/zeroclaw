@@ -11,11 +11,11 @@ name: Scoop Bucket Canary
 # Running the rehearsal weekly surfaces a dead credential between releases,
 # while there is still time to rotate it.
 #
-# This detects credential rot; it is not what keeps the bucket correct. The
-# bucket's own excavator is the self-healing backstop: it reads the manifest's
-# checkver/autoupdate blocks and republishes from the bucket side using the
-# bucket's GITHUB_TOKEN, with no cross-repo credential involved. See
-# zeroclaw-labs/scoop-zeroclaw.
+# This detects credential rot; it is not what keeps the bucket correct. A
+# bucket-side Excavator backstop is proposed in zeroclaw-labs/scoop-zeroclaw#1,
+# but it is not operational until that workflow lands, receives write
+# permission, and passes a maintainer smoke test. Until then, recover a failed
+# publish by rotating the credential and rerunning the publisher.
 
 on:
   schedule:
@@ -63,4 +63,6 @@ jobs:
     with:
       release_tag: ${{ needs.latest-release.outputs.tag }}
       dry_run: true
-    secrets: inherit
+      credential_canary: true
+    secrets:
+      SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}

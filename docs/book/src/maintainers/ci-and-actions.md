@@ -53,14 +53,14 @@ The canary detects credential rot. It is deliberately not what keeps the bucket 
 
 #### How the Scoop bucket stays correct
 
-Two independent layers, in order of who acts first:
+Today the release publisher is the only automated writer:
 
-1. **`pub-scoop.yml` pushes on release.** Atomic with the release, so Scoop users see the new version immediately. Needs the cross-repo `SCOOP_BUCKET_TOKEN`, which is the fragile part.
-2. **The bucket's own excavator self-heals.** `zeroclaw-labs/scoop-zeroclaw` runs the standard Scoop excavator, which reads the manifest's `checkver` and `autoupdate` blocks, recomputes `version`, `url`, and `hash` from the GitHub release, and commits from the bucket side using the bucket's own `GITHUB_TOKEN`. No cross-repo credential is involved, so it cannot fail the way layer 1 does.
+1. **`pub-scoop.yml` pushes on release.** Scoop users see the new version immediately when this succeeds. It needs the cross-repo `SCOOP_BUCKET_TOKEN`, which is the fragile part.
+2. **Maintainers recover failed pushes.** Rotate or repair the token, dispatch the publisher with `dry_run: true` to verify it, rerun with `dry_run: false`, and confirm the bucket manifest landed the release version.
 
-That ordering is why a failed `scoop` job is no longer urgent: if the push fails for any reason, excavator republishes within its schedule without a human. This mirrors the decision already made for Homebrew, where the project-owned publisher was retired in favor of Homebrew's official autobump service.
+A bucket-side Excavator is proposed in [scoop-zeroclaw#1](https://github.com/zeroclaw-labs/scoop-zeroclaw/pull/1). Once that workflow is merged, the bucket repository grants Actions read/write workflow permission, and a maintainer smoke test proves that it commits an update, it can become a credential-independent recovery layer. Until all three conditions are satisfied, do not assume a failed publisher will self-heal.
 
-The `checkver` and `autoupdate` blocks are therefore load-bearing in two places at once: excavator consumes them, and `scripts/release/scoop_metadata.sh` derives the release URL template from `autoupdate` so the push path and excavator cannot disagree about where the asset lives. Do not remove them, and do not hand-edit them out of `dist/scoop/zeroclaw.json`.
+The `checkver` and `autoupdate` blocks are already load-bearing for the planned Excavator path. The current push path also uses `scripts/release/scoop_metadata.sh` to derive its release URL template from `autoupdate`, so both paths share one manifest contract. Do not remove those blocks, and do not hand-edit them out of `dist/scoop/zeroclaw.json`.
 
 ### PR Path Labeler (`pr-path-labeler.yml`)
 

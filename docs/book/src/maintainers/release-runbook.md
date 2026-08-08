@@ -530,16 +530,17 @@ failed distribution job does not invalidate the release itself.
 
 **The `scoop` job failed with `remote: Permission ... denied to <account>` (403):**
 A permissions problem, not a manifest problem: the bucket token is dead or
-under-scoped. This is not urgent, because the bucket's excavator republishes
-from the bucket side within its schedule without a credential. Rotate the token
-per [Rotating `SCOOP_BUCKET_TOKEN`](./ci-and-actions.md#rotating-scoop_bucket_token),
+under-scoped. Rotate the token per
+[Rotating `SCOOP_BUCKET_TOKEN`](./ci-and-actions.md#rotating-scoop_bucket_token),
 then dispatch Scoop Bucket Canary to confirm the fix without writing to the
-bucket. Confirm the bucket landed the new version either way, since excavator
-covering for a dead token is easy to miss.
+bucket. Rerun the Scoop publisher with `dry_run: false` and confirm the bucket
+landed the new version. Bucket-side Excavator recovery remains pending on
+`zeroclaw-labs/scoop-zeroclaw#1`, repository workflow write permission, and a
+maintainer smoke test; do not wait for it to repair a release until those steps
+are complete.
 
 **Weekly `Scoop Bucket Canary` went red:** The token has expired or lost write.
-Same rotation path. Fix it before the next release so layer 1 still works rather
-than leaning on excavator indefinitely.
+Same rotation path. Fix it before the next release.
 
 **Homebrew Core is stale:** Homebrew is not a release-workflow job. Check the
 [Homebrew autobump status and documented manual bump

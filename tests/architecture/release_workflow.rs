@@ -130,6 +130,85 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
 }
 
 #[test]
+fn scoop_credential_canary_fails_closed_without_weakening_generic_dry_runs() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let gate = root.join("scripts/release/scoop_credential_gate.sh");
+
+    let run_gate = |dry_run: bool,
+                    credential_canary: bool,
+                    bucket_repo: Option<&str>,
+                    bucket_token: Option<&str>| {
+        let mut command = Command::new("bash");
+        command
+            .arg(&gate)
+            .env("DRY_RUN", dry_run.to_string())
+            .env("CREDENTIAL_CANARY", credential_canary.to_string())
+            .env_remove("SCOOP_BUCKET_REPO")
+            .env_remove("GH_TOKEN");
+        if let Some(repo) = bucket_repo {
+            command.env("SCOOP_BUCKET_REPO", repo);
+        }
+        if let Some(token) = bucket_token {
+            command.env("GH_TOKEN", token);
+        }
+        command.output().expect("run Scoop credential gate")
+    };
+
+    let generic_dry_run = run_gate(true, false, None, None);
+    assert!(
+        generic_dry_run.status.success(),
+        "a generic dry run may omit bucket credentials: {}",
+        String::from_utf8_lossy(&generic_dry_run.stderr)
+    );
+    assert_eq!(generic_dry_run.stdout, b"skip\n");
+
+    for (repo, token, missing) in [
+        (None, Some("test-token"), "repository"),
+        (Some("example/scoop-bucket"), None, "token"),
+    ] {
+        let canary = run_gate(true, true, repo, token);
+        assert!(
+            !canary.status.success(),
+            "credential canary must fail when the {missing} is missing"
+        );
+    }
+
+    let configured_canary = run_gate(true, true, Some("example/scoop-bucket"), Some("test-token"));
+    assert!(
+        configured_canary.status.success(),
+        "configured credential canary must reach the authorization probe: {}",
+        String::from_utf8_lossy(&configured_canary.stderr)
+    );
+    assert_eq!(configured_canary.stdout, b"probe\n");
+
+    let canary_workflow = workflow("scoop-bucket-canary.yml");
+    for required in [
+        "credential_canary: true",
+        "SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}",
+    ] {
+        assert!(
+            canary_workflow.contains(required),
+            "Scoop canary is missing fail-closed invariant: {required}"
+        );
+    }
+    assert!(
+        !canary_workflow.contains("secrets: inherit"),
+        "Scoop canary must receive only the named bucket token"
+    );
+
+    let publisher_workflow = workflow("pub-scoop.yml");
+    assert!(
+        publisher_workflow.contains("required: true\n  workflow_dispatch:"),
+        "reusable Scoop publisher must require its declared bucket token"
+    );
+    assert!(
+        publisher_workflow
+            .contains("gate_result=\"$(bash scripts/release/scoop_credential_gate.sh)\""),
+        "Scoop publisher must enforce the tested credential gate"
+    );
+}
+
+#[test]
 fn scoop_publisher_metadata_follows_canonical_url_template() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let metadata_script = root.join("scripts/release/scoop_metadata.sh");

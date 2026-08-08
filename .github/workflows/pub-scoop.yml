@@ -12,9 +12,15 @@ on:
         required: false
         default: false
         type: boolean
+      credential_canary:
+        description: "Require bucket credentials and exercise push authorization"
+        required: false
+        default: false
+        type: boolean
     secrets:
       SCOOP_BUCKET_TOKEN:
-        required: false
+        description: "Fine-grained token with Contents write on the Scoop bucket"
+        required: true
   workflow_dispatch:
     inputs:
       release_tag:
@@ -25,6 +31,11 @@ on:
         description: "Generate manifest only (no push)"
         required: false
         default: true
+        type: boolean
+      credential_canary:
+        description: "Require bucket credentials and exercise push authorization"
+        required: false
+        default: false
         type: boolean
 
 concurrency:
@@ -41,6 +52,7 @@ jobs:
     env:
       RELEASE_TAG: ${{ inputs.release_tag }}
       DRY_RUN: ${{ inputs.dry_run }}
+      CREDENTIAL_CANARY: ${{ inputs.credential_canary }}
       SCOOP_BUCKET_REPO: ${{ vars.SCOOP_BUCKET_REPO }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -55,23 +67,18 @@ jobs:
         run: |
           set -euo pipefail
 
-          # This probe runs for dry runs too, so a rehearsal exercises the same
-          # credential the publish path uses. A token that has expired or lost
-          # write on the bucket then surfaces between releases rather than after
-          # the release is already published and announced.
-          if [[ -z "${SCOOP_BUCKET_REPO:-}" || -z "${GH_TOKEN:-}" ]]; then
-            if [[ "$DRY_RUN" != "true" ]]; then
-              echo "::error::Repository variable SCOOP_BUCKET_REPO and secret SCOOP_BUCKET_TOKEN are both required when dry_run=false."
-              exit 1
-            fi
-            echo "::warning::Scoop bucket credentials are unavailable; skipping the push-access probe."
+          gate_result="$(bash scripts/release/scoop_credential_gate.sh)"
+          if [[ "$gate_result" == "skip" ]]; then
             exit 0
           fi
-          if [[ "$SCOOP_BUCKET_REPO" != */* ]]; then
-            echo "::error::SCOOP_BUCKET_REPO must be in owner/repo format."
+          if [[ "$gate_result" != "probe" ]]; then
+            echo "::error::Unexpected Scoop credential gate result."
             exit 1
           fi
 
+          # A credential canary and every configured publish or dry run exercise
+          # the same authorization path. The gate above only permits a missing
+          # credential for a generic standalone dry run.
           probe_dir="$(mktemp -d)"
           trap 'rm -rf "$probe_dir"' EXIT
           gh auth setup-git
