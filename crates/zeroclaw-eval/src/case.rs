@@ -121,6 +121,23 @@ pub struct TraceExpects {
     pub judge: Vec<JudgeRubric>,
 }
 
+impl TraceExpects {
+    /// Whether this case declares at least one check that does not depend on the
+    /// LLM judge. Used to reject judge-only cases, which cannot gate.
+    pub fn has_deterministic_check(&self) -> bool {
+        !self.response_contains.is_empty()
+            || !self.response_not_contains.is_empty()
+            || !self.tools_used.is_empty()
+            || !self.tools_not_used.is_empty()
+            || self.max_tool_calls.is_some()
+            || self.all_tools_succeeded.is_some()
+            || !self.response_matches.is_empty()
+            || self.workspace.is_some()
+            || self.budget.is_some()
+            || !self.response_json.is_empty()
+    }
+}
+
 fn default_judge_threshold() -> f64 {
     0.7
 }
@@ -185,13 +202,45 @@ impl LlmTrace {
         self.id.as_deref().unwrap_or(&self.model_name)
     }
 
-    /// Load a trace from a JSON file.
+    /// Load a trace from a JSON file, rejecting fixtures whose expectations are
+    /// not usable as a gate.
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("reading trace fixture {}", path.display()))?;
         let trace: LlmTrace = serde_json::from_str(&content)
             .with_context(|| format!("parsing trace fixture {}", path.display()))?;
+        trace
+            .validate()
+            .with_context(|| format!("invalid trace fixture {}", path.display()))?;
         Ok(trace)
+    }
+
+    /// Reject fixtures a run could not honestly grade.
+    ///
+    /// Two authoring errors are fatal here rather than silently green later:
+    /// a judge threshold outside the documented `0.0..=1.0` (a `threshold` of
+    /// `NaN` or `2.0` makes the dimension unpassable/unfailable), and a
+    /// judge-only case (a case whose ONLY expectation is `judge`, which passes
+    /// vacuously with `score() == 1.0` whenever no judge provider is configured
+    /// or the judge stays diagnostic).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for rubric in &self.expects.judge {
+            anyhow::ensure!(
+                rubric.threshold.is_finite() && (0.0..=1.0).contains(&rubric.threshold),
+                "judge rubric {:?} has threshold {} which is not a finite value in 0.0..=1.0",
+                rubric.name,
+                rubric.threshold
+            );
+        }
+        if !self.expects.judge.is_empty() && !self.expects.has_deterministic_check() {
+            anyhow::bail!(
+                "case {:?} declares only judge rubrics; every judge case must also declare at \
+                 least one deterministic check (response, tool, workspace, or budget), otherwise \
+                 it passes vacuously when the judge is absent or diagnostic",
+                self.display_id()
+            );
+        }
+        Ok(())
     }
 }
 
@@ -295,6 +344,91 @@ mod tests {
         assert!(t.turns.is_empty());
         assert!(t.expects.response_contains.is_empty());
         assert!(t.expects.max_tool_calls.is_none());
+    }
+
+    fn trace(json: &str) -> LlmTrace {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn judge_rubric_threshold_out_of_range_fails_load() {
+        for bad in ["1.5", "-0.1"] {
+            let t = trace(&format!(
+                r#"{{"model_name":"t","turns":[],"expects":{{"response_contains":["x"],
+                    "judge":[{{"name":"h","rubric":"r","threshold":{bad}}}]}}}}"#
+            ));
+            let err = t
+                .validate()
+                .expect_err("an out-of-range threshold must fail suite load");
+            assert!(
+                err.to_string().contains("0.0..=1.0"),
+                "unexpected error: {err}"
+            );
+        }
+        // The inclusive bounds are valid.
+        for ok in ["0.0", "1.0"] {
+            let t = trace(&format!(
+                r#"{{"model_name":"t","turns":[],"expects":{{"response_contains":["x"],
+                    "judge":[{{"name":"h","rubric":"r","threshold":{ok}}}]}}}}"#
+            ));
+            t.validate().expect("boundary thresholds are valid");
+        }
+    }
+
+    #[test]
+    fn judge_only_case_fails_load() {
+        // A case whose only expectation is `judge` reports passed()==true and
+        // score()==1.0 when no judge provider is configured — a false green.
+        let t = trace(
+            r#"{"model_name":"t","turns":[],"expects":{"judge":[{"name":"h","rubric":"r"}]}}"#,
+        );
+        let err = t
+            .validate()
+            .expect_err("a judge-only case must be rejected at load");
+        assert!(
+            err.to_string().contains("only judge rubrics"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn judge_case_with_a_deterministic_check_loads() {
+        for det in [
+            r#""response_contains":["x"]"#,
+            r#""tools_used":["echo"]"#,
+            r#""max_tool_calls":1"#,
+            r#""all_tools_succeeded":true"#,
+            r#""budget":{"max_total_tokens":10}"#,
+            r#""workspace":{"file_exists":["a.txt"]}"#,
+            r#""response_json":{"/a":1}"#,
+            r#""response_matches":["x"]"#,
+            r#""response_not_contains":["y"]"#,
+            r#""tools_not_used":["shell"]"#,
+        ] {
+            let t = trace(&format!(
+                r#"{{"model_name":"t","turns":[],"expects":{{{det},
+                    "judge":[{{"name":"h","rubric":"r"}}]}}}}"#
+            ));
+            t.validate().unwrap_or_else(|e| {
+                panic!("{det} should satisfy the deterministic-check rule: {e}")
+            });
+        }
+    }
+
+    #[test]
+    fn from_file_rejects_an_invalid_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.json");
+        std::fs::write(
+            &path,
+            r#"{"model_name":"bad","turns":[],"expects":{"judge":[{"name":"h","rubric":"r"}]}}"#,
+        )
+        .unwrap();
+        let err = LlmTrace::from_file(&path).expect_err("invalid fixtures must not load");
+        assert!(
+            format!("{err:#}").contains("only judge rubrics"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]

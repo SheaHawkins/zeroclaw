@@ -242,10 +242,43 @@ fn calibration_stem(judge_ref: &str) -> String {
         .collect()
 }
 
+/// The provider- and model-level fallbacks configured for a judge alias.
+///
+/// A calibration authorizes exactly one `<type>.<alias>:<model>` identity. When
+/// the judge alias can fail over, a successful call may be served by a different
+/// provider or model than the one calibrated, so the gate must refuse rather
+/// than trust the configured primary ref. Returns `(provider_fallbacks,
+/// model_fallbacks)`.
+fn judge_fallbacks(config: &Config, judge_provider: &str) -> (Vec<String>, Vec<String>) {
+    let Some((family, alias)) = judge_provider.split_once('.') else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(entry) = config.providers.models.find(family, alias) else {
+        return (Vec::new(), Vec::new());
+    };
+    let providers = entry
+        .fallback
+        .iter()
+        .map(|r| r.as_str().to_string())
+        .filter(|r| !r.trim().is_empty())
+        .collect();
+    let models = entry
+        .fallback_models
+        .iter()
+        .filter(|m| !m.trim().is_empty())
+        .cloned()
+        .collect();
+    (providers, models)
+}
+
 /// Build judge deps from config, or `None` when `[eval].judge_provider` is empty.
-/// Judge grades gate only when `judge_gate` is set AND a calibration file exists
-/// for the judge (keyed by the model-inclusive `judge_ref`, matching the
-/// comparability key); otherwise they stay diagnostic (a missing file warns).
+///
+/// Judge grades gate only when `judge_gate` is set AND a calibration artifact at
+/// `evals/calibration/<judge_ref>.json` LOADS AND VALIDATES for the judge
+/// identity actually served (schema, exact `judge_ref`, minimum labeled records,
+/// agreement floor) AND that identity cannot change under fallback. Any other
+/// outcome keeps grades diagnostic and prints the specific reason — the gate
+/// never degrades silently.
 fn build_judge_deps(config: &Config) -> Result<Option<zeroclaw_eval::grader::JudgeDeps>> {
     let judge_provider = config.eval.judge_provider.as_str().trim().to_string();
     if judge_provider.is_empty() {
@@ -254,22 +287,26 @@ fn build_judge_deps(config: &Config) -> Result<Option<zeroclaw_eval::grader::Jud
     let (provider, _provider_type, model) =
         build_session_model_provider(config, &judge_provider, None)?;
     let judge_ref = format!("{judge_provider}:{model}");
-    let calibration = std::path::Path::new(&format!(
+    let calibration_path = std::path::PathBuf::from(format!(
         "evals/calibration/{}.json",
         calibration_stem(&judge_ref)
-    ))
-    .exists();
-    let gates = config.eval.judge_gate && calibration;
-    if config.eval.judge_gate && !calibration {
-        println!(
-            "  warning: [eval].judge_gate is set but no calibration file for {judge_ref}; judge grades stay diagnostic"
-        );
+    ));
+    let (provider_fallbacks, model_fallbacks) = judge_fallbacks(config, &judge_provider);
+    let decision = zeroclaw_eval::calibration::decide_gate(
+        config.eval.judge_gate,
+        &calibration_path,
+        &judge_ref,
+        &provider_fallbacks,
+        &model_fallbacks,
+    );
+    if let Some(reason) = decision.refusal() {
+        println!("  warning: [eval].judge_gate is set but judge grades stay diagnostic: {reason}");
     }
     Ok(Some(zeroclaw_eval::grader::JudgeDeps {
         provider: std::sync::Arc::from(provider),
         model,
         judge_ref,
-        gates,
+        gates: decision.gates(),
     }))
 }
 

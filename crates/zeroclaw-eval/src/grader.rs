@@ -310,30 +310,35 @@ fn judge_message(
     msg
 }
 
-/// Parse the judge reply: the LAST line that is a JSON object with a numeric
-/// `score`. Returns `(score_clamped, unknown, reason)`, or `None` if malformed.
+/// The judge's contracted reply object. All three fields are REQUIRED and typed:
+/// a missing, mistyped, or extra field means the judge did not answer the
+/// contract, which is a diagnostic outcome — never a silently defaulted grade.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JudgeReply {
+    score: f64,
+    unknown: bool,
+    reason: String,
+}
+
+/// Parse the judge reply: the LAST line that is a JSON object matching the
+/// contracted schema exactly. Returns `(score, unknown, reason)`, or `None` when
+/// no line satisfies the contract.
+///
+/// The score is NOT clamped. An out-of-range or non-finite score means the judge
+/// is not answering the documented `0.0..=1.0` contract, so its reply is treated
+/// as unparseable (diagnostic) rather than squashed into a perfect grade —
+/// `{"score":999}` must not score `1.0`.
 fn parse_judge_reply(reply: &str) -> Option<(f64, bool, String)> {
     for line in reply.lines().rev() {
         let line = line.trim();
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Ok(parsed) = serde_json::from_str::<JudgeReply>(line) else {
             continue;
         };
-        let Some(obj) = value.as_object() else {
-            continue;
-        };
-        let Some(score) = obj.get("score").and_then(serde_json::Value::as_f64) else {
-            continue;
-        };
-        let unknown = obj
-            .get("unknown")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let reason = obj
-            .get("reason")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        return Some((score.clamp(0.0, 1.0), unknown, reason));
+        if !parsed.score.is_finite() || !(0.0..=1.0).contains(&parsed.score) {
+            return None;
+        }
+        return Some((parsed.score, parsed.unknown, parsed.reason));
     }
     None
 }
@@ -951,6 +956,78 @@ mod tests {
         grader
             .grade(&run("final response", &[], true), &dummy_ctx())
             .await
+    }
+
+    #[tokio::test]
+    async fn judge_reply_out_of_range_score_is_diagnostic() {
+        // `{"score":999}` must NOT be clamped to a perfect 1.0. A judge that is
+        // not answering the 0.0..=1.0 contract has not graded the dimension.
+        let g = judge_grade(
+            &[r#"{"score":999,"unknown":false,"reason":"nonsense"}"#],
+            vec![rubric("helpfulness", 0.7)],
+            true,
+        )
+        .await;
+        assert_eq!(g.len(), 1);
+        assert!(g[0].diagnostic, "an out-of-range score must be diagnostic");
+        assert!(
+            g[0].detail.contains("UNKNOWN"),
+            "unexpected detail: {}",
+            g[0].detail
+        );
+        assert!(
+            !g[0].detail.contains("1.00"),
+            "999 must not be clamped into a perfect score: {}",
+            g[0].detail
+        );
+    }
+
+    #[tokio::test]
+    async fn judge_reply_negative_and_nonfinite_scores_are_diagnostic() {
+        for reply in [
+            r#"{"score":-1.0,"unknown":false,"reason":"x"}"#,
+            r#"{"score":1e400,"unknown":false,"reason":"x"}"#,
+        ] {
+            let g = judge_grade(&[reply], vec![rubric("h", 0.7)], true).await;
+            assert!(g[0].diagnostic, "{reply} must be diagnostic");
+        }
+    }
+
+    #[tokio::test]
+    async fn judge_reply_missing_unknown_field_is_diagnostic() {
+        // `unknown` is part of the contract; defaulting it to false would turn a
+        // non-answer into a real grade.
+        let g = judge_grade(
+            &[r#"{"score":0.9,"reason":"ok"}"#],
+            vec![rubric("h", 0.7)],
+            true,
+        )
+        .await;
+        assert!(g[0].diagnostic, "detail: {}", g[0].detail);
+    }
+
+    #[tokio::test]
+    async fn judge_reply_mistyped_reason_is_diagnostic() {
+        let g = judge_grade(
+            &[r#"{"score":0.9,"unknown":false,"reason":42}"#],
+            vec![rubric("h", 0.7)],
+            true,
+        )
+        .await;
+        assert!(g[0].diagnostic, "detail: {}", g[0].detail);
+    }
+
+    #[tokio::test]
+    async fn judge_reply_with_extra_fields_is_diagnostic() {
+        // deny_unknown_fields: a reply carrying extra keys is not the contracted
+        // object, so it cannot be trusted to gate.
+        let g = judge_grade(
+            &[r#"{"score":0.9,"unknown":false,"reason":"ok","verdict":"pass"}"#],
+            vec![rubric("h", 0.7)],
+            true,
+        )
+        .await;
+        assert!(g[0].diagnostic, "detail: {}", g[0].detail);
     }
 
     #[tokio::test]
