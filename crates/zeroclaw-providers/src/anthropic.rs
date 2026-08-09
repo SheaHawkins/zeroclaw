@@ -3662,6 +3662,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             base_url: format!("http://{addr}"),
             max_tokens: 4096,
             timeout_secs: 120,
+            schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
         }
     }
 
