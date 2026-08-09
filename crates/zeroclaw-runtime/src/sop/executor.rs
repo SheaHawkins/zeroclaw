@@ -500,10 +500,14 @@ pub(crate) fn advance_sop_step(
     let action = engine
         .advance_step(run_id, result)
         .with_context(|| format!("failed to advance SOP run {run_id}"))?;
+    // `Cancelled` is as terminal as `Completed` / `Failed`: omitting it here means
+    // `audit_sop_step` never reaches `log_run_complete`, so a boundary cancellation
+    // leaves the in-memory audit record showing `Running` while the durable run and
+    // the engine metrics are already terminal.
     let finished_run = match &action {
-        SopRunAction::Completed { run_id, .. } | SopRunAction::Failed { run_id, .. } => {
-            engine.get_run(run_id).cloned()
-        }
+        SopRunAction::Completed { run_id, .. }
+        | SopRunAction::Failed { run_id, .. }
+        | SopRunAction::Cancelled { run_id, .. } => engine.get_run(run_id).cloned(),
         _ => None,
     };
     Ok((action, finished_run))
@@ -687,6 +691,67 @@ mod tests {
         assert_eq!(
             collector.get_metric_value("sop.live-once.runs_completed"),
             Some(json!(1u64))
+        );
+    }
+
+    /// Regression for PR #9476 / issue #9425: a run cancelled at a step boundary
+    /// must be reported as a finished run, so `audit_sop_step` reaches
+    /// `log_run_complete`. `advance_sop_step` previously captured `finished_run`
+    /// only for `Completed` and `Failed`, leaving the in-memory audit record at
+    /// `Running` while the durable run and the engine metrics were already terminal.
+    #[test]
+    fn boundary_cancellation_reports_a_finished_run_for_the_audit_projection() {
+        let mut engine = SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![test_sop("cancel-at-boundary")]);
+        let action = engine
+            .start_run("cancel-at-boundary", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action);
+
+        // Operator Stop on a Running run: durable CancelRequested, run retained and
+        // still claimed until the driver reaches a safe boundary.
+        let outcome = engine
+            .cancel_run_idempotent(
+                &run_id,
+                Some("operator requested stop".to_string()),
+                Some("gateway:operator".to_string()),
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome, Some(crate::sop::engine::CancelOutcome::Requested)),
+            "a Running run must enter CancelRequested rather than terminalizing immediately"
+        );
+
+        let engine = Arc::new(Mutex::new(engine));
+        // The driver reaches the next step boundary and finalizes the cancellation.
+        let (action, finished_run) = advance_sop_step(
+            &engine,
+            &run_id,
+            SopStepResult {
+                effective_agent: None,
+                step_number: 1,
+                status: SopStepStatus::Completed,
+                output: "ok".to_string(),
+                started_at: "2026-06-28T00:00:00Z".to_string(),
+                completed_at: Some("2026-06-28T00:00:01Z".to_string()),
+                tool_calls: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            matches!(action, SopRunAction::Cancelled { .. }),
+            "the boundary must finalize the requested cancellation, got {action:?}"
+        );
+        let finished = finished_run.expect(
+            "a boundary cancellation must surface the finished run so the audit \
+             projection can log run completion",
+        );
+        assert_eq!(finished.run_id, run_id);
+        assert_eq!(
+            finished.status,
+            SopRunStatus::Cancelled,
+            "the audited run must carry the terminal Cancelled status"
         );
     }
 
