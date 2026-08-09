@@ -199,18 +199,27 @@ pub async fn run_live_case(
         ..SecurityPolicy::default()
     });
 
+    let tools = live_tool_registry(&effective, policy.clone())?;
+    // Auto-approve exactly the tools the registry actually exposes, not the
+    // `effective` intersection. The two agree for a non-empty allowlist (the
+    // registry is filtered by `effective`, so registry names are a subset), but
+    // with an *empty* allowlist the registry falls back to the eval `echo` tool
+    // while `effective` is empty — so keying approvals off `effective` put the
+    // one exposed tool on the prompt path and auto-denied it, contradicting the
+    // "usable with allowed_tools=None" contract just below.
+    let auto_approve: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
+
     // Deny-by-default approvals. Allowlisted tools are auto-approved (deterministic
     // pass-through); anything else that reaches the gate resolves Prompt -> auto-deny.
     // The backchannel variant closes the non-interactive shell-exemption hole.
     let risk = RiskProfileConfig {
         level: AutonomyLevel::Supervised,
-        auto_approve: effective.clone(),
+        auto_approve,
         always_ask: Vec::new(),
         ..RiskProfileConfig::default()
     };
     let approvals = Arc::new(ApprovalManager::for_non_interactive_backchannel(&risk));
 
-    let tools = live_tool_registry(&effective, policy.clone())?;
     // Empty allowlist -> None so the echo registry's own tool is usable; a
     // `Some(vec![])` would deny every tool including echo. Non-empty -> the
     // allowlist backs the already-filtered registry as defense in depth.
@@ -423,6 +432,111 @@ mod tests {
              (proving it never actually ran), but no denial was recorded \
              in history: {:?}",
             record.history
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_allowlist_echo_actually_dispatches_end_to_end() {
+        // The registry-membership test below only proves `echo` is *present*.
+        // This drives the whole `run_live_case` path with an empty allowlist to
+        // prove it is also *usable* — the claim the `allowed_tools=None` comment
+        // in `run_live_case` makes. Previously `risk.auto_approve` was built
+        // from the same empty `effective`, so `echo` reached the prompt path and
+        // was auto-denied, contradicting that comment.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{ "model_name": "empty-allowlist-echo", "turns": [{ "user_input": "hi" }] }"#,
+        )
+        .unwrap();
+
+        let driver = r#"{"model_name":"driver","turns":[{"user_input":"","steps":[
+            {"response":{"type":"tool_calls","tool_calls":[{"id":"1","name":"echo","arguments":{"message":"pong"}}]}},
+            {"response":{"type":"text","content":"done"}}
+        ]}]}"#;
+
+        let deps = live_deps(
+            move |_| Ok(driver_provider(driver)),
+            Vec::new(),
+            Duration::from_secs(5),
+        );
+
+        let record = run_live_case(&trace, &deps).await.unwrap().record;
+        assert!(
+            record.tools_called.contains(&"echo".to_string()),
+            "echo must actually dispatch under an empty allowlist: {:?}",
+            record.tools_called
+        );
+        assert!(
+            record.all_tools_succeeded,
+            "the dispatched echo call must succeed: {record:?}"
+        );
+        let denied = record.history.iter().any(|msg| {
+            matches!(
+                msg,
+                ConversationMessage::ToolResults(results)
+                    if results
+                        .iter()
+                        .any(|r| r.content.to_ascii_lowercase().contains("denied"))
+            )
+        });
+        assert!(
+            !denied,
+            "echo must not be auto-denied by the approval gate: {:?}",
+            record.history
+        );
+    }
+
+    #[tokio::test]
+    async fn live_grading_reads_the_still_live_case_workspace() {
+        // Replaces `grades_run_while_workspace_alive`, which built its own
+        // TempDir and invoked a local `Probe` grader directly — never
+        // `grade_run`/`run_case`/`run_live_case` — so a change moving production
+        // grading after the runner's TempDir teardown would have left it green.
+        //
+        // This drives the real `run_live_case` path and asserts a *positive*
+        // end state: the production WorkspaceGrader must read setup content out
+        // of the runner's own per-case temp workspace. That can only pass while
+        // that workspace is still alive, so it is not satisfiable by a
+        // torn-down directory the way a `file_absent` check would be.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "workspace-liveness",
+                "turns": [{ "user_input": "hi" }],
+                "setup": { "workspace_files": { "seeded.txt": "SENTINEL-CONTENT" } },
+                "expects": {
+                    "workspace": {
+                        "file_exists": ["seeded.txt"],
+                        "file_contains": { "seeded.txt": ["SENTINEL-CONTENT"] }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let driver = r#"{"model_name":"driver","turns":[{"user_input":"","steps":[
+            {"response":{"type":"text","content":"done"}}
+        ]}]}"#;
+        let deps = live_deps(
+            move |_| Ok(driver_provider(driver)),
+            Vec::new(),
+            Duration::from_secs(5),
+        );
+
+        let grades = run_live_case(&trace, &deps).await.unwrap().grades;
+        let exists = grades
+            .iter()
+            .find(|g| g.check.starts_with("file_exists"))
+            .unwrap_or_else(|| panic!("expected a file_exists grade: {grades:?}"));
+        assert!(
+            exists.passed,
+            "the production grader must see the live case workspace: {exists:?}"
+        );
+        let contains = grades
+            .iter()
+            .find(|g| g.check.starts_with("file_contains"))
+            .unwrap_or_else(|| panic!("expected a file_contains grade: {grades:?}"));
+        assert!(
+            contains.passed,
+            "the production grader must read the live workspace's contents: {contains:?}"
         );
     }
 

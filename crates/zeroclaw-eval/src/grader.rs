@@ -452,44 +452,37 @@ mod tests {
     use crate::record::RunRecord;
 
     #[tokio::test]
-    async fn grades_run_while_workspace_alive() {
-        // A grader receives, through GradeContext, a workspace path that exists at
-        // grade time. `run_case` awaits `grade_run` before its `tmp` (TempDir)
-        // drops, so a workspace-aware grader always sees a live directory. The
-        // control below (drop, then re-check the same path) proves this exists()
-        // check is meaningful, not tautological: it flips to false once dropped.
-        struct Probe;
-        #[async_trait::async_trait]
-        impl Grader for Probe {
-            fn name(&self) -> &str {
-                "probe"
-            }
-            async fn grade(&self, _run: &RunRecord, ctx: &GradeContext<'_>) -> Vec<GradeResult> {
-                vec![GradeResult::new(
-                    "workspace_alive".to_string(),
-                    ctx.workspace.exists(),
-                    "",
-                    GradeCategory::SideEffect,
-                )]
-            }
-        }
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().to_path_buf();
-        let record = run("hi", &[], true);
-        let grades = Probe
-            .grade(&record, &GradeContext { workspace: &path })
-            .await;
-        assert!(grades[0].passed, "workspace must exist during grading");
+    async fn run_case_routes_grading_through_the_production_workspace_grader() {
+        // Boundary half of the workspace-liveness coverage: this goes through
+        // `run_case` (production) rather than constructing a local grader, so a
+        // future change that stops invoking the workspace grader from the runner
+        // fails here. The *liveness* half — that the workspace still exists when
+        // the grader reads it — needs a positive existence assertion and lives in
+        // `live::tests::live_grading_reads_the_still_live_case_workspace`, since
+        // replay's tool set cannot create a file to assert on.
+        let trace: crate::case::LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "workspace-boundary",
+                "turns": [{
+                    "user_input": "say hi",
+                    "steps": [{ "response": { "type": "text", "content": "done" } }]
+                }],
+                "expects": { "workspace": { "file_absent": ["never_created.txt"] } }
+            }"#,
+        )
+        .unwrap();
 
-        // Control: once the workspace drops, the same probe fails on the same path,
-        // so the assertion above is not vacuously true.
-        drop(tmp);
-        let after = Probe
-            .grade(&record, &GradeContext { workspace: &path })
-            .await;
+        let outcome = crate::runner::run_case(&trace, &crate::runner::RunDeps::replay())
+            .await
+            .unwrap();
+        let check = outcome
+            .grades
+            .iter()
+            .find(|g| g.check.starts_with("file_absent"))
+            .unwrap_or_else(|| panic!("expected a workspace grade: {:?}", outcome.grades));
         assert!(
-            !after[0].passed,
-            "probe must fail once the workspace is torn down"
+            check.passed,
+            "the production workspace grader must run from the runner: {check:?}"
         );
     }
 
