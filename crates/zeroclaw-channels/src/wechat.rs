@@ -3797,20 +3797,21 @@ mod tests {
         );
     }
 
-    /// Regression for the reviewer-flagged attachment-loss bug: a batch
-    /// carrying a text-plus-attachment message where the attachment
-    /// download fails retryably (a transient CDN 503) must not let
-    /// `next_cursor` commit. Delivering the text and moving the cursor
-    /// on would permanently drop the attachment, since a redelivered
-    /// message never happens without inbound dedup.
+    /// Invariant: a batch carrying a text-plus-attachment message whose
+    /// attachment download fails retryably (a transient CDN 503) must not
+    /// let `next_cursor` commit, and must publish nothing while held.
+    /// Delivering the bare text and moving the cursor on would permanently
+    /// drop the attachment, since a redelivered message never happens
+    /// without inbound dedup.
     ///
-    /// This drives an actual reload: after the first pass, a fresh
-    /// `WeChatChannel` is built from the persisted state dir exactly like
-    /// a supervised restart, and the CDN is made to succeed. The same
-    /// batch is re-fetched (because the cursor never advanced) and the
-    /// attachment is delivered.
+    /// Scope: SAME-PROCESS recovery. One long-lived listener stays up
+    /// across the failure and the CDN's recovery, so this covers the
+    /// held-then-recovered path plus the post-commit persistence a later
+    /// restart would read. It deliberately does NOT cover restart *while*
+    /// the cursor is still pending — that is
+    /// `listen_recovers_held_batch_after_restart_while_cursor_pending`.
     #[tokio::test]
-    async fn listen_holds_cursor_on_retryable_attachment_failure_and_recovers_after_reload() {
+    async fn listen_holds_cursor_on_retryable_attachment_failure_and_recovers_on_same_listener() {
         use wiremock::matchers::{body_partial_json, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -3952,13 +3953,202 @@ mod tests {
         );
     }
 
-    /// The reviewer-required multi-message staging regression: ordinary
-    /// text message A followed by message B whose attachment fails
-    /// retryably (CDN 503). While the batch is held, NOTHING may be
-    /// delivered — in particular A must not cross `tx.send`, or it would
-    /// start a fresh agent turn on every held re-poll. Once the CDN
-    /// recovers, A and B arrive exactly once, in order, with no
-    /// duplicates afterward.
+    /// The restart-while-cursor-pending regression required by #9187's
+    /// acceptance criteria, and the gap the same-process test above does
+    /// NOT cover: the process must be able to die *while the batch is
+    /// still held* and have a freshly constructed channel — built through
+    /// `WeChatChannel::new` from the persisted state dir, exactly like a
+    /// supervised restart — re-poll that batch and deliver it once.
+    ///
+    /// Pass 1 holds the batch (CDN 503) and the listener is aborted
+    /// before the cursor ever commits, so `sync.json` still carries the
+    /// pre-batch cursor. Pass 2 rebuilds from that file with a healthy
+    /// CDN and must re-fetch the identical batch, deliver it complete
+    /// exactly once, and only then commit. A regression in
+    /// `save_sync_data()` ordering, or in the reload constructor, breaks
+    /// this even though every same-process test stays green.
+    #[tokio::test]
+    async fn listen_recovers_held_batch_after_restart_while_cursor_pending() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        let mock_server = MockServer::start().await;
+
+        let attachment_batch = || {
+            getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([
+                    {
+                        "from_user_id": "user_a",
+                        "message_id": 1,
+                        "create_time_ms": 1_700_000_000_000u64,
+                        "item_list": [
+                            {"type": 1, "text_item": {"text": "hello"}},
+                            {
+                                "type": 2,
+                                "image_item": {
+                                    "media": {"encrypt_query_param": "enc_param_1"}
+                                }
+                            }
+                        ]
+                    }
+                ]),
+            )
+        };
+
+        // The server only replays a batch the client has not acknowledged:
+        // polling with the pre-batch cursor yields the batch, polling with
+        // the committed cursor yields nothing. That matcher is what makes
+        // "delivered exactly once" meaningful below.
+        async fn mount_getupdates(server: &MockServer, batch: serde_json::Value) {
+            Mock::given(method("POST"))
+                .and(path("/ilink/bot/getupdates"))
+                .and(body_partial_json(
+                    serde_json::json!({"get_updates_buf": "original_cursor"}),
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(batch))
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/ilink/bot/getupdates"))
+                .and(body_partial_json(
+                    serde_json::json!({"get_updates_buf": "cursor_after_batch"}),
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                    "cursor_after_batch",
+                    serde_json::json!([]),
+                )))
+                .mount(server)
+                .await;
+        }
+
+        // ---- pass 1: CDN down, batch held, killed before commit ----
+        mount_getupdates(&mock_server, attachment_batch()).await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&mock_server)
+            .await;
+
+        let ch = wechat_channel_for_mock_with_workspace(
+            state_dir.clone(),
+            workspace_dir.clone(),
+            mock_server.uri(),
+        );
+        *ch.cursor.lock() = "original_cursor".to_string();
+        ch.save_sync_data();
+        let ch = Arc::new(ch);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        let held = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await;
+        assert!(
+            held.is_err(),
+            "nothing may be delivered while the batch is held on a failing CDN"
+        );
+
+        // Kill the listener mid-hold — the crash/restart this test exists
+        // for. The cursor has NOT committed at this point.
+        handle.abort();
+        let _ = handle.await;
+        drop(rx);
+        drop(ch);
+
+        let pending = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            *pending.cursor.lock(),
+            "original_cursor",
+            "the held batch must leave the pre-batch cursor on disk, or a restart skips it"
+        );
+        drop(pending);
+
+        // ---- pass 2: restart from persisted state with a healthy CDN ----
+        mock_server.reset().await;
+        mount_getupdates(&mock_server, attachment_batch()).await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-image-bytes".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        // Built through the production constructor, which reloads the
+        // cursor from `sync.json`; the test never sets it by hand.
+        let restarted = Arc::new(wechat_channel_for_mock_with_workspace(
+            state_dir.clone(),
+            workspace_dir.clone(),
+            mock_server.uri(),
+        ));
+        assert_eq!(
+            *restarted.cursor.lock(),
+            "original_cursor",
+            "the restarted channel must resume from the persisted pending cursor"
+        );
+
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel(8);
+        let restart_ch = restarted.clone();
+        let handle2 = zeroclaw_spawn::spawn!(async move { restart_ch.listen(tx2).await });
+
+        let msg = tokio::time::timeout(Duration::from_secs(20), rx2.recv())
+            .await
+            .expect("timed out waiting for the held batch to be redelivered after restart")
+            .expect("channel closed before the held batch was redelivered");
+        assert_eq!(msg.sender, "user_a");
+        assert!(
+            msg.content.contains("[IMAGE:"),
+            "the restarted pass must carry the attachment, got: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains("hello"),
+            "the restarted pass must still carry the text, got: {}",
+            msg.content
+        );
+
+        let duplicate = tokio::time::timeout(Duration::from_secs(3), rx2.recv()).await;
+        assert!(
+            duplicate.is_err(),
+            "a batch recovered after restart must deliver exactly once"
+        );
+
+        handle2.abort();
+        let _ = handle2.await;
+        drop(rx2);
+        drop(restarted);
+
+        let committed = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            *committed.cursor.lock(),
+            "cursor_after_batch",
+            "the cursor must commit once the restarted pass delivers the batch in full"
+        );
+    }
+
+    /// Invariant: while a batch is held for a retryable attachment
+    /// failure, NOTHING may be delivered — in particular an ordinary text
+    /// message A that precedes the failing message B must not cross
+    /// `tx.send`, or it would start a fresh agent turn on every held
+    /// re-poll. Once the CDN recovers, A and B arrive exactly once, in
+    /// order, with no duplicates afterward.
     #[tokio::test]
     async fn listen_stages_whole_batch_before_publishing_any_message() {
         use wiremock::matchers::{body_partial_json, method, path};
