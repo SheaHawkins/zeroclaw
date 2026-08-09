@@ -5,7 +5,12 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// A complete LLM conversation trace loaded from a JSON fixture.
+///
+/// Unknown keys are rejected here too: misspelling `expects` deletes every
+/// assertion in the case, which is the same silent-green failure as
+/// misspelling a key inside it. See [`TraceExpects`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LlmTrace {
     /// Identifier for the trace (surfaced in reports).
     pub model_name: String,
@@ -28,6 +33,7 @@ pub struct LlmTrace {
 
 /// Pre-run environment preparation for a case.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaseSetup {
     /// Files written into the case's temp workspace before the run.
     /// Keys are workspace-relative paths; absolute paths and `..` are rejected.
@@ -40,6 +46,7 @@ pub struct CaseSetup {
 /// `steps` is optional: replay cases script every LLM round-trip, while live
 /// cases must omit them (the real provider produces the responses).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TraceTurn {
     pub user_input: String,
     #[serde(default)]
@@ -48,6 +55,7 @@ pub struct TraceTurn {
 
 /// A single LLM response step within a turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TraceStep {
     pub response: TraceResponse,
 }
@@ -76,6 +84,7 @@ pub enum TraceResponse {
 
 /// A tool call within a trace response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TraceToolCall {
     pub id: String,
     pub name: String,
@@ -83,7 +92,15 @@ pub struct TraceToolCall {
 }
 
 /// Declarative expectations for grading a run.
+///
+/// `deny_unknown_fields` is load-bearing: with the default Serde behaviour an
+/// unknown key such as `response_contians` is silently discarded, `grade_run`
+/// then returns no grades, and `CaseReport::passed` treats the empty iterator
+/// as true — so a typo in an assertion does not fail loudly, it deletes the
+/// assertion and the case reports green at 0/0. A deliberately empty
+/// `"expects": {}` block stays valid; only unknown keys fail.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TraceExpects {
     /// Substrings the final response must contain.
     #[serde(default)]
@@ -118,7 +135,10 @@ pub struct TraceExpects {
 }
 
 /// End-state checks against the case workspace after the run.
+///
+/// See [`TraceExpects`] for why unknown keys are rejected rather than ignored.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceExpects {
     /// Workspace-relative paths that must exist as a regular file after the run
     /// (a directory at the path does not satisfy the check).
@@ -135,7 +155,10 @@ pub struct WorkspaceExpects {
 
 /// Resource ceilings for the run (all optional; each present bound is one
 /// inclusive check, `actual <= max`).
+///
+/// See [`TraceExpects`] for why unknown keys are rejected rather than ignored.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BudgetExpects {
     /// Max accumulated input tokens reported by the provider.
     #[serde(default)]
@@ -361,5 +384,98 @@ mod tests {
         assert_eq!(suite[0].1.model_name, "a"); // sorted by path
         assert_eq!(suite[1].1.model_name, "b");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fixture whose only assertion is misspelled. Before
+    /// `deny_unknown_fields` this parsed happily, graded nothing, and reported
+    /// a green case at 0/0 checks.
+    const TYPO_FIXTURE: &str = r#"{
+        "model_name": "malformed-expectation",
+        "turns": [{"user_input": "hi", "steps": [
+            {"response": {"type": "text", "content": "hello"}}
+        ]}],
+        "expects": {"response_contians": ["hi"]}
+    }"#;
+
+    #[test]
+    fn trace_expects_rejects_unknown_key() {
+        let err = serde_json::from_str::<TraceExpects>(r#"{"response_contians":["hi"]}"#)
+            .expect_err("a misspelled expectation key must fail parsing, not delete the check");
+        assert!(
+            err.to_string().contains("response_contians"),
+            "the error must name the offending key, got: {err}"
+        );
+    }
+
+    #[test]
+    fn trace_rejects_unknown_key_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("malformed.json");
+        std::fs::write(&path, TYPO_FIXTURE).unwrap();
+        let err = LlmTrace::from_file(&path)
+            .expect_err("a fixture with a typo'd expectation key must fail to load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("malformed.json"),
+            "the error must name the fixture path, got: {msg}"
+        );
+        assert!(
+            msg.contains("response_contians"),
+            "the error must name the offending key, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn trace_expects_allows_empty_block() {
+        // Assertion-free smoke fixtures stay valid: only *unknown* keys fail.
+        let expects: TraceExpects = serde_json::from_str("{}").expect("empty expects must parse");
+        assert!(expects.response_contains.is_empty());
+        assert!(expects.max_tool_calls.is_none());
+
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{"model_name":"smoke","turns":[],"expects":{}}"#,
+        )
+        .expect("a trace with an empty expects block must parse");
+        assert!(trace.expects.tools_used.is_empty());
+    }
+
+    #[test]
+    fn load_suite_fails_on_malformed_expectation_fixture() {
+        // The suite aborts rather than quietly running a reduced set.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a_good.json"), r#"{"model_name":"good","turns":[]}"#)
+            .unwrap();
+        std::fs::write(dir.path().join("b_typo.json"), TYPO_FIXTURE).unwrap();
+        let err = load_suite(dir.path())
+            .expect_err("one malformed fixture must fail the whole suite load");
+        assert!(format!("{err:#}").contains("b_typo.json"));
+    }
+
+    #[test]
+    fn nested_expectation_structs_reject_unknown_keys() {
+        for (label, json, key) in [
+            (
+                "workspace",
+                r#"{"workspace":{"file_exsits":["a.txt"]}}"#,
+                "file_exsits",
+            ),
+            ("budget", r#"{"budget":{"max_tokens":10}}"#, "max_tokens"),
+        ] {
+            let err = serde_json::from_str::<TraceExpects>(json).expect_err(&format!(
+                "an unknown key in the nested {label} block must fail parsing"
+            ));
+            assert!(
+                err.to_string().contains(key),
+                "the {label} error must name {key}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_regression_fixtures_still_load() {
+        // Guard against the new strictness rejecting the fixtures in-tree.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals/regression");
+        let suite = load_suite(&dir).expect("shipped regression fixtures must still load");
+        assert!(!suite.is_empty());
     }
 }
