@@ -2054,32 +2054,6 @@ pub fn create_routed_model_provider_with_options(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn create_routed_model_provider_for_route_with_options(
-    config: &zeroclaw_config::schema::Config,
-    primary_name: &str,
-    api_key: Option<&str>,
-    api_url: Option<&str>,
-    reliability: &zeroclaw_config::schema::ReliabilityConfig,
-    model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
-    selected_route_hint: &str,
-    default_model: &str,
-    options: &ModelProviderRuntimeOptions,
-) -> anyhow::Result<Box<dyn ModelProvider>> {
-    create_routed_model_provider_with_options_and_live(
-        config,
-        primary_name,
-        api_key,
-        api_url,
-        reliability,
-        model_routes,
-        default_model,
-        options,
-        None,
-        Some(selected_route_hint),
-    )
-}
-
 /// Build a routed provider whose API-key pool is resolved from the shared
 /// canonical config before every request.
 pub fn create_routed_model_provider_with_live_config_options(
@@ -2114,42 +2088,6 @@ pub fn create_routed_model_provider_with_live_config_options(
         &options,
         Some(live_config),
         None,
-    )
-}
-
-pub fn create_routed_model_provider_with_live_config_for_route_options(
-    live_config: Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
-    primary_name: &str,
-    selected_route_hint: &str,
-    default_model: &str,
-) -> anyhow::Result<Box<dyn ModelProvider>> {
-    let config = live_config.read().clone();
-    let (api_key, api_url, options) = match primary_name.split_once('.') {
-        Some((family, alias)) => {
-            let entry = config.providers.models.find(family, alias).ok_or_else(|| {
-                anyhow::Error::msg(format!(
-                    "live model_provider `{primary_name}` no longer resolves"
-                ))
-            })?;
-            (
-                entry.api_key.as_deref(),
-                entry.uri.as_deref(),
-                provider_runtime_options_for_alias(&config, family, alias),
-            )
-        }
-        None => (None, None, ModelProviderRuntimeOptions::default()),
-    };
-    create_routed_model_provider_with_options_and_live(
-        &config,
-        primary_name,
-        api_key,
-        api_url,
-        &config.reliability,
-        &config.model_routes,
-        default_model,
-        &options,
-        Some(live_config),
-        Some(selected_route_hint),
     )
 }
 
