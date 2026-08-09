@@ -7778,6 +7778,83 @@ mod tests {
         handle.abort();
     }
 
+    /// The source region of `process_update`'s `callback_query` arm that
+    /// builds the acknowledgement text, delimited by the `answer_text`
+    /// binding and the `answer_body` that consumes it.
+    ///
+    /// Read from the compiled-in source so the assertion tracks the file
+    /// rather than a copy that can drift.
+    fn callback_ack_source_region() -> &'static str {
+        const SRC: &str = include_str!("telegram.rs");
+        let start = SRC
+            .find("let answer_text = match action {")
+            .expect("callback ack arm: `let answer_text = match action {` not found");
+        let rest = &SRC[start..];
+        let end = rest
+            .find("let answer_body")
+            .expect("callback ack arm: `let answer_body` terminator not found");
+        &rest[..end]
+    }
+
+    /// Companion to `listen_callback_approval_ack_uses_fluent_catalogue`.
+    ///
+    /// That test proves the ack text *resolves* through the catalogue, but it
+    /// runs under whatever locale the test process picks — and `i18n`'s
+    /// `LOCALE` is a process-wide `OnceLock` a test cannot re-set. Under `en`
+    /// the catalogue value and the English literal are byte-identical, so a
+    /// behavioural assertion alone cannot distinguish
+    /// `get_required_cli_string("...-denied")` from `"Denied"`. It catches a
+    /// wrong or missing key; it does not catch a literal.
+    ///
+    /// This closes that specific hole at the source level: every arm of the
+    /// ack `match` must go through `i18n::get_required_cli_string`, and no
+    /// arm may carry a bare English literal. Together the two tests give the
+    /// blocker the coverage Audacity88 asked for — a future move of this
+    /// block cannot silently re-hard-code the strings.
+    #[test]
+    fn callback_ack_arms_are_all_catalogue_lookups() {
+        let region = callback_ack_source_region();
+
+        for key in [
+            "channel-telegram-approval-ack-approved",
+            "channel-telegram-approval-ack-always-approved",
+            "channel-telegram-approval-ack-denied",
+            "channel-telegram-approval-ack-unknown",
+        ] {
+            assert!(
+                region.contains(&format!(
+                    "i18n::get_required_cli_string(\n                            \"{key}\"\n"
+                )) || region.contains(&format!("i18n::get_required_cli_string(\"{key}\")")),
+                "ack arm for `{key}` must be a Fluent catalogue lookup, not a literal"
+            );
+        }
+
+        // Exactly four arms, exactly four lookups: an arm added or converted
+        // to a literal breaks this.
+        assert_eq!(
+            region.matches("i18n::get_required_cli_string").count(),
+            4,
+            "every arm of the ack match must resolve through the Fluent catalogue"
+        );
+
+        // #9517's regression in literal form: no bare English ack word may
+        // appear in this region (the emoji prefixes are protocol, not prose).
+        for literal in [
+            "\"Approved\"",
+            "\"Always approved\"",
+            "\"Denied\"",
+            "\"Unknown action\"",
+            "❌ Denied",
+            "✅ Approved",
+        ] {
+            assert!(
+                !region.contains(literal),
+                "hard-coded English ack text `{literal}` reappeared in the callback arm; \
+                 #9517 localized these through the Fluent catalogue"
+            );
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // Live e2e: voice transcription via Groq Whisper + reply cache lookup
     // ─────────────────────────────────────────────────────────────────────
