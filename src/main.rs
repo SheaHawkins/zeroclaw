@@ -5316,23 +5316,28 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let suite_dir = suite.unwrap_or_else(|| config.eval.suite_dir.clone());
                 let mode: zeroclaw_eval::Mode =
                     mode.unwrap_or_else(|| config.eval.mode.clone()).parse()?;
-                let report =
+                let (report, artifacts) =
                     commands::eval::run(&config, std::path::PathBuf::from(suite_dir), mode).await?;
                 commands::eval::print_report(&report, format);
+                // Dumps land in this run's own staging dir; it becomes `last-run`
+                // only after the run completes, so `eval-last-run` never resolves
+                // to a mix of two runs.
                 let wrote_auto = commands::eval::write_dumps(
                     &report,
                     dump_records.as_deref().map(std::path::Path::new),
-                    std::path::Path::new(commands::eval::AUTO_DUMP_DIR),
+                    &artifacts.staged,
                 )?;
+                let published = artifacts.publish()?;
                 // Footer is a table affordance only; never emit it in JSON mode, or
                 // it would corrupt the machine-readable stdout artifact.
                 if wrote_auto && format == commands::eval::OutputFormat::Table {
+                    let dir = published.display().to_string();
                     println!(
                         "{}",
                         ta(
                             "cli-eval-failed-case-records",
-                            &[("dir", commands::eval::AUTO_DUMP_DIR)],
-                            &format!("  failed-case records: {}/", commands::eval::AUTO_DUMP_DIR),
+                            &[("dir", dir.as_str())],
+                            &format!("  failed-case records: {dir}/"),
                         )
                     );
                 }
