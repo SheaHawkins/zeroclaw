@@ -176,14 +176,20 @@ fn quickstart_row(key: &str, glyph: &str, summary: &str) -> String {
 }
 
 #[cfg(feature = "agent-runtime")]
-const QUICKSTART_SELECTOR_MIN_WIDTH: usize = 3;
+const QUICKSTART_SELECTOR_MIN_WIDTH: usize = 20;
+
+#[cfg(feature = "agent-runtime")]
+const QUICKSTART_SELECTOR_ROW_OVERHEAD: usize = 3;
 
 #[cfg(feature = "agent-runtime")]
 const QUICKSTART_SELECTOR_VERTICAL_OVERHEAD: usize = 2;
 
 #[cfg(feature = "agent-runtime")]
 fn quickstart_selector_row_budget(terminal_width: usize) -> Option<usize> {
-    terminal_width.checked_sub(QUICKSTART_SELECTOR_MIN_WIDTH)
+    if terminal_width < QUICKSTART_SELECTOR_MIN_WIDTH {
+        return None;
+    }
+    terminal_width.checked_sub(QUICKSTART_SELECTOR_ROW_OVERHEAD)
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -8489,11 +8495,35 @@ mod tests {
     #[cfg(feature = "agent-runtime")]
     #[test]
     fn quickstart_selector_budget_rejects_unsafe_terminal_widths() {
-        assert_eq!(quickstart_selector_row_budget(0), None);
-        assert_eq!(quickstart_selector_row_budget(1), None);
-        assert_eq!(quickstart_selector_row_budget(2), None);
-        assert_eq!(quickstart_selector_row_budget(3), Some(0));
-        assert_eq!(quickstart_selector_row_budget(4), Some(1));
+        assert!(
+            (0..QUICKSTART_SELECTOR_MIN_WIDTH)
+                .all(|width| quickstart_selector_row_budget(width).is_none())
+        );
+        assert_eq!(quickstart_selector_row_budget(20), Some(17));
+        assert_eq!(quickstart_selector_row_budget(21), Some(18));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_minimum_width_keeps_actions_identifiable() {
+        let budget = quickstart_selector_row_budget(QUICKSTART_SELECTOR_MIN_WIDTH).unwrap();
+        let rows = [
+            ("[ ] Model provider — not yet chosen", "[ ] Model"),
+            ("[ ] Risk profile — not yet chosen", "[ ] Risk"),
+            ("[ ] Memory — not yet chosen", "[ ] Memory"),
+            ("[ ] Channels (0) — not yet chosen", "[ ] Channels"),
+            ("[ ] Peer groups — not yet chosen", "[ ] Peer"),
+            ("[ ] Agent identity — not yet chosen", "[ ] Agent"),
+            ("── Create agent", "── Create"),
+        ];
+
+        for (row, identifiable_prefix) in rows {
+            let fitted = fit_quickstart_selector_row(row, budget);
+            assert!(
+                fitted.starts_with(identifiable_prefix),
+                "{fitted:?} does not identify {row:?}"
+            );
+        }
     }
 
     #[cfg(feature = "agent-runtime")]
@@ -8522,7 +8552,7 @@ mod tests {
             "Open a selector\nwithout adding a physical terminal row.",
         ];
 
-        for terminal_width in [3, 4, 20, 40, 80] {
+        for terminal_width in [20, 40, 80] {
             let budget = quickstart_selector_row_budget(terminal_width).unwrap();
             for prompt in prompts {
                 let fitted = fit_quickstart_selector_row(prompt, budget);
