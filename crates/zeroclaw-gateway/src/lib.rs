@@ -2846,6 +2846,42 @@ fn authorize_webhook_request(
     })
 }
 
+/// Build an injective storage key for the replay/idempotency store.
+///
+/// Both the namespace (derived from a caller-controlled SOP path) and the
+/// caller's `X-Idempotency-Key` are attacker-controlled strings, so a bare
+/// `"{namespace}:{key}"` join is ambiguous: `/sop/a` with key `b:c` produced
+/// the same string as `/sop/a:b` with key `c`, and a `/webhook` caller could
+/// forge the key `sop:/sop/deploy:k` to collide with `/sop/deploy` key `k`.
+/// An authenticated caller could therefore suppress a *different* attempt
+/// despite the documented per-path and per-endpoint isolation.
+///
+/// This encoding is injective because every component is length-prefixed:
+/// a reader consumes exactly the declared number of bytes, so no component
+/// boundary can be forged by embedding the separator inside a component. The
+/// endpoint domain tag is carried as its own component, so `/webhook` keys can
+/// never alias `/sop/*` keys.
+fn idempotency_storage_key(namespace: Option<&str>, idempotency_key: &str) -> String {
+    fn push_component(out: &mut String, value: &str) {
+        // `<byte-len>:<value>` — the length prefix makes the split point
+        // unambiguous regardless of what `value` contains.
+        out.push_str(&value.len().to_string());
+        out.push(':');
+        out.push_str(value);
+    }
+
+    let mut key = String::new();
+    match namespace {
+        Some(namespace) => {
+            push_component(&mut key, "ns");
+            push_component(&mut key, namespace);
+        }
+        None => push_component(&mut key, "global"),
+    }
+    push_component(&mut key, idempotency_key);
+    key
+}
+
 fn check_webhook_idempotency(
     state: &AppState,
     headers: &HeaderMap,
@@ -2856,9 +2892,7 @@ fn check_webhook_idempotency(
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
-    let storage_key = namespace
-        .map(|namespace| format!("{namespace}:{idempotency_key}"))
-        .unwrap_or_else(|| idempotency_key.to_string());
+    let storage_key = idempotency_storage_key(namespace, idempotency_key);
     if state.idempotency_store.record_if_new(&storage_key) {
         return None;
     }
@@ -6916,6 +6950,133 @@ path = "{trigger_path}"
             "the decision must depend only on the verdict, never on live state"
         );
         assert!(!before, "an unconfigured snapshot must fail closed");
+    }
+
+    /// B2: the replay-domain encoding must be injective. Every one of these
+    /// pairs collides under the old `format!("{namespace}:{key}")` join, which
+    /// let an authenticated caller suppress a *different* attempt.
+    #[test]
+    fn idempotency_storage_key_encoding_is_injective() {
+        // Adversarial cross-path: `/sop/a` + `b:c` vs `/sop/a:b` + `c`.
+        assert_ne!(
+            idempotency_storage_key(Some("sop:/sop/a"), "b:c"),
+            idempotency_storage_key(Some("sop:/sop/a:b"), "c"),
+            "a caller must not shift bytes across the namespace/key boundary"
+        );
+        // `/webhook` (global domain) vs `/sop/*`: a forged caller key must not
+        // alias a namespaced SOP key.
+        assert_ne!(
+            idempotency_storage_key(None, "sop:/sop/deploy:k"),
+            idempotency_storage_key(Some("sop:/sop/deploy"), "k"),
+            "/webhook keys must never collide with /sop/* keys"
+        );
+        // Empty-component edge cases stay distinct too.
+        assert_ne!(
+            idempotency_storage_key(Some(""), "x"),
+            idempotency_storage_key(Some("x"), ""),
+        );
+        // The encoding is still deterministic and path-discriminating.
+        assert_eq!(
+            idempotency_storage_key(Some("sop:/sop/deploy"), "k"),
+            idempotency_storage_key(Some("sop:/sop/deploy"), "k"),
+        );
+        assert_ne!(
+            idempotency_storage_key(Some("sop:/sop/deploy"), "k"),
+            idempotency_storage_key(Some("sop:/sop/rollback"), "k"),
+            "distinct SOP paths must remain distinct",
+        );
+    }
+
+    /// B2 end-to-end: two different SOP paths whose `(path, key)` pairs collide
+    /// under the old join must both dispatch. `/sop/a` with `X-Idempotency-Key:
+    /// b:c` and `/sop/a:b` with key `c` are genuinely different requests.
+    #[tokio::test]
+    async fn sop_idempotency_resists_adversarial_cross_path_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _provider) = webhook_two_sop_state(&tmp, "/sop/a", "/sop/a:b");
+        let (state, secret) = with_webhook_secret(state);
+        let mut headers = webhook_secret_header(&secret);
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("b:c"));
+        let mut second_headers = webhook_secret_header(&secret);
+        second_headers.insert("X-Idempotency-Key", HeaderValue::from_static("c"));
+
+        let first = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("a".to_string()),
+            headers,
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_parsed: serde_json::Value =
+            serde_json::from_slice(&first.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(first_parsed["status"], "accepted");
+
+        let second = api_sop_webhook::handle_sop_webhook(
+            State(state),
+            test_connect_info(),
+            axum::extract::Path("a:b".to_string()),
+            second_headers,
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_parsed: serde_json::Value =
+            serde_json::from_slice(&second.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(
+            second_parsed["status"], "accepted",
+            "a colliding-by-concatenation key must not suppress a different SOP path"
+        );
+    }
+
+    /// B2 end-to-end across endpoints: a `/webhook` caller who forges the SOP
+    /// namespace prefix into their own key must not reserve the `/sop/deploy`
+    /// replay slot and suppress the real SOP request.
+    #[tokio::test]
+    async fn webhook_forged_namespace_key_cannot_suppress_sop_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _provider) = webhook_two_sop_state(&tmp, "/webhook", "/sop/deploy");
+        let (state, secret) = with_webhook_secret(state);
+
+        // `/webhook` caller forges the `/sop/deploy` storage key.
+        let mut forged = webhook_secret_header(&secret);
+        forged.insert(
+            "X-Idempotency-Key",
+            HeaderValue::from_static("sop:/sop/deploy:k"),
+        );
+        let chat = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            forged,
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(chat.status(), StatusCode::OK);
+
+        // The genuine `/sop/deploy` request with key `k` must still dispatch.
+        let mut sop_headers = webhook_secret_header(&secret);
+        sop_headers.insert("X-Idempotency-Key", HeaderValue::from_static("k"));
+        let sop = api_sop_webhook::handle_sop_webhook(
+            State(state),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            sop_headers,
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(sop.status(), StatusCode::OK);
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&sop.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(
+            parsed["status"], "accepted",
+            "a forged /webhook key must not reserve a /sop/* replay slot"
+        );
     }
 
     #[tokio::test]
