@@ -71,6 +71,90 @@ tokio::task_local! {
     static TEST_PRE_RUN_BLOCK: Duration;
 }
 
+/// The outcome of [`supervise_wall_clock`] when the deadline expires first.
+///
+/// Deliberately NOT named `Cancelled`: reaching this variant means the
+/// supervised work was **abandoned**, not preempted. See
+/// [`supervise_wall_clock`] for the full contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Abandoned;
+
+impl std::fmt::Display for Abandoned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("supervised operation exceeded its wall-clock deadline and was abandoned")
+    }
+}
+
+/// Runs `f` under a **wall-clock** deadline that does not depend on `f` ever
+/// yielding, and returns `Err(Abandoned)` once `deadline` elapses.
+///
+/// # Why this exists
+///
+/// The obvious shape — `tokio::time::timeout(d, zeroclaw_spawn::spawn!(f))` —
+/// is only a *cooperative* bound. `zeroclaw_spawn::spawn!` expands to
+/// `tokio::spawn` (`crates/zeroclaw-spawn/src/lib.rs`), so the child task and
+/// the parent timer share one worker pool. A section of `f` that blocks
+/// without yielding (the PostgreSQL memory backend spawns an initializer
+/// thread and immediately `join()`s it while it connects, migrates and
+/// initializes schema; `AuditedMemory::purge_session` performs a synchronous
+/// SQLite `execute` under a mutex before its first await) occupies a worker.
+/// If the runtime has one worker, or concurrent cron runs occupy all of them,
+/// no worker is left to poll the timer, the elapsed branch never runs, and the
+/// scheduler's `release_job` stays unreachable — so `locked_at` is pinned until
+/// the daemon restarts. `AbortHandle::abort` does not help: it is cooperative
+/// and cannot preempt a future that is already executing synchronously.
+///
+/// This helper moves `f` off the shared worker pool entirely. It is driven by
+/// `Handle::block_on` on a thread from the blocking pool, so however long `f`
+/// blocks, it blocks a thread that no timer depends on. The caller stays parked
+/// on a `oneshot` receiver, whose timer is polled by the ordinary worker pool.
+///
+/// # Cancellation semantics — abandonment, not preemption
+///
+/// On `Err(Abandoned)` the underlying operation **may still be running**. There
+/// is no way to preempt a thread that is blocked inside synchronous code, and
+/// this function deliberately does not pretend otherwise. It guarantees only
+/// that *the caller* is released at the deadline so it can persist state and
+/// drop its lock. Callers must therefore treat supervised work as abandoned:
+/// safe to walk away from, not known to have stopped. Every cron use is
+/// either idempotent-per-run (the isolated purge targets a per-run session key)
+/// or already best-effort (announcement delivery), so an abandoned operation
+/// that later completes cannot corrupt a subsequent run.
+///
+/// Use this — never a bare `spawn!` + `timeout` — for any deadline that is
+/// documented to operators as a hard bound.
+pub(crate) async fn supervise_wall_clock<T, F>(deadline: Duration, f: F) -> Result<T, Abandoned>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::runtime::Handle::current();
+    // `spawn_blocking` is the right pool precisely because `f` is expected to
+    // be able to block: blocking-pool threads are never used to poll timers,
+    // and the pool grows on demand, so a blocked supervised op cannot starve
+    // either this caller or a concurrent supervised op.
+    let worker = tokio::task::spawn_blocking(move || {
+        // Result ignored: an `Err` here just means the caller already hit the
+        // deadline and dropped the receiver. Nothing left to report to.
+        let _ = tx.send(handle.block_on(f));
+    });
+
+    match time::timeout(deadline, rx).await {
+        Ok(Ok(value)) => Ok(value),
+        // The worker thread died (panicked) without sending. Not a deadline
+        // breach; surfaced as abandonment so callers keep one error path.
+        Ok(Err(_)) => Err(Abandoned),
+        Err(_) => {
+            // Do NOT join `worker`: it may be blocked indefinitely, which is
+            // the whole reason this function exists. Detaching is what makes
+            // the deadline real, and is why the contract is "abandoned".
+            drop(worker);
+            Err(Abandoned)
+        }
+    }
+}
+
 /// The deadline applied to announcement delivery while the job claim is held.
 fn delivery_timeout() -> Duration {
     #[cfg(test)]
@@ -186,35 +270,29 @@ pub async fn deliver_and_classify_run_result(
     let mut status = if success { "ok" } else { "error" }.to_string();
 
     // Bound delivery: this future is awaited while the scheduler still holds
-    // the job's in-flight claim (see `CRON_DELIVERY_TIMEOUT`). It runs on its
-    // own task for the same reason the agent run does — a `DeliveryFn` that
-    // blocks before its first await (DNS resolution, a synchronous client
-    // build) would starve an inline timer and defeat the deadline. A stalled
-    // send is then classified exactly like any other delivery failure, so
-    // `best_effort` still decides whether the run degrades or errors.
+    // the job's in-flight claim (see `CRON_DELIVERY_TIMEOUT`). It goes through
+    // the shared `supervise_wall_clock` boundary for the same reason the agent
+    // run does — a `DeliveryFn` that blocks before its first await (DNS
+    // resolution, a synchronous client build) would starve a same-runtime
+    // timer and defeat the deadline. A stalled send is then classified exactly
+    // like any other delivery failure, so `best_effort` still decides whether
+    // the run degrades or errors.
     let delivery_result = {
         let d_config = config.clone();
         let d_job = job.clone();
         let d_output = output.clone();
         let deadline = delivery_timeout();
-        let handle = ::zeroclaw_spawn::spawn!(async move {
+        match supervise_wall_clock(deadline, async move {
             deliver_if_configured(&d_config, &d_job, &d_output).await
-        });
-        let abort = handle.abort_handle();
-        match time::timeout(deadline, handle).await {
-            Ok(Ok(res)) => res,
-            Ok(Err(join_err)) => Err(anyhow::Error::msg(format!(
-                "delivery task failed to complete: {join_err}"
+        })
+        .await
+        {
+            Ok(res) => res,
+            // Abandoned so the send cannot outlive the claim it was blocking;
+            // the run result is still recorded and released.
+            Err(Abandoned) => Err(anyhow::Error::msg(format!(
+                "delivery exceeded {deadline:?} deadline while the job lock was held; abandoned"
             ))),
-            Err(_) => {
-                // Abandon the send so it cannot outlive the claim it was
-                // blocking; the run result is still recorded and released.
-                abort.abort();
-                Err(anyhow::Error::msg(format!(
-                    "delivery exceeded {:?} deadline while the job lock was held; abandoned",
-                    deadline
-                )))
-            }
         }
     };
 
@@ -1020,24 +1098,27 @@ async fn run_agent_job_with_timeout(
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
-            // Run the agent on its OWN task rather than inline under
-            // `time::timeout`. A timer can only fire when the future holding it
-            // yields, and `agent::run` performs synchronous setup before its
-            // first await point: the PostgreSQL memory backend spawns an
-            // initializer thread and immediately `join()`s it while that thread
-            // connects, initializes schema, and runs migrations (see
-            // `PostgresMemory::initialize_client`). Inline, that work happens
-            // inside a single poll, so neither the timeout arm nor the
-            // subsequent `release_job` could run and the advertised wall-clock
-            // deadline would silently depend on the agent future cooperating.
+            // Supervise the run deadline from a boundary that a non-yielding
+            // poll cannot occupy. `agent::run` performs synchronous setup
+            // before its first await point: the PostgreSQL memory backend
+            // spawns an initializer thread and immediately `join()`s it while
+            // that thread connects, initializes schema, and runs migrations
+            // (see `PostgresMemory::initialize_client`), and
+            // `connect_timeout_secs` defaults to `None`.
             //
-            // Spawning moves that blocking stretch onto a worker thread, and
-            // leaves this task parked on `timeout` + `JoinHandle` — a boundary
-            // whose timer stays schedulable no matter what the run does. On
-            // timeout we abort the handle so the abandoned run cannot keep
-            // using the runtime after the deadline.
-            // Read outside the spawn: task-locals are not inherited by
-            // spawned tasks.
+            // Neither an inline `timeout` nor `spawn!` + `timeout` bounds that:
+            // `spawn!` is a bare `tokio::spawn`, so parent timer and child run
+            // share the worker pool, and with one worker (or all workers busy
+            // with concurrent cron runs) nothing is left to poll the timeout
+            // arm — `release_job` below stays unreachable and `locked_at` is
+            // pinned until restart. `supervise_wall_clock` drives the run on
+            // the blocking pool instead, so the deadline holds no matter what
+            // the run does. Its contract is abandonment, not preemption: a
+            // timed-out run may still be executing, which is safe here because
+            // the Isolated session key is unique per run and the completion
+            // state is persisted by this task, not by the abandoned one.
+            // Read outside the supervised future: task-locals are not
+            // inherited across spawn boundaries.
             #[cfg(test)]
             let pre_run_block = TEST_PRE_RUN_BLOCK.try_with(|d| *d).ok();
             let run_alias = agent_alias.to_string();
@@ -1046,7 +1127,8 @@ async fn run_agent_job_with_timeout(
                 .and_then(|e| e.temperature);
             let run_session_path = session_path.clone();
             let run_allowed_tools = job.allowed_tools.clone();
-            let handle = ::zeroclaw_spawn::spawn!(
+            let supervised = supervise_wall_clock(
+                timeout,
                 async move {
                     #[cfg(test)]
                     if let Some(d) = pre_run_block {
@@ -1068,21 +1150,14 @@ async fn run_agent_job_with_timeout(
                     ))
                     .await
                 }
-                .instrument(subagent_span)
-            );
-            let abort = handle.abort_handle();
+                .instrument(subagent_span),
+            )
+            .await;
 
-            match time::timeout(timeout, handle).await {
-                // The run task completed on its own; unwrap the join layer.
-                Ok(Ok(run_result)) => run_result,
-                // The run task panicked or was aborted. Surface it as a
-                // non-timeout failure so the retry classifier treats it like
-                // any other run error rather than as a deadline breach.
-                Ok(Err(join_err)) => Err(anyhow::Error::msg(format!(
-                    "agent run task failed to complete: {join_err}"
-                ))),
-                Err(_) => {
-                    abort.abort();
+            match supervised {
+                // The run completed within its deadline.
+                Ok(run_result) => run_result,
+                Err(Abandoned) => {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
