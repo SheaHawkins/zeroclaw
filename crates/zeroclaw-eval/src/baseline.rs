@@ -96,9 +96,20 @@ impl Baseline {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
     }
 
-    /// Parse a baseline from JSON text.
+    /// Parse a baseline from JSON text, rejecting an unrecognized schema tag.
+    ///
+    /// Accepting any JSON would silently honour a stale or unrelated baseline —
+    /// its per-case verdicts would drive regression gating even though its
+    /// entry shape is not this format's.
     pub fn from_json(text: &str) -> anyhow::Result<Baseline> {
-        Ok(serde_json::from_str(text)?)
+        let baseline: Baseline = serde_json::from_str(text)?;
+        if baseline.schema != BASELINE_SCHEMA {
+            anyhow::bail!(
+                "unrecognized baseline schema {:?} (expected {BASELINE_SCHEMA:?}); regenerate the baseline with --write-baseline",
+                baseline.schema
+            );
+        }
+        Ok(baseline)
     }
 }
 
@@ -328,6 +339,43 @@ mod tests {
 
     fn baseline_of(current: &SuiteReport) -> Baseline {
         Baseline::from_report(current)
+    }
+
+    /// A stale or unrelated baseline must not silently drive regression gating.
+    #[test]
+    fn from_json_rejects_an_unrecognized_schema() {
+        let baseline = baseline_of(&SuiteReport {
+            cases: vec![case(
+                "a",
+                vec![grade("c", true, GradeCategory::Response)],
+                10,
+            )],
+        });
+        let stale = baseline
+            .to_json()
+            .replace(BASELINE_SCHEMA, "zeroclaw-eval/baseline/v0");
+        let err = Baseline::from_json(&stale)
+            .expect_err("a foreign baseline schema must not be honoured");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("zeroclaw-eval/baseline/v0") && rendered.contains(BASELINE_SCHEMA),
+            "error must name both the found and expected schema, got: {rendered}"
+        );
+    }
+
+    /// The current schema still round-trips.
+    #[test]
+    fn from_json_accepts_the_current_schema() {
+        let baseline = baseline_of(&SuiteReport {
+            cases: vec![case(
+                "a",
+                vec![grade("c", true, GradeCategory::Response)],
+                10,
+            )],
+        });
+        let parsed = Baseline::from_json(&baseline.to_json()).expect("round-trip must succeed");
+        assert_eq!(parsed.schema, BASELINE_SCHEMA);
+        assert_eq!(parsed.entries.len(), 1);
     }
 
     #[test]
