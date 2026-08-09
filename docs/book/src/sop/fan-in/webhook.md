@@ -34,11 +34,32 @@ fires for `POST /sop/deploy`, but not for `/sop/deploy/` or
 the event topic and the canonical JSON body becomes its payload. Invalid JSON
 returns `400`.
 
+Send every control that is configured. With `gateway.require_pairing = true`
+*and* `gateway.webhook_secret` set — the configuration shown below — a complete
+request carries both:
+
 ```bash
 curl -X POST http://127.0.0.1:42617/sop/deploy \
   -H 'Authorization: Bearer <paired-token>' \
+  -H 'X-Webhook-Secret: <gateway.webhook_secret>' \
   -H 'Content-Type: application/json' \
   -H 'X-Idempotency-Key: deploy-2026-07-20-001' \
+  -d '{"revision":"abc123"}'
+```
+
+When only one control is configured, send only that one:
+
+```bash
+# gateway.webhook_secret set, pairing not required
+curl -X POST http://127.0.0.1:42617/sop/deploy \
+  -H 'X-Webhook-Secret: <gateway.webhook_secret>' \
+  -H 'Content-Type: application/json' \
+  -d '{"revision":"abc123"}'
+
+# gateway.require_pairing = true, no webhook secret configured
+curl -X POST http://127.0.0.1:42617/sop/deploy \
+  -H 'Authorization: Bearer <paired-token>' \
+  -H 'Content-Type: application/json' \
   -d '{"revision":"abc123"}'
 ```
 
@@ -61,6 +82,15 @@ when pairing is required, send a valid `Authorization: Bearer <paired-token>`;
 when `gateway.webhook_secret` is set, send its exact value in
 `X-Webhook-Secret`; when both are configured, send both.
 
+The credential policy is read **once per request**. Authorization captures an
+immutable snapshot of which controls are configured and which of them the
+request satisfied, and the SOP dispatch gate decides from that snapshot alone.
+A configuration change that lands while a request is in flight therefore cannot
+mix two security states inside one request: a request that presented no
+credential is never admitted because a secret was added mid-flight, and a
+request bearing a retired secret is never admitted because its replacement is
+present. Rotation takes effect at next-request granularity.
+
 ```toml
 [gateway]
 webhook_secret = "replace-with-a-random-secret"
@@ -82,7 +112,10 @@ request retains the existing chat fallback policy.
 Optional `X-Idempotency-Key` replay protection is namespaced per SOP path, not
 just per endpoint family: the same key sent to two different SOP paths (e.g.
 `/sop/deploy` then `/sop/rollback`) is treated as two distinct requests, and
-`/sop/*` keys never collide with `/webhook` keys. HTTP delivery is
+`/sop/*` keys never collide with `/webhook` keys. The stored key is a
+length-prefixed encoding of the endpoint domain, the path namespace, and the
+caller key, so it is injective: no caller-controlled value can be crafted to
+land on another path's or another endpoint's replay slot. HTTP delivery is
 at-most-once by attempt: the key is reserved before dispatch, so a race such
 as SOP unload between matching and dispatch may consume the key without
 starting a run. A duplicate response therefore says that a prior request
