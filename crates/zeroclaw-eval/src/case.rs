@@ -559,8 +559,8 @@ mod tests {
         let dir = std::env::temp_dir().join("zeroclaw_eval_case_suite_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("b.json"), &asserting_fixture("b")).unwrap();
-        std::fs::write(dir.join("a.json"), &asserting_fixture("a")).unwrap();
+        std::fs::write(dir.join("b.json"), asserting_fixture("b")).unwrap();
+        std::fs::write(dir.join("a.json"), asserting_fixture("a")).unwrap();
         std::fs::write(dir.join("note.txt"), "ignored").unwrap();
         let suite = load_suite(&dir).unwrap();
         assert_eq!(suite.len(), 2); // the .txt file is ignored
@@ -635,8 +635,8 @@ mod tests {
     #[test]
     fn load_suite_rejects_duplicate_case_ids() {
         let dir = suite_dir("zeroclaw_eval_case_dup_id_test");
-        std::fs::write(dir.join("a_failing.json"), &asserting_fixture("duplicate")).unwrap();
-        std::fs::write(dir.join("b_passing.json"), &asserting_fixture("duplicate")).unwrap();
+        std::fs::write(dir.join("a_failing.json"), asserting_fixture("duplicate")).unwrap();
+        std::fs::write(dir.join("b_passing.json"), asserting_fixture("duplicate")).unwrap();
         let err = load_suite(&dir).expect_err("duplicate case ids must not load");
         let rendered = format!("{err:#}");
         assert!(
@@ -655,7 +655,7 @@ mod tests {
     #[test]
     fn load_suite_rejects_empty_case_id() {
         let dir = suite_dir("zeroclaw_eval_case_empty_id_test");
-        std::fs::write(dir.join("blank.json"), &asserting_fixture("")).unwrap();
+        std::fs::write(dir.join("blank.json"), asserting_fixture("")).unwrap();
         let err = load_suite(&dir).expect_err("an empty case id must not load");
         let rendered = format!("{err:#}");
         assert!(
@@ -670,7 +670,7 @@ mod tests {
     #[test]
     fn load_suite_rejects_whitespace_only_effective_id() {
         let dir = suite_dir("zeroclaw_eval_case_ws_id_test");
-        std::fs::write(dir.join("ws.json"), &asserting_fixture("   ")).unwrap();
+        std::fs::write(dir.join("ws.json"), asserting_fixture("   ")).unwrap();
         let err = load_suite(&dir).expect_err("a whitespace-only case id must not load");
         assert!(format!("{err:#}").contains("empty case id"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -680,8 +680,8 @@ mod tests {
     #[test]
     fn load_suite_accepts_distinct_case_ids() {
         let dir = suite_dir("zeroclaw_eval_case_ok_id_test");
-        std::fs::write(dir.join("a.json"), &asserting_fixture("a")).unwrap();
-        std::fs::write(dir.join("b.json"), &asserting_fixture("b")).unwrap();
+        std::fs::write(dir.join("a.json"), asserting_fixture("a")).unwrap();
+        std::fs::write(dir.join("b.json"), asserting_fixture("b")).unwrap();
         assert_eq!(load_suite(&dir).unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
