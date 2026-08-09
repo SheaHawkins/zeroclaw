@@ -3680,7 +3680,24 @@ mod tests {
 
         assert_eq!(
             &*capture.lock().expect("capture lock poisoned"),
-            &["Bearer sk-route-env", "Bearer sk-route-live-bad"]
+            &[
+                "Bearer sk-route-env",
+                // `provider_retries = 1` and the route has a single credential,
+                // so the rate-limited key keeps its normal one retry rather than
+                // being cut short by rotation that cannot happen.
+                "Bearer sk-route-live-bad",
+                "Bearer sk-route-live-bad"
+            ],
+            "the live route key must replace the startup key, and removing it must \
+             revoke the startup key rather than falling back to it"
+        );
+        assert!(
+            !capture
+                .lock()
+                .expect("capture lock poisoned")
+                .iter()
+                .any(|auth| auth == "Bearer sk-global-must-not-reach-route"),
+            "a global reliability key must never reach a route-scoped credential"
         );
         server.abort();
     }

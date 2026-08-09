@@ -4007,8 +4007,14 @@ mod tests {
 
         assert_eq!(
             &*seen.lock(),
-            &["bad-primary"],
-            "a whitespace-equivalent spelling must not rebind or retry the same credential"
+            &["bad-primary", "bad-primary"],
+            "a whitespace-equivalent spelling must resolve to one canonical credential \
+             (never the untrimmed spelling, never a second binding), while a \
+             single-credential pool still consumes max_retries + 1 attempts"
+        );
+        assert!(
+            seen.lock().iter().all(|key| key == "bad-primary"),
+            "no attempt may use the untrimmed spelling"
         );
     }
 
