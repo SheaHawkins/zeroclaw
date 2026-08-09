@@ -245,6 +245,34 @@ where
     Ok(paths)
 }
 
+/// Reject empty and colliding case identities in a loaded suite.
+///
+/// [`LlmTrace::display_id`] permits any `id`, including an empty string, and
+/// nothing else in the load path enforces uniqueness. Two downstream maps are
+/// keyed by that identity — the baseline comparison's `cur_map` and the live
+/// retry's `rerun_passed[id]` — so colliding ids collapse last-writer-wins: a
+/// failing fixture and a passing fixture sharing an id can have the real
+/// failure overwritten by the passing retry and downgraded to flaky. That is a
+/// gate bypass, so identities are validated once at load, before any suite
+/// execution, baseline comparison, or retry.
+fn validate_suite_identities(suite: &[(PathBuf, LlmTrace)]) -> anyhow::Result<()> {
+    let mut seen: std::collections::BTreeMap<&str, &PathBuf> = std::collections::BTreeMap::new();
+    for (path, trace) in suite {
+        let id = trace.display_id();
+        if id.trim().is_empty() {
+            anyhow::bail!("eval fixture {} has an empty case id", path.display());
+        }
+        if let Some(prev) = seen.insert(id, path) {
+            anyhow::bail!(
+                "duplicate eval case id {id:?}: {} and {}",
+                prev.display(),
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Load every `*.json` trace fixture in `dir`, sorted by path for stable ordering.
 pub fn load_suite(dir: &Path) -> anyhow::Result<Vec<(PathBuf, LlmTrace)>> {
     let read = std::fs::read_dir(dir)
@@ -257,6 +285,7 @@ pub fn load_suite(dir: &Path) -> anyhow::Result<Vec<(PathBuf, LlmTrace)>> {
         let trace = LlmTrace::from_file(&path)?;
         out.push((path, trace));
     }
+    validate_suite_identities(&out)?;
     Ok(out)
 }
 
@@ -443,5 +472,81 @@ mod tests {
         ];
         let paths = collect_suite_paths(dir, entries).unwrap();
         assert_eq!(paths, vec![dir.join("a.json"), dir.join("b.json")]);
+    }
+
+    fn suite_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Colliding ids collapse the baseline `cur_map` and the live retry's
+    /// `rerun_passed[id]`, so a passing sibling can overwrite a real failure.
+    /// The error must name BOTH source paths so the collision is actionable.
+    #[test]
+    fn load_suite_rejects_duplicate_case_ids() {
+        let dir = suite_dir("zeroclaw_eval_case_dup_id_test");
+        std::fs::write(
+            dir.join("a_failing.json"),
+            r#"{"model_name":"m","id":"duplicate","turns":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b_passing.json"),
+            r#"{"model_name":"other","id":"duplicate","turns":[]}"#,
+        )
+        .unwrap();
+        let err = load_suite(&dir).expect_err("duplicate case ids must not load");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("duplicate"),
+            "error must name the colliding id, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("a_failing.json") && rendered.contains("b_passing.json"),
+            "error must name both source paths, got: {rendered}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An empty (or whitespace-only) effective id is not a usable map key for
+    /// baseline comparison or retry bookkeeping, so it is rejected at load.
+    #[test]
+    fn load_suite_rejects_empty_case_id() {
+        let dir = suite_dir("zeroclaw_eval_case_empty_id_test");
+        std::fs::write(
+            dir.join("blank.json"),
+            r#"{"model_name":"m","id":"","turns":[]}"#,
+        )
+        .unwrap();
+        let err = load_suite(&dir).expect_err("an empty case id must not load");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("blank.json") && rendered.contains("empty case id"),
+            "error must name the offending fixture, got: {rendered}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `display_id()` falls back to `model_name`, so a blank `model_name` with
+    /// no `id` is the same hazard by another route.
+    #[test]
+    fn load_suite_rejects_whitespace_only_effective_id() {
+        let dir = suite_dir("zeroclaw_eval_case_ws_id_test");
+        std::fs::write(dir.join("ws.json"), r#"{"model_name":"   ","turns":[]}"#).unwrap();
+        let err = load_suite(&dir).expect_err("a whitespace-only case id must not load");
+        assert!(format!("{err:#}").contains("empty case id"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Distinct ids across fixtures remain loadable — the guard is not blanket.
+    #[test]
+    fn load_suite_accepts_distinct_case_ids() {
+        let dir = suite_dir("zeroclaw_eval_case_ok_id_test");
+        std::fs::write(dir.join("a.json"), r#"{"model_name":"m","id":"a","turns":[]}"#).unwrap();
+        std::fs::write(dir.join("b.json"), r#"{"model_name":"m","id":"b","turns":[]}"#).unwrap();
+        assert_eq!(load_suite(&dir).unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -541,6 +541,93 @@ mod tests {
         );
     }
 
+    /// The bot's exact gate-bypass scenario at the command boundary: a baseline
+    /// regression for `"duplicate"`, plus two current fixtures sharing that id —
+    /// one failing, one passing, the passing one visited last (path order
+    /// `a_failing.json` < `b_passing.json`). Before identity validation the
+    /// retry's `rerun_passed["duplicate"]` was overwritten last-writer-wins by
+    /// the passing sibling and the real regression was downgraded to flaky.
+    /// Now the suite refuses to load at all, so the regression stays gating.
+    #[tokio::test]
+    async fn duplicate_case_ids_cannot_downgrade_a_regression() {
+        use zeroclaw_eval::baseline::{BaselineComparison, CaseComparison, SuiteKind};
+
+        let suite = tempfile::tempdir().unwrap();
+        // Fails: demands a substring the static provider never emits.
+        std::fs::write(
+            suite.path().join("a_failing.json"),
+            r#"{
+                "id": "duplicate",
+                "model_name": "duplicate",
+                "turns": [{ "user_input": "run" }],
+                "expects": { "response_contains": ["never-emitted"] }
+            }"#,
+        )
+        .unwrap();
+        // Passes, and sorts last so it would be the final writer.
+        std::fs::write(
+            suite.path().join("b_passing.json"),
+            r#"{
+                "id": "duplicate",
+                "model_name": "duplicate",
+                "turns": [{ "user_input": "run" }],
+                "expects": { "response_contains": ["ok"] }
+            }"#,
+        )
+        .unwrap();
+
+        let deps = RunDeps {
+            mode: Mode::Live,
+            provider: Box::new(|_trace| {
+                Ok(zeroclaw_eval::CaseProvider::from_provider(Box::new(
+                    StaticTextProvider,
+                )))
+            }),
+            provider_ref: "test.retry:model".to_string(),
+            live_tools: Vec::new(),
+            case_timeout: Duration::from_secs(5),
+        };
+
+        let mut cmp = BaselineComparison {
+            per_case: [(
+                "duplicate".to_string(),
+                CaseComparison::Regression {
+                    categories: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let err = rerun_live_regressions_with_deps(suite.path(), &cmp, &deps)
+            .await
+            .expect_err("a suite with colliding case ids must not run the retry");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("duplicate")
+                && rendered.contains("a_failing.json")
+                && rendered.contains("b_passing.json"),
+            "error must name the id and both fixtures, got: {rendered}"
+        );
+
+        // No retry result exists, so nothing can be downgraded and the
+        // regression still forces a non-zero exit.
+        let flaky = zeroclaw_eval::baseline::downgrade_flaky_regressions(
+            &mut cmp,
+            Mode::Live,
+            &BTreeMap::new(),
+        );
+        assert!(flaky.is_empty(), "no case may be excused as flaky");
+        let report = SuiteReport {
+            cases: vec![case_report("duplicate", false)],
+        };
+        assert_eq!(
+            report.exit_code(SuiteKind::Regression, Some(&cmp)),
+            1,
+            "the regression must stay gating"
+        );
+    }
+
     #[test]
     fn record_dump_contains_indexed_repeat_attempts() {
         let sample = zeroclaw_eval::stats::RunSample {
