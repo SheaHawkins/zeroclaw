@@ -15,7 +15,7 @@ use zeroclaw_runtime::approval::ApprovalManager;
 
 use crate::case::{CaseSetup, LlmTrace, validate_workspace_rel_path};
 use crate::observer::RecordingObserver;
-use crate::record::RunRecord;
+use crate::record::{CaseProvenance, RunCompletion, RunRecord, ToolSurface};
 use crate::runner::RunDeps;
 
 /// Tools that may never be exposed to a live eval run, regardless of the case's
@@ -111,6 +111,7 @@ fn live_tool_registry(effective: &[String], policy: Arc<SecurityPolicy>) -> Vec<
 pub async fn run_live_case(
     trace: &LlmTrace,
     deps: &RunDeps,
+    provenance_out: &mut Option<CaseProvenance>,
 ) -> anyhow::Result<crate::runner::CaseOutcome> {
     ensure_no_scripted_steps(trace)?;
 
@@ -150,6 +151,19 @@ pub async fn run_live_case(
     let approvals = Arc::new(ApprovalManager::for_non_interactive_backchannel(&risk));
 
     let tools = live_tool_registry(&effective, policy.clone());
+    // Derive the recorded surface from the registry that is about to be handed to
+    // `Agent::builder`, not from the request path. This is the only list that is
+    // true in both directions: the empty-allowlist branch reports `["echo"]`
+    // instead of `[]`, and an allowlisted name matching no runtime tool appears in
+    // `requested` but not here.
+    let registered: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
+    let provenance = crate::runner::case_provenance(
+        trace,
+        deps,
+        ToolSurface::new(requested.clone(), effective.clone(), registered),
+    )?;
+    *provenance_out = Some(provenance.clone());
+
     // Empty allowlist -> None so the echo registry's own tool is usable; a
     // `Some(vec![])` would deny every tool including echo. Non-empty -> the
     // allowlist backs the already-filtered registry as defense in depth.
@@ -201,27 +215,18 @@ pub async fn run_live_case(
     let duration_ms = start.elapsed().as_millis() as u64;
 
     let (input_tokens, output_tokens) = observer.tokens();
-    let mut tool_surface = effective.clone();
-    tool_surface.sort();
     let record = RunRecord {
-        schema: crate::record::RECORD_SCHEMA.to_string(),
-        mode: crate::Mode::Live,
-        case_id: trace.display_id().to_string(),
-        case_hash: crate::case::case_hash(trace)?,
-        provider_ref: deps.provider_ref.clone(),
-        tool_surface,
-        sandbox: crate::record::SandboxStamp {
-            autonomy: "supervised".to_string(),
-            workspace_only: true,
-        },
-        final_response,
-        history: agent.history().to_vec(),
-        tools_called: observer.tool_names(),
-        all_tools_succeeded: observer.all_tools_succeeded(),
-        input_tokens,
-        output_tokens,
-        duration_ms,
-        llm_calls: observer.llm_calls(),
+        provenance,
+        completion: Some(RunCompletion {
+            final_response,
+            history: agent.history().to_vec(),
+            tools_called: observer.tool_names(),
+            all_tools_succeeded: observer.all_tools_succeeded(),
+            input_tokens,
+            output_tokens,
+            duration_ms,
+            llm_calls: observer.llm_calls(),
+        }),
     };
     // Grade while the temp workspace is still alive, then let `tmp` drop.
     let grades = crate::grader::grade_run(trace, &record, tmp.path()).await;
@@ -387,7 +392,7 @@ mod tests {
             Vec::new(),
             Duration::from_secs(5),
         );
-        let err = run_live_case(&trace, &deps).await.unwrap_err();
+        let err = run_live_case(&trace, &deps, &mut None).await.unwrap_err();
         assert!(
             err.to_string().contains("must not script LLM steps"),
             "unexpected error: {err}"
@@ -448,7 +453,7 @@ mod tests {
             Vec::new(),
             Duration::from_millis(50),
         );
-        let err = run_live_case(&trace, &deps).await.unwrap_err();
+        let err = run_live_case(&trace, &deps, &mut None).await.unwrap_err();
         assert!(
             err.to_string().contains("timed out"),
             "unexpected error: {err}"
@@ -483,7 +488,7 @@ mod tests {
             Duration::from_secs(5),
         );
 
-        let outcome = run_live_case(&trace, &deps).await.unwrap();
+        let outcome = run_live_case(&trace, &deps, &mut None).await.unwrap();
         assert!(
             !canary.exists(),
             "sandbox breach: file_write wrote outside the workspace to {}",
@@ -497,8 +502,127 @@ mod tests {
             canary_parent.display()
         );
         assert!(
-            !outcome.record.all_tools_succeeded,
+            !outcome.record.completion_or_default().all_tools_succeeded,
             "the out-of-workspace file_write must not report success"
         );
+    }
+
+    #[tokio::test]
+    async fn live_empty_tool_list_records_echo_in_registered_surface() {
+        // No allowlisted tools -> the built-in echo registry is substituted. The
+        // receipt must say `["echo"]`, not `[]`: reporting an empty surface hides
+        // a capability the run genuinely had.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{ "model_name": "echo-surface", "turns": [{ "user_input": "hi" }] }"#,
+        )
+        .unwrap();
+        let deps = live_deps(
+            |_| {
+                Ok(driver_provider(
+                    r#"{"model_name":"d","turns":[{"user_input":"","steps":[{"response":{"type":"text","content":"ok"}}]}]}"#,
+                ))
+            },
+            Vec::new(),
+            std::time::Duration::from_secs(5),
+        );
+        let outcome = run_live_case(&trace, &deps, &mut None).await.unwrap();
+        let surface = &outcome.record.provenance.tool_surface;
+        assert_eq!(
+            surface.registered,
+            vec!["echo".to_string()],
+            "the implicit echo registry must be reported, not hidden behind []"
+        );
+        assert!(surface.effective.is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_unknown_allowlisted_tool_absent_from_registered_surface() {
+        // A name present in both the case and the config allowlist but matching no
+        // runtime tool must not be reported as available.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{ "model_name": "unknown-tool", "turns": [{ "user_input": "hi" }], "tools": ["definitely_not_a_tool"] }"#,
+        )
+        .unwrap();
+        let deps = live_deps(
+            |_| {
+                Ok(driver_provider(
+                    r#"{"model_name":"d","turns":[{"user_input":"","steps":[{"response":{"type":"text","content":"ok"}}]}]}"#,
+                ))
+            },
+            vec!["definitely_not_a_tool".to_string()],
+            std::time::Duration::from_secs(5),
+        );
+        let outcome = run_live_case(&trace, &deps, &mut None).await.unwrap();
+        let surface = &outcome.record.provenance.tool_surface;
+        assert!(
+            surface
+                .requested
+                .contains(&"definitely_not_a_tool".to_string()),
+            "the request must be recorded verbatim: {surface:?}"
+        );
+        assert!(
+            !surface
+                .registered
+                .contains(&"definitely_not_a_tool".to_string()),
+            "a tool no registry exposes must not be reported as available: {surface:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_surface_matches_agent_builder_registry() {
+        // The recorded `registered` list must equal the names the registry hands to
+        // `Agent::builder` — derived from the registry handle, not the request path.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{ "model_name": "registry-match", "turns": [{ "user_input": "hi" }], "tools": ["file_read", "definitely_not_a_tool"] }"#,
+        )
+        .unwrap();
+        let deps = live_deps(
+            |_| {
+                Ok(driver_provider(
+                    r#"{"model_name":"d","turns":[{"user_input":"","steps":[{"response":{"type":"text","content":"ok"}}]}]}"#,
+                ))
+            },
+            vec!["file_read".to_string(), "definitely_not_a_tool".to_string()],
+            std::time::Duration::from_secs(5),
+        );
+        let outcome = run_live_case(&trace, &deps, &mut None).await.unwrap();
+        let surface = &outcome.record.provenance.tool_surface;
+
+        let effective = effective_live_tools(trace.tools.as_deref(), &deps.live_tools);
+        let policy = Arc::new(SecurityPolicy::default());
+        let mut expected: Vec<String> = live_tool_registry(&effective, policy)
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(
+            surface.registered, expected,
+            "recorded surface must equal the registry actually built"
+        );
+        assert_eq!(surface.registered, vec!["file_read".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn timed_out_live_case_publishes_provenance_before_execution() {
+        // A timeout aborts before any record is assembled; provenance must already
+        // have been published so the caller can still build a receipt.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{ "model_name": "slow-prov", "turns": [{ "user_input": "hang" }] }"#,
+        )
+        .unwrap();
+        let deps = live_deps(
+            |_| Ok(Box::new(SleepProvider) as Box<dyn ModelProvider>),
+            Vec::new(),
+            std::time::Duration::from_millis(50),
+        );
+        let mut provenance = None;
+        let err = run_live_case(&trace, &deps, &mut provenance)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "unexpected: {err}");
+        let p = provenance.expect("provenance must be published before the turns loop");
+        assert_eq!(p.case_id, "slow-prov");
+        assert!(!p.case_hash.is_empty(), "case hash must survive a timeout");
+        assert_eq!(p.tool_surface.registered, vec!["echo".to_string()]);
     }
 }

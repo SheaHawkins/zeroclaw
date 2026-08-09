@@ -14,7 +14,7 @@ use crate::Mode;
 use crate::case::{LlmTrace, load_suite};
 use crate::grader::{GradeResult, grade_run};
 use crate::observer::RecordingObserver;
-use crate::record::RunRecord;
+use crate::record::{CaseProvenance, RunCompletion, RunRecord, ToolSurface};
 use crate::report::{CaseReport, SuiteReport};
 use crate::tools::default_tools;
 
@@ -78,6 +78,31 @@ pub fn ensure_live_provider(provider_ref: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Build the provenance half of a case's receipt. Everything here is knowable
+/// before the fallible work starts, so a failed run still carries it.
+///
+/// `tool_surface` is supplied by the caller because only the execution path knows
+/// which registry was actually constructed; an error before that point records an
+/// empty surface rather than a guess.
+pub fn case_provenance(
+    trace: &LlmTrace,
+    deps: &RunDeps,
+    tool_surface: ToolSurface,
+) -> anyhow::Result<CaseProvenance> {
+    Ok(CaseProvenance {
+        schema: crate::record::RECORD_SCHEMA.to_string(),
+        mode: deps.mode,
+        case_id: trace.display_id().to_string(),
+        case_hash: crate::case::case_hash(trace)?,
+        provider_ref: deps.provider_ref.clone(),
+        tool_surface,
+        sandbox: crate::record::SandboxStamp {
+            autonomy: "supervised".to_string(),
+            workspace_only: matches!(deps.mode, Mode::Live),
+        },
+    })
+}
+
 /// Run every `*.json` trace fixture in `dir` and return an aggregated report.
 pub async fn run_suite(dir: &Path, deps: &RunDeps) -> anyhow::Result<SuiteReport> {
     let traces = load_suite(dir)?;
@@ -94,7 +119,10 @@ pub async fn run_suite(dir: &Path, deps: &RunDeps) -> anyhow::Result<SuiteReport
             .unwrap_or("<unknown>")
             .to_string();
 
-        let report = match run_case(&trace, deps).await {
+        // The execution path publishes provenance here as soon as it is known,
+        // so an error after that point still yields a joinable receipt.
+        let mut provenance: Option<CaseProvenance> = None;
+        let report = match run_case_recording_provenance(&trace, deps, &mut provenance).await {
             Ok(outcome) => CaseReport {
                 name,
                 source,
@@ -102,13 +130,21 @@ pub async fn run_suite(dir: &Path, deps: &RunDeps) -> anyhow::Result<SuiteReport
                 grades: outcome.grades,
                 error: None,
             },
-            Err(e) => CaseReport {
-                name,
-                source,
-                record: None,
-                grades: vec![],
-                error: Some(e.to_string()),
-            },
+            Err(e) => {
+                // The receipt exists for exactly this path. A provider, setup,
+                // timeout, or agent error must still produce a record carrying the
+                // case hash, mode, provider, tool surface, and sandbox stamp, or a
+                // baseline cannot classify the failure against the attempted run.
+                let provenance = provenance
+                    .or_else(|| case_provenance(&trace, deps, ToolSurface::default()).ok());
+                CaseReport {
+                    name,
+                    source,
+                    record: provenance.map(RunRecord::from_provenance),
+                    grades: vec![],
+                    error: Some(e.to_string()),
+                }
+            }
         };
         cases.push(report);
     }
@@ -119,15 +155,30 @@ pub async fn run_suite(dir: &Path, deps: &RunDeps) -> anyhow::Result<SuiteReport
 /// Run a single trace through a freshly built, isolated agent, grade it while its
 /// workspace is still alive, and return the outcome. Dispatches on `deps.mode`.
 pub async fn run_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<CaseOutcome> {
+    run_case_recording_provenance(trace, deps, &mut None).await
+}
+
+/// [`run_case`], but publishing the case's [`CaseProvenance`] into `provenance_out`
+/// the moment it is known — before the fallible execution work. On `Err` the caller
+/// can therefore still build a receipt describing the run that was attempted.
+pub async fn run_case_recording_provenance(
+    trace: &LlmTrace,
+    deps: &RunDeps,
+    provenance_out: &mut Option<CaseProvenance>,
+) -> anyhow::Result<CaseOutcome> {
     match deps.mode {
-        Mode::Replay => run_replay_case(trace, deps).await,
-        Mode::Live => crate::live::run_live_case(trace, deps).await,
+        Mode::Replay => run_replay_case(trace, deps, provenance_out).await,
+        Mode::Live => crate::live::run_live_case(trace, deps, provenance_out).await,
     }
 }
 
 /// Replay a scripted trace through the Phase 0 deterministic agent (echo tools,
 /// native dispatcher, no network).
-async fn run_replay_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<CaseOutcome> {
+async fn run_replay_case(
+    trace: &LlmTrace,
+    deps: &RunDeps,
+    provenance_out: &mut Option<CaseProvenance>,
+) -> anyhow::Result<CaseOutcome> {
     // Each case gets an isolated temp workspace and an ephemeral "none" memory
     // backend so cases cannot observe one another.
     let tmp = tempfile::tempdir()?;
@@ -138,12 +189,25 @@ async fn run_replay_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<Cas
     };
     let memory: Arc<dyn Memory> = Arc::from(create_memory(&mem_cfg, tmp.path(), None)?);
 
+    // Replay uses the built-in echo registry; record what it actually exposes so
+    // the surface is derived from the registry, not from the request path.
+    let tools = default_tools();
+    let registered: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
+    // Published before the provider is constructed: a fixture whose steps are
+    // unscriptable fails in the factory, and that failure still needs a receipt.
+    let provenance = case_provenance(
+        trace,
+        deps,
+        ToolSurface::new(Vec::new(), Vec::new(), registered),
+    )?;
+    *provenance_out = Some(provenance.clone());
+
     let observer = Arc::new(RecordingObserver::new());
     let provider = (deps.provider)(trace)?;
 
     let mut agent = Agent::builder()
         .model_provider(provider)
-        .tools(default_tools())
+        .tools(tools)
         .memory(memory)
         .observer(observer.clone())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -159,24 +223,17 @@ async fn run_replay_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<Cas
 
     let (input_tokens, output_tokens) = observer.tokens();
     let record = RunRecord {
-        schema: crate::record::RECORD_SCHEMA.to_string(),
-        mode: Mode::Replay,
-        case_id: trace.display_id().to_string(),
-        case_hash: crate::case::case_hash(trace)?,
-        provider_ref: deps.provider_ref.clone(),
-        tool_surface: Vec::new(),
-        sandbox: crate::record::SandboxStamp {
-            autonomy: "supervised".to_string(),
-            workspace_only: false,
-        },
-        final_response,
-        history: agent.history().to_vec(),
-        tools_called: observer.tool_names(),
-        all_tools_succeeded: observer.all_tools_succeeded(),
-        input_tokens,
-        output_tokens,
-        duration_ms,
-        llm_calls: observer.llm_calls(),
+        provenance,
+        completion: Some(RunCompletion {
+            final_response,
+            history: agent.history().to_vec(),
+            tools_called: observer.tool_names(),
+            all_tools_succeeded: observer.all_tools_succeeded(),
+            input_tokens,
+            output_tokens,
+            duration_ms,
+            llm_calls: observer.llm_calls(),
+        }),
     };
     // Grade while the temp workspace is still alive, then let `tmp` drop.
     let grades = grade_run(trace, &record, tmp.path()).await;
@@ -212,8 +269,20 @@ mod tests {
     async fn replays_text_only_trace() {
         let trace: LlmTrace = serde_json::from_str(SMOKE).unwrap();
         let outcome = run_case(&trace, &RunDeps::replay()).await.unwrap();
-        assert!(outcome.record.final_response.contains("Hello"));
-        assert!(outcome.record.tools_called.is_empty());
+        assert!(
+            outcome
+                .record
+                .completion_or_default()
+                .final_response
+                .contains("Hello")
+        );
+        assert!(
+            outcome
+                .record
+                .completion_or_default()
+                .tools_called
+                .is_empty()
+        );
         assert!(
             outcome.grades.iter().all(|g| g.passed),
             "grades: {:?}",
@@ -225,8 +294,11 @@ mod tests {
     async fn replays_tool_call_trace() {
         let trace: LlmTrace = serde_json::from_str(ECHO).unwrap();
         let outcome = run_case(&trace, &RunDeps::replay()).await.unwrap();
-        assert_eq!(outcome.record.tools_called, vec!["echo".to_string()]);
-        assert!(outcome.record.all_tools_succeeded);
+        assert_eq!(
+            outcome.record.completion_or_default().tools_called,
+            vec!["echo".to_string()]
+        );
+        assert!(outcome.record.completion_or_default().all_tools_succeeded);
         assert!(
             outcome.grades.iter().all(|g| g.passed),
             "grades: {:?}",
@@ -249,9 +321,13 @@ mod tests {
         let outcome = run_case(&trace, &RunDeps::replay()).await.unwrap();
         // The final response comes from the *last* turn, proving turns replay in order.
         assert!(
-            outcome.record.final_response.contains("Goodbye"),
+            outcome
+                .record
+                .completion_or_default()
+                .final_response
+                .contains("Goodbye"),
             "final response: {:?}",
-            outcome.record.final_response
+            outcome.record.completion_or_default().final_response
         );
     }
 
@@ -280,5 +356,120 @@ mod tests {
             "error must name the config key: {err}"
         );
         assert!(ensure_live_provider("anthropic.sonnet").is_ok());
+    }
+
+    /// A provider factory that always fails, standing in for an unreachable or
+    /// misconfigured provider.
+    fn failing_deps() -> RunDeps {
+        RunDeps {
+            mode: Mode::Replay,
+            provider: Box::new(|_| anyhow::bail!("provider unreachable")),
+            provider_ref: "test.model:m".to_string(),
+            live_tools: Vec::new(),
+            case_timeout: Duration::from_secs(5),
+        }
+    }
+
+    fn write_suite(dir: &std::path::Path, name: &str, json: &str) {
+        std::fs::write(dir.join(name), json).unwrap();
+    }
+
+    #[tokio::test]
+    async fn errored_case_report_retains_provenance() {
+        // The receipt's whole purpose is comparability. A provider error must not
+        // collapse the record to `None` — the case hash, mode, provider ref, tool
+        // surface, and sandbox stamp are all knowable without executing anything.
+        let tmp = tempfile::tempdir().unwrap();
+        write_suite(tmp.path(), "a.json", SMOKE);
+        let report = run_suite(tmp.path(), &failing_deps()).await.unwrap();
+
+        let case = &report.cases[0];
+        assert!(case.error.is_some(), "the case must be recorded as errored");
+        let record = case
+            .record
+            .as_ref()
+            .expect("an errored case must still carry a receipt");
+        assert!(!record.is_complete(), "no completion data for a failed run");
+        assert!(!record.provenance.case_hash.is_empty());
+        assert_eq!(record.provenance.case_id, "test-smoke-greeting");
+        assert_eq!(record.provenance.provider_ref, "test.model:m");
+        assert_eq!(record.provenance.mode, Mode::Replay);
+
+        // ...and it survives serialization: the JSON report must not emit `null`.
+        let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        let c = &json["cases"][0];
+        assert!(c["case_hash"].is_string() && !c["case_hash"].as_str().unwrap().is_empty());
+        assert_eq!(c["mode"], "replay");
+        assert_eq!(c["provider_ref"], "test.model:m");
+        assert!(c["tool_surface"].is_object());
+        assert!(c["sandbox"].is_object());
+    }
+
+    #[tokio::test]
+    async fn setup_error_before_agent_still_records_case_hash() {
+        // An authoring error (a replay turn with no scripted steps) fails inside the
+        // provider factory, before the agent exists. Provenance is published first,
+        // so the receipt is intact.
+        let tmp = tempfile::tempdir().unwrap();
+        write_suite(
+            tmp.path(),
+            "a.json",
+            r#"{ "model_name": "no-steps-case", "turns": [{ "user_input": "Hi" }], "expects": {} }"#,
+        );
+        let report = run_suite(tmp.path(), &RunDeps::replay()).await.unwrap();
+        let case = &report.cases[0];
+        assert!(
+            case.error.as_deref().unwrap().contains("no scripted steps"),
+            "unexpected error: {:?}",
+            case.error
+        );
+        let record = case
+            .record
+            .as_ref()
+            .expect("receipt must survive a setup error");
+        assert!(!record.provenance.case_hash.is_empty());
+        assert_eq!(record.provenance.case_id, "no-steps-case");
+    }
+
+    #[tokio::test]
+    async fn errored_case_scores_none_not_vacuous_one() {
+        // An errored case has an empty grade list because nothing was scored, not
+        // because everything passed. Emitting `passed: false` beside `score: 1.0`
+        // misleads machine consumers and inflates suite averages.
+        let tmp = tempfile::tempdir().unwrap();
+        write_suite(tmp.path(), "a.json", SMOKE);
+        let report = run_suite(tmp.path(), &failing_deps()).await.unwrap();
+        assert_eq!(report.cases[0].score(), None);
+
+        let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        assert_eq!(json["cases"][0]["passed"], false);
+        assert!(
+            json["cases"][0]["score"].is_null(),
+            "an errored case must not serialize score 1.0: {}",
+            json["cases"][0]["score"]
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_case_still_reports_a_score_and_completion() {
+        // Guard the other direction: the provenance split must not strip completion
+        // data or scoring from a run that actually finished.
+        let tmp = tempfile::tempdir().unwrap();
+        write_suite(tmp.path(), "a.json", SMOKE);
+        let report = run_suite(tmp.path(), &RunDeps::replay()).await.unwrap();
+        let case = &report.cases[0];
+        assert!(case.error.is_none());
+        assert_eq!(case.score(), Some(1.0));
+        let record = case.record.as_ref().unwrap();
+        assert!(record.is_complete());
+        assert!(
+            record
+                .completion_or_default()
+                .final_response
+                .contains("Hello")
+        );
+        let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        assert_eq!(json["cases"][0]["score"], 1.0);
+        assert!(json["cases"][0]["total_tokens"].is_number());
     }
 }

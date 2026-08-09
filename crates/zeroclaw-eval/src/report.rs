@@ -28,13 +28,22 @@ impl CaseReport {
         self.grades.iter().filter(|g| g.passed).count()
     }
 
-    /// Partial-credit score: fraction of checks passed. A case with no checks
-    /// scores 1.0 (it passes vacuously). Informational; the gate is pass/fail.
-    pub fn score(&self) -> f64 {
+    /// Partial-credit score: fraction of checks passed, or `None` when no score
+    /// is meaningful.
+    ///
+    /// An errored case has an empty grade list because nothing was scored — not
+    /// because everything passed. Reporting the vacuous 1.0 there would have the
+    /// JSON emit `passed: false` beside `score: 1.0`, which misleads machine
+    /// consumers and inflates any average built over a suite. A case with no
+    /// checks that ran cleanly still scores 1.0 (it passes vacuously).
+    pub fn score(&self) -> Option<f64> {
+        if self.error.is_some() {
+            return None;
+        }
         if self.grades.is_empty() {
-            1.0
+            Some(1.0)
         } else {
-            self.checks_passed() as f64 / self.grades.len() as f64
+            Some(self.checks_passed() as f64 / self.grades.len() as f64)
         }
     }
 
@@ -142,26 +151,33 @@ impl SuiteReport {
                     "grades": c.grades,
                 });
                 if let (Some(rec), Some(map)) = (&c.record, obj.as_object_mut()) {
-                    map.insert("schema".into(), rec.schema.clone().into());
+                    // Provenance is emitted unconditionally: it is knowable before
+                    // execution, so an errored case still carries a joinable receipt.
+                    let p = &rec.provenance;
+                    map.insert("schema".into(), p.schema.clone().into());
                     map.insert(
                         "mode".into(),
-                        serde_json::to_value(rec.mode).unwrap_or_default(),
+                        serde_json::to_value(p.mode).unwrap_or_default(),
                     );
-                    map.insert("case_id".into(), rec.case_id.clone().into());
-                    map.insert("case_hash".into(), rec.case_hash.clone().into());
-                    map.insert("provider_ref".into(), rec.provider_ref.clone().into());
+                    map.insert("case_id".into(), p.case_id.clone().into());
+                    map.insert("case_hash".into(), p.case_hash.clone().into());
+                    map.insert("provider_ref".into(), p.provider_ref.clone().into());
                     map.insert(
                         "tool_surface".into(),
-                        serde_json::to_value(&rec.tool_surface).unwrap_or_default(),
+                        serde_json::to_value(&p.tool_surface).unwrap_or_default(),
                     );
                     map.insert(
                         "sandbox".into(),
-                        serde_json::to_value(&rec.sandbox).unwrap_or_default(),
+                        serde_json::to_value(&p.sandbox).unwrap_or_default(),
                     );
-                    map.insert(
-                        "total_tokens".into(),
-                        (rec.input_tokens + rec.output_tokens).into(),
-                    );
+                    // Completion-only fields stay absent for a run that never
+                    // finished, rather than being reported as a real zero.
+                    if let Some(done) = &rec.completion {
+                        map.insert(
+                            "total_tokens".into(),
+                            (done.input_tokens + done.output_tokens).into(),
+                        );
+                    }
                 }
                 obj
             })
@@ -343,7 +359,7 @@ mod tests {
             error: None,
         };
         // score = 3/4 passed.
-        assert!((report.score() - 0.75).abs() < f64::EPSILON);
+        assert!((report.score().unwrap() - 0.75).abs() < f64::EPSILON);
         let totals = report.category_totals();
         assert_eq!(totals["response"]["passed"].as_u64(), Some(1));
         assert_eq!(totals["response"]["total"].as_u64(), Some(2));
