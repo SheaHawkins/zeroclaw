@@ -18,7 +18,7 @@ use zeroclaw_runtime::tools::ShellTool;
 use crate::case::{CaseSetup, LlmTrace, validate_workspace_rel_path};
 use crate::observer::RecordingObserver;
 use crate::record::RunRecord;
-use crate::runner::RunDeps;
+use crate::runner::{ProviderSetup, RunDeps};
 
 /// Intersect a case's requested tools with the config allowlist, preserving the
 /// allowlist's order and de-duplicating. An empty allowlist yields no tools.
@@ -182,7 +182,7 @@ pub async fn run_live_case(
     };
 
     let observer = Arc::new(RecordingObserver::new());
-    let provider = (deps.provider)(trace)?;
+    let provider = (deps.provider)(trace)?.provider;
     // Resolve the dispatcher from the provider's capabilities so XML-dialect
     // providers work; a default agent config routes purely by capability.
     let dispatcher =
@@ -254,7 +254,7 @@ mod tests {
     ) -> RunDeps {
         RunDeps {
             mode: Mode::Live,
-            provider: Box::new(provider),
+            provider: Box::new(move |trace| Ok(ProviderSetup::new(provider(trace)?))),
             live_tools,
             case_timeout: timeout,
         }

@@ -27,10 +27,44 @@ pub struct CaseOutcome {
     pub grades: Vec<GradeResult>,
 }
 
+/// A per-turn boundary hook invoked by the runner after each `Agent::turn`,
+/// receiving the just-finished turn index. Replay uses it to assert the turn
+/// consumed all of its scripted steps; live mode has no such contract and passes
+/// `None`.
+pub type TurnBoundary = Box<dyn Fn(usize) -> anyhow::Result<()> + Send + Sync>;
+
+/// Everything one case run needs from its provider: the boxed provider itself
+/// plus the optional per-turn boundary hook that must share state with it.
+///
+/// The two travel together because the hook is only meaningful for the specific
+/// provider instance built for this case — the runner cannot reach inside a boxed
+/// `dyn ModelProvider` to recover it.
+pub struct ProviderSetup {
+    pub provider: Box<dyn ModelProvider>,
+    pub on_turn_end: Option<TurnBoundary>,
+}
+
+impl ProviderSetup {
+    /// A provider with no per-turn boundary contract (live mode, tests).
+    pub fn new(provider: Box<dyn ModelProvider>) -> Self {
+        Self {
+            provider,
+            on_turn_end: None,
+        }
+    }
+
+    /// A provider that enforces a per-turn boundary after every `Agent::turn`.
+    pub fn with_turn_boundary(provider: Box<dyn ModelProvider>, on_turn_end: TurnBoundary) -> Self {
+        Self {
+            provider,
+            on_turn_end: Some(on_turn_end),
+        }
+    }
+}
+
 /// Factory that builds a fresh model provider for one case run. Injected so
 /// replay, live, and deterministic tests share one runner code path.
-pub type ProviderFactory =
-    Box<dyn Fn(&LlmTrace) -> anyhow::Result<Box<dyn ModelProvider>> + Send + Sync>;
+pub type ProviderFactory = Box<dyn Fn(&LlmTrace) -> anyhow::Result<ProviderSetup> + Send + Sync>;
 
 /// Everything a case run needs that differs between replay, live, and tests.
 ///
@@ -53,10 +87,14 @@ impl RunDeps {
         Self {
             mode: Mode::Replay,
             provider: Box::new(|trace| {
-                Ok(
-                    Box::new(crate::replay::TraceLlmProvider::try_from_trace(trace)?)
-                        as Box<dyn ModelProvider>,
-                )
+                let replay = crate::replay::TraceLlmProvider::try_from_trace(trace)?;
+                // The handle shares the provider's per-turn queues, so the runner can
+                // assert consumption at each turn boundary without owning the box.
+                let handle = replay.handle();
+                Ok(ProviderSetup::with_turn_boundary(
+                    Box::new(replay) as Box<dyn ModelProvider>,
+                    Box::new(move |turn_index| handle.finish_turn(turn_index)),
+                ))
             }),
             live_tools: Vec::new(),
             case_timeout: Duration::from_secs(120),
@@ -155,7 +193,10 @@ async fn run_replay_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<Cas
     let memory: Arc<dyn Memory> = Arc::from(create_memory(&mem_cfg, tmp.path(), None)?);
 
     let observer = Arc::new(RecordingObserver::new());
-    let provider = (deps.provider)(trace)?;
+    let ProviderSetup {
+        provider,
+        on_turn_end,
+    } = (deps.provider)(trace)?;
 
     let mut agent = Agent::builder()
         .model_provider(provider)
@@ -168,8 +209,13 @@ async fn run_replay_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<Cas
 
     let start = std::time::Instant::now();
     let mut final_response = String::new();
-    for turn in &trace.turns {
+    for (turn_index, turn) in trace.turns.iter().enumerate() {
         final_response = agent.turn(&turn.user_input).await?;
+        // Enforce the turn boundary: every step scripted for this turn must have been
+        // consumed before the next turn begins, so responses cannot bleed across turns.
+        if let Some(on_turn_end) = &on_turn_end {
+            on_turn_end(turn_index)?;
+        }
     }
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -413,5 +459,103 @@ mod tests {
         std::fs::write(dir.path().join("smoke.json"), SMOKE).unwrap();
         let report = run_suite(dir.path(), &RunDeps::replay()).await.unwrap();
         assert!(report.all_passed(), "{report:?}");
+    }
+
+    // --- B2: the replay per-turn consumption boundary ---
+
+    #[tokio::test]
+    async fn over_specified_turn_is_an_error() {
+        // The turn declares two steps but the agent makes a single chat() call, so the
+        // extra step is left unconsumed. Under a flat queue this passed silently;
+        // it must surface as a turn-scoped error rather than bleed into a next turn.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "test-over-specified",
+                "turns": [{ "user_input": "Hi", "steps": [
+                    { "response": { "type": "text", "content": "Hello there." } },
+                    { "response": { "type": "text", "content": "unused extra step" } }
+                ] }],
+                "expects": {}
+            }"#,
+        )
+        .unwrap();
+        let err = match run_case(&trace, &RunDeps::replay()).await {
+            Ok(_) => panic!("expected an error: an over-specified turn left a step unconsumed"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("over-specifies") || msg.contains("never requested"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn leftover_step_does_not_leak_into_next_turn() {
+        // Turn 1 scripts two steps and the agent consumes one. With a single flat
+        // queue, turn 2 would silently receive turn 1's leftover ("turn one leftover")
+        // as its response, shifting the whole trace one step out of phase while still
+        // reporting green. The boundary must fail the run at turn 1 instead.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "test-cross-turn-leak",
+                "turns": [
+                    { "user_input": "Hi", "steps": [
+                        { "response": { "type": "text", "content": "Hello there." } },
+                        { "response": { "type": "text", "content": "turn one leftover" } }
+                    ] },
+                    { "user_input": "And goodbye?", "steps": [
+                        { "response": { "type": "text", "content": "Goodbye!" } }
+                    ] }
+                ],
+                "expects": {}
+            }"#,
+        )
+        .unwrap();
+
+        let err = match run_case(&trace, &RunDeps::replay()).await {
+            Ok(outcome) => panic!(
+                "expected an error; turn 1's leftover leaked into turn 2: {:?}",
+                outcome.record.final_response
+            ),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("turn 0")
+                && (msg.contains("over-specifies") || msg.contains("never requested")),
+            "the error should name the offending turn: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn under_specified_turn_is_scoped_to_its_own_turn() {
+        // Turn 1 scripts one step and turn 2 scripts none of its own beyond the first
+        // response the agent needs; exhausting the current turn's queue must not fall
+        // through to a later turn's steps.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "test-under-specified",
+                "turns": [
+                    { "user_input": "Echo hello for me", "steps": [
+                        { "response": { "type": "tool_calls", "tool_calls": [{ "id": "call_1", "name": "echo", "arguments": {"message": "hello"} }] } }
+                    ] },
+                    { "user_input": "And goodbye?", "steps": [
+                        { "response": { "type": "text", "content": "Goodbye!" } }
+                    ] }
+                ],
+                "expects": {}
+            }"#,
+        )
+        .unwrap();
+
+        let err = run_case(&trace, &RunDeps::replay())
+            .await
+            .expect_err("turn 0 needs a follow-up response it does not script");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("turn 0") && msg.contains("more LLM responses"),
+            "the exhaustion error should be scoped to turn 0: {msg}"
+        );
     }
 }
