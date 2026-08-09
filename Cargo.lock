@@ -13756,6 +13756,7 @@ dependencies = [
  "nostr-sdk",
  "parking_lot",
  "portable-atomic",
+ "quick-xml",
  "rand 0.10.1",
  "ratatui",
  "rcgen",

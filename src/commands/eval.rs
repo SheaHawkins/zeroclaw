@@ -24,6 +24,9 @@ pub struct FinalizeOpts {
 
 /// Handle the post-run flow (dumps, baselines, comparison, printing) and return
 /// the process exit code. Kept together so `main` only wires flags.
+///
+/// Every accepted path converges on the single [`emit_report`] call at the end,
+/// so no flag combination can drop the requested output format.
 pub async fn finalize(
     config: &Config,
     mode: Mode,
@@ -32,82 +35,134 @@ pub async fn finalize(
     opts: FinalizeOpts,
 ) -> Result<i32> {
     let kind = SuiteKind::resolve(suite_path, opts.suite_kind);
-    print_report(&report, opts.format);
 
     let wrote_auto = write_dumps(
         &report,
         opts.dump_records.as_deref(),
         Path::new(AUTO_DUMP_DIR),
     )?;
-    if wrote_auto && opts.format == OutputFormat::Table {
-        println!(
-            "{}",
-            get_required_cli_string_with_args(
-                "cli-eval-failed-case-records",
-                &[("dir", AUTO_DUMP_DIR)],
-            )
-        );
-    }
 
-    // --write-baseline: persist the run and exit with its normal code.
-    if let Some(path) = &opts.write_baseline {
+    // --write-baseline: persist the run, then fall through to the same renderer
+    // with an explicit no-comparison policy. A baseline refresh has no prior
+    // baseline to diff against, so nothing is <skipped/> — but the requested
+    // format is still emitted exactly once. Returning early here is what made
+    // `--format junit --write-baseline` produce no document at all.
+    let mut flaky_ids: Vec<String> = Vec::new();
+    let compared = if let Some(path) = &opts.write_baseline {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         std::fs::write(path, Baseline::from_report(&report).to_json())?;
-        return Ok(report.exit_code(kind, None));
-    }
+        None
+    } else {
+        // --baseline: compare and apply the live flakiness rule.
+        match &opts.baseline {
+            Some(path) => {
+                let baseline = Baseline::from_json(&std::fs::read_to_string(path)?)?;
+                let mut cmp = baseline::compare(&report, &baseline);
+                if mode == Mode::Live {
+                    let rerun_passed =
+                        Box::pin(rerun_live_regressions(config, suite_path, &cmp)).await?;
+                    flaky_ids =
+                        baseline::downgrade_flaky_regressions(&mut cmp, mode, &rerun_passed);
+                }
+                Some((cmp, baseline))
+            }
+            None => None,
+        }
+    };
+    let (comparison, baseline) = match compared {
+        Some((cmp, baseline)) => (Some(cmp), Some(baseline)),
+        None => (None, None),
+    };
 
-    // --baseline: compare, apply the live flakiness rule, and report.
-    let comparison = match &opts.baseline {
-        Some(path) => {
-            let baseline = Baseline::from_json(&std::fs::read_to_string(path)?)?;
-            let mut cmp = baseline::compare(&report, &baseline);
-            if mode == Mode::Live {
-                let rerun_passed =
-                    Box::pin(rerun_live_regressions(config, suite_path, &cmp)).await?;
-                let flaky = baseline::downgrade_flaky_regressions(&mut cmp, mode, &rerun_passed);
-                if opts.format == OutputFormat::Table {
-                    for id in &flaky {
-                        println!(
-                            "{}",
-                            get_required_cli_string_with_args(
-                                "cli-eval-flaky-unconfirmed-regression",
-                                &[("id", id)],
-                            )
-                        );
+    emit_report(EmitReport {
+        report: &report,
+        comparison: comparison.as_ref(),
+        baseline: baseline.as_ref(),
+        format: opts.format,
+        kind,
+        wrote_auto,
+        flaky_ids: &flaky_ids,
+    });
+
+    Ok(report.exit_code(kind, comparison.as_ref()))
+}
+
+/// Everything the single render site needs. Grouped in one struct so adding a
+/// new output format cannot silently miss a call site.
+struct EmitReport<'a> {
+    report: &'a SuiteReport,
+    comparison: Option<&'a baseline::BaselineComparison>,
+    baseline: Option<&'a Baseline>,
+    format: OutputFormat,
+    kind: SuiteKind,
+    wrote_auto: bool,
+    /// Live cases downgraded from regression to flaky-unconfirmed, announced in
+    /// the table output only.
+    flaky_ids: &'a [String],
+}
+
+/// The one place a run's output is written. Every accepted flag combination
+/// reaches this exactly once, so a requested format is never dropped.
+fn emit_report(args: EmitReport<'_>) {
+    let EmitReport {
+        report,
+        comparison,
+        baseline,
+        format,
+        kind,
+        wrote_auto,
+        flaky_ids,
+    } = args;
+
+    match format {
+        OutputFormat::Json => println!("{}", report.to_json()),
+        OutputFormat::Table => {
+            println!("{}", report.render_table());
+            if wrote_auto {
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-eval-failed-case-records",
+                        &[("dir", AUTO_DUMP_DIR)],
+                    )
+                );
+            }
+            for id in flaky_ids {
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-eval-flaky-unconfirmed-regression",
+                        &[("id", id.as_str())],
+                    )
+                );
+            }
+            match (comparison, baseline) {
+                (Some(cmp), Some(baseline)) => print_comparison(cmp, kind, report, baseline),
+                _ => {
+                    if kind == SuiteKind::Capability {
+                        println!("  {}", report.capability_summary(None));
                     }
                 }
             }
-            if opts.format == OutputFormat::Table {
-                print_comparison(&cmp, kind, &report, &baseline);
-            }
-            Some(cmp)
         }
-        None => {
-            if kind == SuiteKind::Capability && opts.format == OutputFormat::Table {
-                println!("  {}", report.capability_summary(None));
-            }
-            None
+        OutputFormat::Junit => {
+            // Cases unverifiable against the baseline render as <skipped/>. With
+            // no comparison (no --baseline, or --write-baseline) nothing is
+            // skipped and the raw suite report is rendered as-is.
+            let skipped: Vec<&str> = comparison
+                .map(|cmp| {
+                    cmp.per_case
+                        .iter()
+                        .filter(|(_, c)| matches!(c, CaseComparison::Unverifiable))
+                        .map(|(id, _)| id.as_str())
+                        .collect()
+                })
+                .unwrap_or_default();
+            print!("{}", zeroclaw_eval::junit::render_junit(report, &skipped));
         }
-    };
-
-    if opts.format == OutputFormat::Junit {
-        // Cases unverifiable against the baseline render as <skipped/>.
-        let skipped: Vec<&str> = comparison
-            .as_ref()
-            .map(|cmp| {
-                cmp.per_case
-                    .iter()
-                    .filter(|(_, c)| matches!(c, CaseComparison::Unverifiable))
-                    .map(|(id, _)| id.as_str())
-                    .collect()
-            })
-            .unwrap_or_default();
-        print!("{}", zeroclaw_eval::junit::render_junit(&report, &skipped));
     }
-
-    Ok(report.exit_code(kind, comparison.as_ref()))
 }
 
 /// Re-run each regressed case once against the same config, returning whether the
@@ -312,15 +367,20 @@ pub enum OutputFormat {
     Junit,
 }
 
-/// Render a suite report in the requested format. JUnit is emitted separately in
-/// `finalize` (it needs the baseline comparison for `<skipped/>`), so it is a
-/// no-op here.
+/// Render a suite report in the requested format, without any comparison
+/// context. Kept for callers that only have a `SuiteReport`; the `eval run`
+/// flow goes through `emit_report` instead so no format can be dropped by an
+/// early return.
 pub fn print_report(report: &SuiteReport, format: OutputFormat) {
-    match format {
-        OutputFormat::Json => println!("{}", report.to_json()),
-        OutputFormat::Table => println!("{}", report.render_table()),
-        OutputFormat::Junit => {}
-    }
+    emit_report(EmitReport {
+        report,
+        comparison: None,
+        baseline: None,
+        format,
+        kind: SuiteKind::Regression,
+        wrote_auto: false,
+        flaky_ids: &[],
+    });
 }
 
 #[cfg(test)]
