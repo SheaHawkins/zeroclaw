@@ -397,7 +397,35 @@ impl SopEngine {
     /// `resolve_gate` for a `WaitingApproval` run or the historical checkpoint
     /// resolver for a `PausedCheckpoint` run. The broker is cloned out first so it
     /// does not borrow `self` while `self` is mutated by the chokepoint.
+    ///
+    /// This shared entry point does **not** consume a resumed deterministic
+    /// capability tail inline: the caller receives the resumed action and hands it
+    /// to the shared async executor, which reacquires the engine lock once per
+    /// capability. That is what lets an operator cancellation persist
+    /// `CancelRequested` *between* post-checkpoint capabilities instead of blocking
+    /// on the engine mutex until the whole tail has already run.
+    ///
+    /// A caller that genuinely owns an exclusive engine handle and must observe the
+    /// fully-driven tail before returning wants [`Self::resolve_via_broker_inline`]
+    /// instead — but note that no shared transport qualifies.
     pub fn resolve_via_broker(
+        &mut self,
+        run_id: &str,
+        decision: super::approval::ApprovalDecision,
+        principal: super::approval::ApprovalPrincipal,
+    ) -> Result<super::approval::BrokerOutcome> {
+        self.resolve_via_broker_inner(run_id, decision, principal, false)
+    }
+
+    /// Resolve through the broker and synchronously drive the resumed
+    /// deterministic capability tail while the engine mutex is still held.
+    ///
+    /// ⚠️ Cancellation cannot interleave with a tail driven this way. Reserved for
+    /// genuinely exclusive callers (single-owner engine handles and tests that
+    /// assert on the fully-driven tail). Shared transports — admin HTTP,
+    /// WebSocket, RPC, channels, and the `sop_approve` tool — must use
+    /// [`Self::resolve_via_broker`], which defers the tail.
+    pub fn resolve_via_broker_inline(
         &mut self,
         run_id: &str,
         decision: super::approval::ApprovalDecision,
@@ -406,10 +434,8 @@ impl SopEngine {
         self.resolve_via_broker_inner(run_id, decision, principal, true)
     }
 
-    /// Resolve a broker-authorized gate without synchronously consuming a
-    /// resumed deterministic capability tail. Headless transports hand the
-    /// returned action to the shared async executor, which reacquires the
-    /// engine lock once per capability so cancellation can interleave.
+    /// Explicit alias for [`Self::resolve_via_broker`], kept for call sites that
+    /// want the deferral to be obvious at the point of use.
     pub fn resolve_via_broker_deferred(
         &mut self,
         run_id: &str,
@@ -13804,7 +13830,7 @@ type = "manual"
         let run_id = extract_run_id(&first).to_string();
 
         let outcome = engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Approve,
                 super::super::approval::ApprovalPrincipal::cli(None),
@@ -13891,7 +13917,7 @@ type = "manual"
         let run_id = extract_run_id(&first).to_string();
 
         let outcome = engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Approve,
                 super::super::approval::ApprovalPrincipal::cli(None),
@@ -13948,7 +13974,7 @@ type = "manual"
         let run_id = extract_run_id(&first).to_string();
 
         let first_error = engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Approve,
                 super::super::approval::ApprovalPrincipal::cli(None),
@@ -14078,7 +14104,7 @@ type = "manual"
         let run_id = extract_run_id(&first).to_string();
 
         let outcome = engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Approve,
                 super::super::approval::ApprovalPrincipal::agent("triage-agent"),
@@ -14140,7 +14166,7 @@ type = "manual"
         let run_id = extract_run_id(&first).to_string();
 
         let outcome = engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Approve,
                 super::super::approval::ApprovalPrincipal::cli(None),
@@ -14198,7 +14224,7 @@ type = "manual"
         let run_id = extract_run_id(&first).to_string();
 
         let outcome = engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Approve,
                 super::super::approval::ApprovalPrincipal::cli(None),
@@ -14254,7 +14280,7 @@ type = "manual"
         let run_id = extract_run_id(&first).to_string();
 
         let first_outcome = engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Approve,
                 super::super::approval::ApprovalPrincipal::cli(None),
@@ -14336,7 +14362,7 @@ type = "manual"
         );
 
         let first_outcome = engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Approve,
                 super::super::approval::ApprovalPrincipal::cli(None),
@@ -14433,7 +14459,7 @@ type = "manual"
         );
 
         let outcome = engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Approve,
                 super::super::approval::ApprovalPrincipal::cli(None),
@@ -14627,7 +14653,7 @@ type = "manual"
         assert!(matches!(parked, SopRunAction::CheckpointWait { .. }));
 
         let outcome = engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Amend {
                     text: "the operator rewrite".into(),
@@ -15024,7 +15050,7 @@ type = "manual"
         }
         // One revise at gate 1: revision 1.
         engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Revise {
                     guidance: "shorter".into(),
@@ -15036,7 +15062,7 @@ type = "manual"
         // Approve gate 1 -> the tail drives to gate 2, whose presentation must
         // be revision 2 (unique vs gate 1's 0 and 1) with a FRESH revise budget.
         engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Approve,
                 super::super::approval::ApprovalPrincipal::cli(None),
@@ -15055,7 +15081,7 @@ type = "manual"
         // Gate 2 has its FULL budget despite gate 1's spend.
         for i in 1..=MAX_GATE_REVISIONS {
             engine
-                .resolve_via_broker(
+                .resolve_via_broker_inline(
                     &run_id,
                     super::super::approval::ApprovalDecision::Revise {
                         guidance: format!("gate2 round {i}"),
@@ -15066,7 +15092,7 @@ type = "manual"
         }
         assert!(
             engine
-                .resolve_via_broker(
+                .resolve_via_broker_inline(
                     &run_id,
                     super::super::approval::ApprovalDecision::Revise {
                         guidance: "over budget".into(),
@@ -15096,7 +15122,7 @@ type = "manual"
         let state_file = dir.join(format!("{run_id}.state.json"));
         assert!(state_file.exists(), "the park must write the snapshot");
         engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Deny { reason: None },
                 super::super::approval::ApprovalPrincipal::cli(None),
@@ -15114,7 +15140,7 @@ type = "manual"
         let state_file = dir.join(format!("{run_id}.state.json"));
         assert!(state_file.exists());
         engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Approve,
                 super::super::approval::ApprovalPrincipal::cli(None),
