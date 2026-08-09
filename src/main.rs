@@ -521,7 +521,8 @@ enum EvalCommands {
         #[arg(long)]
         suite: Option<String>,
 
-        /// Execution mode: `replay` (deterministic) or `live` (later phase).
+        /// Execution mode: `replay` (deterministic, no network) or `live`
+        /// (real provider — makes network calls and incurs cost).
         /// Defaults to config `[eval] mode`.
         #[arg(long)]
         mode: Option<String>,
@@ -1071,14 +1072,22 @@ Examples:
     #[command(long_about = "\
 Run the agent evaluation harness.
 
-Phase 0 supports deterministic replay: every `*.json` trace fixture in the suite \
-directory is replayed through the real agent loop and graded against its declarative \
-expectations. No network calls, fully deterministic. Exits non-zero if any case fails, \
-so it can gate CI.
+Two execution modes are supported.
+
+`--mode replay` (the default) is deterministic: every `*.json` trace fixture in the \
+suite directory is replayed through the real agent loop against its scripted LLM \
+responses and graded against its declarative expectations. No network calls, no cost.
+
+`--mode live` executes the same cases against the real provider configured in \
+`[eval].live_provider`. It makes network calls and incurs provider cost; cases run in \
+a per-case sandboxed workspace under the `[eval].live_allowed_tools` allowlist.
+
+Exits non-zero if any case fails, so it can gate CI.
 
 Examples:
   zeroclaw eval run                                  # replay ./evals/regression
-  zeroclaw eval run --suite evals/regression --format json")]
+  zeroclaw eval run --suite evals/regression --format json
+  zeroclaw eval run --mode live                      # real provider, network + cost")]
     Eval {
         #[command(subcommand)]
         eval_command: EvalCommands,

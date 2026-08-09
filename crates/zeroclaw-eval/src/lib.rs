@@ -25,8 +25,9 @@ use std::str::FromStr;
 pub enum Mode {
     /// Deterministic replay against scripted LLM responses — no network, no cost.
     Replay,
-    /// Live execution against a real provider. Added in a later phase; the Phase 0
-    /// runner returns a clear error so the variant can already be parsed from the CLI.
+    /// Live execution against the provider configured in `[eval].live_provider`.
+    /// Makes real network calls and incurs provider cost; each case runs in an
+    /// isolated sandboxed workspace under the configured tool allowlist.
     Live,
 }
 
