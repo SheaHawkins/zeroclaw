@@ -8571,6 +8571,154 @@ mod tests {
         }
     }
 
+    /// The checklist rows exactly as a committed locale ships them.
+    ///
+    /// The identifiability guarantee is about the strings users actually see,
+    /// so these are read from the committed catalogues rather than retyped:
+    /// a hand-written approximation can stay distinguishable at a width where
+    /// the real, longer, column-padded row has already collapsed.
+    #[cfg(feature = "agent-runtime")]
+    fn quickstart_checklist_rows_for_locale(cli_ftl: &str) -> Vec<String> {
+        const ROW_KEYS: [&str; 6] = [
+            "cli-quickstart-row-model-provider",
+            "cli-quickstart-row-risk-profile",
+            "cli-quickstart-row-memory",
+            "cli-quickstart-row-channels",
+            "cli-quickstart-row-peer-groups",
+            "cli-quickstart-row-agent-identity",
+        ];
+
+        let value_for = |key: &str| -> String {
+            cli_ftl
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{key} = ")))
+                .unwrap_or_else(|| panic!("{key} should be defined in the catalogue"))
+                .to_string()
+        };
+
+        let mut rows: Vec<String> = ROW_KEYS
+            .iter()
+            .map(|key| {
+                value_for(key)
+                    .replace("{$glyph}", "[ ]")
+                    .replace("{$summary}", "not yet chosen")
+            })
+            .collect();
+        rows.push(value_for("cli-quickstart-create-agent"));
+        rows
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_accepted_widths_keep_every_action_distinguishable() {
+        // The blocker this guards: a width floor chosen only for arithmetic
+        // safety left widths 3 and 4 "supported" while every fitted row
+        // collapsed to "" or ".", producing an interactive menu in which the
+        // user could not tell Provider from Risk from Create — and could
+        // commit real config chosen blind. Accepting a width must therefore
+        // mean the rows stay individually readable, in every locale we ship,
+        // not merely that the budget subtraction did not underflow.
+        let locales: [(&str, &str); 5] = [
+            (
+                "en",
+                include_str!("../crates/zeroclaw-runtime/locales/en/cli.ftl"),
+            ),
+            (
+                "es",
+                include_str!("../crates/zeroclaw-runtime/locales/es/cli.ftl"),
+            ),
+            (
+                "fr",
+                include_str!("../crates/zeroclaw-runtime/locales/fr/cli.ftl"),
+            ),
+            (
+                "ja",
+                include_str!("../crates/zeroclaw-runtime/locales/ja/cli.ftl"),
+            ),
+            (
+                "zh-CN",
+                include_str!("../crates/zeroclaw-runtime/locales/zh-CN/cli.ftl"),
+            ),
+        ];
+
+        for (locale, cli_ftl) in locales {
+            let rows = quickstart_checklist_rows_for_locale(cli_ftl);
+            assert_eq!(rows.len(), 7, "{locale}: expected seven checklist rows");
+
+            for width in 0..=120usize {
+                let Some(budget) = quickstart_selector_row_budget(width) else {
+                    continue;
+                };
+
+                let fitted: Vec<String> = rows
+                    .iter()
+                    .map(|row| fit_quickstart_selector_row(row, budget))
+                    .collect();
+
+                for (row, label) in rows.iter().zip(&fitted) {
+                    assert!(
+                        !label.is_empty(),
+                        "{locale}: width {width} accepted but {row:?} fits to an empty label"
+                    );
+                    assert!(
+                        label.chars().any(|ch| ch.is_alphanumeric()),
+                        "{locale}: width {width} accepted but {row:?} fits to {label:?}, \
+                         which carries no readable text"
+                    );
+                }
+
+                let distinct: std::collections::HashSet<&str> =
+                    fitted.iter().map(String::as_str).collect();
+                assert_eq!(
+                    distinct.len(),
+                    fitted.len(),
+                    "{locale}: width {width} accepted but the fitted rows are not all \
+                     distinguishable: {fitted:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_rejects_widths_that_erase_action_labels() {
+        // The specific widths the previous floor blessed. At width 3 the row
+        // budget was 0 and every label fitted to ""; at width 4 the budget was
+        // 1 and every label fitted to ".". Both must now be rejected before
+        // any interaction can start.
+        let rows = quickstart_checklist_rows_for_locale(include_str!(
+            "../crates/zeroclaw-runtime/locales/en/cli.ftl"
+        ));
+
+        for width in [0usize, 1, 2, 3, 4, 5, 10, 19] {
+            assert_eq!(
+                quickstart_selector_row_budget(width),
+                None,
+                "width {width} must be rejected, not fitted"
+            );
+        }
+
+        // Demonstrate what acceptance at those widths would have meant, so the
+        // rejection above is anchored to the user-visible failure rather than
+        // to an arbitrary constant.
+        for (collapsed_budget, expected) in [(0usize, ""), (1, ".")] {
+            let fitted: std::collections::HashSet<String> = rows
+                .iter()
+                .map(|row| fit_quickstart_selector_row(row, collapsed_budget))
+                .collect();
+            assert_eq!(
+                fitted,
+                std::collections::HashSet::from([expected.to_string()]),
+                "budget {collapsed_budget} collapses every action to {expected:?}"
+            );
+        }
+
+        assert!(
+            quickstart_selector_row_budget(QUICKSTART_SELECTOR_MIN_WIDTH).is_some(),
+            "the floor itself must remain usable"
+        );
+    }
+
     #[cfg(feature = "agent-runtime")]
     #[test]
     fn quickstart_selector_height_prevents_paging_suffixes() {
