@@ -88,8 +88,13 @@ fn shared_transports_still_resolve_through_the_broker() {
             .unwrap_or_else(|e| panic!("guarded call site {rel} must be readable: {e}"));
         let code = strip_line_comments(&src);
 
+        // Any broker entry point counts here, INCLUDING the inline one: this test
+        // must fail only when a call site has vanished entirely, never merely
+        // because it regressed onto the inline variant. Catching that regression is
+        // the other test's job, and duplicating it here would make one defect
+        // report as two unrelated failures.
         assert!(
-            code.contains("resolve_via_broker_deferred(") || code.contains("resolve_via_broker("),
+            code.contains("resolve_via_broker"),
             "{rel} is listed as a shared broker transport but no longer resolves through \
              the broker; update SHARED_TRANSPORT_CALL_SITES deliberately rather than \
              letting the inline-resolver guard pass vacuously"
