@@ -7646,6 +7646,138 @@ mod tests {
         handle.abort();
     }
 
+    /// Build a `callback_query` update carrying an inline-keyboard approval
+    /// tap, as Telegram delivers it to `getUpdates`.
+    fn telegram_callback_update(
+        update_id: i64,
+        callback_id: &str,
+        approval_id: &str,
+        action: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "update_id": update_id,
+            "callback_query": {
+                "id": callback_id,
+                "from": {"id": 900_001, "username": "alice"},
+                "data": format!("approval:{approval_id}:{action}"),
+            }
+        })
+    }
+
+    /// #9517 localized the Telegram approval acknowledgements through the
+    /// runtime Fluent catalogue. This PR relocates the whole `callback_query`
+    /// arm into `process_update`, so the move must not silently re-introduce
+    /// hard-coded English ack text.
+    ///
+    /// This drives a real `callback_query` through the listener and asserts
+    /// the posted `answerCallbackQuery` body's `text` is rebuilt from the
+    /// SAME `channel-telegram-approval-ack-*` keys the implementation uses —
+    /// locale-agnostic, so it holds whatever locale the test process
+    /// resolves to, and fails if any arm is replaced by a literal.
+    #[tokio::test]
+    async fn listen_callback_approval_ack_uses_fluent_catalogue() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        mount_telegram_startup_probe(&mock_server).await;
+
+        // One update per action, so every catalogue-backed arm is exercised
+        // in a single listener run: approve, always, deny, and the unknown
+        // fallback.
+        let actions = ["approve", "always", "deny", "bogus"];
+        let updates: Vec<serde_json::Value> = actions
+            .iter()
+            .enumerate()
+            .map(|(i, action)| {
+                telegram_callback_update(
+                    7_000 + i as i64,
+                    &format!("cb{i}"),
+                    "11111111-2222-3333-4444-555555555555",
+                    action,
+                )
+            })
+            .collect();
+        let last_uid = 7_000 + actions.len() as i64 - 1;
+
+        mount_telegram_get_updates(&mock_server, 0, serde_json::json!(updates)).await;
+        mount_telegram_get_updates(&mock_server, last_uid + 1, serde_json::json!([])).await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/answerCallbackQuery$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": true})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ch = Arc::new(
+            TelegramChannel::new(
+                "test-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["alice".to_string()]),
+                false,
+            )
+            .with_api_base(mock_server.uri()),
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        // A callback is terminal for inbound processing, so the offset must
+        // advance past the whole batch; waiting on that also guarantees every
+        // answerCallbackQuery has been posted before we inspect them.
+        assert!(
+            telegram_wait_for_main_loop_offset(&mock_server, last_uid + 1, Duration::from_secs(5))
+                .await,
+            "offset never advanced past the callback batch"
+        );
+
+        let ack_texts: Vec<String> = mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.url.path().ends_with("/answerCallbackQuery"))
+            .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+            .filter_map(|b| {
+                b.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from)
+            })
+            .collect();
+
+        // Rebuild the expectation through the catalogue, not from literals:
+        // a wiring regression that stops calling i18n, or a typo'd key,
+        // changes this and fails the assertion.
+        let expected = vec![
+            format!(
+                "✅ {}",
+                i18n::get_required_cli_string("channel-telegram-approval-ack-approved")
+            ),
+            format!(
+                "✅✅ {}",
+                i18n::get_required_cli_string("channel-telegram-approval-ack-always-approved")
+            ),
+            format!(
+                "❌ {}",
+                i18n::get_required_cli_string("channel-telegram-approval-ack-denied")
+            ),
+            format!(
+                "⚠️ {}",
+                i18n::get_required_cli_string("channel-telegram-approval-ack-unknown")
+            ),
+        ];
+        assert_eq!(
+            ack_texts, expected,
+            "answerCallbackQuery text must come from the Fluent catalogue, not hard-coded English"
+        );
+
+        handle.abort();
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // Live e2e: voice transcription via Groq Whisper + reply cache lookup
     // ─────────────────────────────────────────────────────────────────────
