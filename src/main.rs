@@ -192,6 +192,24 @@ fn quickstart_selector_row_budget(terminal_width: usize) -> Option<usize> {
     terminal_width.checked_sub(QUICKSTART_SELECTOR_ROW_OVERHEAD)
 }
 
+/// Resolve the terminal dimensions the Quickstart checklist will be fitted to.
+///
+/// `console::Term::size()` silently substitutes `(24, 80)` when the size query
+/// fails, so a narrow terminal whose size is unavailable would otherwise get
+/// rows fitted for 77 columns — reintroducing the exact overflow class this
+/// change exists to prevent. Unknown dimensions therefore take the same
+/// fail-closed path as a too-narrow terminal.
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_terminal_size(term: &console::Term) -> Option<(u16, u16)> {
+    term.size_checked()
+}
+
+/// Whether a sampled terminal size is usable for fitting the checklist.
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_size_is_usable(size: Option<(u16, u16)>) -> bool {
+    size.is_some()
+}
+
 #[cfg(feature = "agent-runtime")]
 fn quickstart_selector_min_height(item_count: usize) -> usize {
     item_count.saturating_add(QUICKSTART_SELECTOR_VERTICAL_OVERHEAD)
@@ -248,6 +266,28 @@ fn quickstart_selector_resize_error(
     ))
 }
 
+/// Decide whether an interaction may continue at the size sampled now.
+///
+/// Returns `Err` both when the terminal changed size and when its size became
+/// unavailable: an unknown size is not evidence that the geometry still
+/// matches, and `Term::size()`'s fabricated `(24, 80)` fallback could even
+/// compare *equal* to the initial sample on an 80x24 terminal that has since
+/// lost its size query. Unknown therefore fails closed, like a resize.
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_recheck_size(
+    initial_size: (u16, u16),
+    current_size: Option<(u16, u16)>,
+) -> Result<()> {
+    match current_size {
+        Some(current) if current == initial_size => Ok(()),
+        Some(current) => Err(quickstart_selector_resize_error(initial_size, current)),
+        None => Err(anyhow::Error::msg(qta(
+            "cli-quickstart-terminal-size-unknown",
+            &[],
+        ))),
+    }
+}
+
 /// Render the fixed-size Quickstart checklist without dialoguer paging.
 ///
 /// The terminal dimensions sampled for fitting are part of this interaction's
@@ -264,10 +304,8 @@ fn interact_quickstart_selector(
     if labels.is_empty() {
         bail!(qta("cli-quickstart-empty-checklist", &[]));
     }
-    let current_size = term.size();
-    if current_size != initial_size {
-        return Err(quickstart_selector_resize_error(initial_size, current_size));
-    }
+    let current_size = quickstart_selector_terminal_size(term);
+    quickstart_selector_recheck_size(initial_size, current_size)?;
 
     fn render(
         term: &console::Term,
@@ -294,10 +332,13 @@ fn interact_quickstart_selector(
 
         loop {
             let key = term.read_key()?;
-            let current_size = term.size();
-            if current_size != initial_size {
-                term.clear_screen()?;
-                return Err(quickstart_selector_resize_error(initial_size, current_size));
+            let current_size = quickstart_selector_terminal_size(term);
+            if let Err(error) = quickstart_selector_recheck_size(initial_size, current_size) {
+                // Scoped cleanup: erase only the rows this selector drew.
+                // `clear_screen()` would also wipe unrelated scrollback the
+                // user did not ask us to destroy.
+                clear(term, labels)?;
+                return Err(error);
             }
 
             match key {
@@ -1765,7 +1806,11 @@ async fn run_quickstart_cli(
         ));
 
         let term = console::Term::stderr();
-        let terminal_size = term.size();
+        // Fail closed when the size query fails: `Term::size()` would hand back
+        // a fabricated 80x24 and fit rows for a terminal we cannot see.
+        let Some(terminal_size) = quickstart_selector_terminal_size(&term) else {
+            anyhow::bail!("{}", qta("cli-quickstart-terminal-size-unknown", &[]));
+        };
         let (terminal_height, terminal_width) = terminal_size;
         let terminal_height = usize::from(terminal_height);
         let terminal_width = usize::from(terminal_width);
@@ -8572,6 +8617,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_unknown_terminal_size_fails_closed() {
+        // `console::Term::size()` silently substitutes (24, 80) when the size
+        // query fails, so a narrow terminal with an unavailable size would get
+        // rows fitted for 77 columns. The checklist must resolve its geometry
+        // through the checked query and treat "unknown" as unusable.
+        assert!(
+            !quickstart_selector_size_is_usable(None),
+            "an unknown terminal size must not be accepted for fitting"
+        );
+        assert!(
+            quickstart_selector_size_is_usable(Some((24, 80))),
+            "a reported size must still be accepted"
+        );
+
+        // A real 80x24 terminal and the fabricated fallback are indistinguishable
+        // once `size()` has flattened them, which is exactly why the checked
+        // query is the one wired into the selector.
+        let term = console::Term::stderr();
+        assert_eq!(
+            quickstart_selector_terminal_size(&term),
+            term.size_checked(),
+            "the selector must resolve geometry through the checked size query"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_recheck_rejects_resize_and_unknown_size() {
+        let initial = (24u16, 80u16);
+
+        assert!(
+            quickstart_selector_recheck_size(initial, Some(initial)).is_ok(),
+            "an unchanged size must allow the interaction to continue"
+        );
+
+        let resized = quickstart_selector_recheck_size(initial, Some((24, 40)))
+            .expect_err("a changed size must abort the interaction");
+        assert!(
+            resized.to_string().contains("40"),
+            "the resize error should name the new width; got {resized}"
+        );
+
+        // The important half: unknown is not evidence the geometry still
+        // matches. Without the checked query this branch would compare the
+        // fabricated (24, 80) against the initial sample, find them equal, and
+        // keep redrawing rows fitted for a terminal it can no longer see.
+        let unknown = quickstart_selector_recheck_size(initial, None)
+            .expect_err("an unavailable size must abort the interaction");
+        assert_eq!(
+            unknown.to_string(),
+            qta("cli-quickstart-terminal-size-unknown", &[]),
+            "unknown size must surface the localized size-unknown error"
+        );
     }
 
     #[cfg(feature = "agent-runtime")]
