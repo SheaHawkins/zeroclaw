@@ -27,10 +27,36 @@ pub struct CaseOutcome {
     pub grades: Vec<GradeResult>,
 }
 
+/// Enforces a conversation-turn boundary on the provider side.
+///
+/// Replay implements this to assert every step scripted for a turn was consumed
+/// before the next turn begins. Without it, a flat response queue lets a turn that
+/// over-specifies its round-trips bleed the surplus into the following turn and
+/// still pass — a false green from a harness other PRs gate merges on.
+pub trait TurnBoundary: Send + Sync {
+    /// Called after each completed turn. Errors if the turn was over-specified.
+    fn finish_turn(&self, turn_index: usize) -> anyhow::Result<()>;
+}
+
+/// A provider built for one case, plus the optional turn-boundary hook that goes
+/// with it. Live mode has no scripted steps to over-specify, so it supplies `None`.
+pub struct CaseProvider {
+    pub provider: Box<dyn ModelProvider>,
+    pub turn_boundary: Option<Arc<dyn TurnBoundary>>,
+}
+
+impl From<Box<dyn ModelProvider>> for CaseProvider {
+    fn from(provider: Box<dyn ModelProvider>) -> Self {
+        Self {
+            provider,
+            turn_boundary: None,
+        }
+    }
+}
+
 /// Factory that builds a fresh model provider for one case run. Injected so
 /// replay, live, and deterministic tests share one runner code path.
-pub type ProviderFactory =
-    Box<dyn Fn(&LlmTrace) -> anyhow::Result<Box<dyn ModelProvider>> + Send + Sync>;
+pub type ProviderFactory = Box<dyn Fn(&LlmTrace) -> anyhow::Result<CaseProvider> + Send + Sync>;
 
 /// Everything a case run needs that differs between replay, live, and tests.
 ///
@@ -55,10 +81,14 @@ impl RunDeps {
         Self {
             mode: Mode::Replay,
             provider: Box::new(|trace| {
-                Ok(
-                    Box::new(crate::replay::TraceLlmProvider::try_from_trace(trace)?)
-                        as Box<dyn ModelProvider>,
-                )
+                let replay = crate::replay::TraceLlmProvider::try_from_trace(trace)?;
+                // The handle shares the provider's per-turn queues, so the runner
+                // can enforce turn boundaries without owning the boxed provider.
+                let turn_boundary: Arc<dyn TurnBoundary> = Arc::new(replay.handle());
+                Ok(CaseProvider {
+                    provider: Box::new(replay) as Box<dyn ModelProvider>,
+                    turn_boundary: Some(turn_boundary),
+                })
             }),
             provider_ref: "scripted".to_string(),
             live_tools: Vec::new(),
@@ -203,7 +233,10 @@ async fn run_replay_case(
     *provenance_out = Some(provenance.clone());
 
     let observer = Arc::new(RecordingObserver::new());
-    let provider = (deps.provider)(trace)?;
+    let CaseProvider {
+        provider,
+        turn_boundary,
+    } = (deps.provider)(trace)?;
 
     let mut agent = Agent::builder()
         .model_provider(provider)
@@ -216,8 +249,14 @@ async fn run_replay_case(
 
     let start = std::time::Instant::now();
     let mut final_response = String::new();
-    for turn in &trace.turns {
+    for (turn_index, turn) in trace.turns.iter().enumerate() {
         final_response = agent.turn(&turn.user_input).await?;
+        // Enforce the turn boundary: every step scripted for this turn must have
+        // been consumed before the next turn begins, so a surplus response cannot
+        // bleed forward and turn an over-specified fixture into a passing case.
+        if let Some(boundary) = &turn_boundary {
+            boundary.finish_turn(turn_index)?;
+        }
     }
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -471,5 +510,75 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
         assert_eq!(json["cases"][0]["score"], 1.0);
         assert!(json["cases"][0]["total_tokens"].is_number());
+    }
+
+    const OVER_SPECIFIED_TURN: &str = r#"{
+        "model_name": "test-over-specified-turn",
+        "turns": [
+            { "user_input": "Hi", "steps": [
+                { "response": { "type": "text", "content": "Hello there." } },
+                { "response": { "type": "text", "content": "SURPLUS-FROM-TURN-0" } }
+            ] },
+            { "user_input": "And goodbye?", "steps": [
+                { "response": { "type": "text", "content": "Goodbye!" } }
+            ] }
+        ],
+        "expects": {}
+    }"#;
+
+    #[tokio::test]
+    async fn replay_rejects_over_specified_turn() {
+        // Turn 0 scripts two responses but the agent only requests one. With a flat
+        // response queue the surplus silently becomes turn 1's answer and the case
+        // passes — a replay suite used as a merge gate would certify behaviour that
+        // never happened. The turn boundary must fail the case instead.
+        let trace: LlmTrace = serde_json::from_str(OVER_SPECIFIED_TURN).unwrap();
+        let err = run_case(&trace, &RunDeps::replay())
+            .await
+            .expect_err("an over-specified turn must fail the case, not pass it");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("over-specifies"),
+            "error must name the unconsumed responses: {msg}"
+        );
+        assert!(
+            msg.contains("turn 0"),
+            "error must name the offending turn: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_extra_response_does_not_bleed_into_next_turn() {
+        // The same fixture, observed from the other side: turn 1 must never receive
+        // turn 0's leftover response. If the surplus bled forward the run would
+        // succeed with "Goodbye!" left unconsumed, so a successful run — or a final
+        // response carrying the surplus — is the bug.
+        let trace: LlmTrace = serde_json::from_str(OVER_SPECIFIED_TURN).unwrap();
+        match run_case(&trace, &RunDeps::replay()).await {
+            Err(e) => assert!(
+                !e.to_string().contains("SURPLUS-FROM-TURN-0"),
+                "the surplus must be reported as unconsumed, never served: {e}"
+            ),
+            Ok(outcome) => panic!(
+                "turn 0's surplus bled into turn 1; final response: {:?}",
+                outcome.record.completion_or_default().final_response
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_exhausted_turn_names_the_turn() {
+        // The exhaustion guard is also per-turn now: turn 1 asking for a response
+        // the trace does not script for it must not be able to borrow turn 0's.
+        let trace: LlmTrace = serde_json::from_str(MULTI_TURN).unwrap();
+        let outcome = run_case(&trace, &RunDeps::replay()).await.unwrap();
+        // Baseline: a well-formed multi-turn fixture still replays cleanly.
+        assert!(
+            outcome
+                .record
+                .completion_or_default()
+                .final_response
+                .contains("Goodbye")
+        );
     }
 }
