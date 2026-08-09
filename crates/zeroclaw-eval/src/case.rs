@@ -146,17 +146,41 @@ pub fn validate_workspace_rel_path(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Collect the `*.json` fixture paths from a suite-directory listing, sorted
+/// for stable ordering.
+///
+/// Entry-level I/O errors are propagated with the suite directory attached,
+/// never discarded. A suite that cannot be fully enumerated must fail, not
+/// shrink: an eval report is used as CI evidence, and a silently smaller
+/// certified set yields a green report and a zero exit while an unknown
+/// number of cases never ran.
+///
+/// Takes the listing as an iterator rather than a `ReadDir` so the
+/// error path is reachable from a test without depending on the host
+/// filesystem being coaxed into failing mid-enumeration.
+fn collect_fixture_paths(
+    entries: impl Iterator<Item = std::io::Result<PathBuf>>,
+    dir: &Path,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry.with_context(|| {
+            format!("reading an entry in eval suite directory {}", dir.display())
+        })?;
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
 /// Load every `*.json` trace fixture in `dir`, sorted by path for stable ordering.
 pub fn load_suite(dir: &Path) -> anyhow::Result<Vec<(PathBuf, LlmTrace)>> {
     let read = std::fs::read_dir(dir)
         .with_context(|| format!("reading eval suite directory {}", dir.display()))?;
 
-    let mut paths: Vec<PathBuf> = read
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
-        .collect();
-    paths.sort();
+    let paths = collect_fixture_paths(read.map(|entry| entry.map(|e| e.path())), dir)?;
 
     let mut out = Vec::with_capacity(paths.len());
     for path in paths {
@@ -276,5 +300,52 @@ mod tests {
         assert_eq!(suite[0].1.model_name, "a"); // sorted by path
         assert_eq!(suite[1].1.model_name, "b");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_suite_propagates_entry_error_instead_of_shrinking() {
+        // The defect this guards: `filter_map(Result::ok)` over `read_dir`
+        // discarded entry-level I/O errors, so a fixture that disappeared or
+        // became unreadable mid-enumeration was silently omitted and the
+        // suite still reported all-green with a zero exit. Enumeration must
+        // fail, not shrink.
+        let dir = Path::new("/eval/suite");
+        let entries = vec![
+            Ok(dir.join("a.json")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "entry unreadable",
+            )),
+            Ok(dir.join("b.json")),
+        ];
+
+        let err = collect_fixture_paths(entries.into_iter(), dir)
+            .expect_err("an unreadable entry must abort the suite, not shrink it");
+
+        // The suite directory must be in the chain so CI output names which
+        // suite failed to enumerate.
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("reading an entry in eval suite directory /eval/suite"),
+            "error must name the suite directory, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("entry unreadable"),
+            "error must preserve the underlying io cause, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn collect_fixture_paths_keeps_only_sorted_json_on_the_happy_path() {
+        let dir = Path::new("/eval/suite");
+        let entries = vec![
+            Ok(dir.join("b.json")),
+            Ok(dir.join("note.txt")),
+            Ok(dir.join("a.json")),
+        ];
+
+        let paths = collect_fixture_paths(entries.into_iter(), dir).unwrap();
+
+        assert_eq!(paths, vec![dir.join("a.json"), dir.join("b.json")]);
     }
 }
