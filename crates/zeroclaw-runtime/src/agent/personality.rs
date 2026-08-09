@@ -19,6 +19,24 @@ pub const PERSONALITY_FILES: &[&str] = &[
     "MEMORY.md",
 ];
 
+/// [`PERSONALITY_FILES`] minus `MEMORY.md`, for isolated / ACP sessions created
+/// with `exclude_memory: true`. Those sessions get no memory tools, a
+/// `NoneMemory` backend and no automatic saves; the curated memory *content*
+/// must be withheld from the provider-visible prompt too, otherwise the
+/// "persistent memory isolated" guarantee is only half enforced.
+///
+/// Kept next to [`PERSONALITY_FILES`] deliberately: one list, one policy. Do
+/// not filter ad hoc at a call site.
+pub const PERSONALITY_FILES_WITHOUT_MEMORY: &[&str] = &[
+    "SOUL.md",
+    "IDENTITY.md",
+    "USER.md",
+    "AGENTS.md",
+    "TOOLS.md",
+    "HEARTBEAT.md",
+    "BOOTSTRAP.md",
+];
+
 pub const EDITABLE_PERSONALITY_FILES: &[&str] = &[
     "SOUL.md",
     "IDENTITY.md",
