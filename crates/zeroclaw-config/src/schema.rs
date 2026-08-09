@@ -19945,7 +19945,19 @@ impl Config {
             }
         }
 
-        // Reply-pacing bounds — both `reply_min_interval_secs` and
+        // A zero live case timeout is never a usable configuration: it becomes
+        // `Duration::from_secs(0)` at the `eval` command boundary and reaches
+        // `tokio::time::timeout` in `zeroclaw-eval`'s live driver, timing out
+        // every live turn instantly. Reject it rather than let live mode fail
+        // in a way that looks like a provider problem.
+        if self.eval.case_timeout_secs == 0 {
+            validation_bail!(
+                InvalidFormat,
+                "eval.case_timeout_secs",
+                "eval.case_timeout_secs must be at least 1 second (0 times out every live turn instantly)",
+            );
+        }
+
         // `reply_queue_depth_max` walk through one entry list so adding
         // a new paced channel only requires extending `reply_pacing_entries`.
         for (path_prefix, cfg) in self.reply_pacing_entries() {
@@ -36952,6 +36964,58 @@ allowed_users = []
         let cfg = eval_live_provider_config("");
         cfg.validate()
             .expect("empty eval.live_provider must validate");
+    }
+
+    fn eval_case_timeout_config(secs: u64) -> Config {
+        let toml = format!(
+            r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [eval]
+            case_timeout_secs = {secs}
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+        "#
+        );
+        toml::from_str(&toml).unwrap()
+    }
+
+    /// A zero live case timeout becomes `Duration::from_secs(0)` and reaches
+    /// `tokio::time::timeout`, so every live turn times out instantly and the
+    /// failure looks like a provider fault. Reject it in config validation.
+    #[tokio::test]
+    async fn config_validate_rejects_zero_eval_case_timeout() {
+        let cfg = eval_case_timeout_config(0);
+        let msg = format!(
+            "{:#}",
+            cfg.validate()
+                .expect_err("a zero eval.case_timeout_secs must fail")
+        );
+        assert!(
+            msg.contains("eval.case_timeout_secs") && msg.contains("at least 1 second"),
+            "expected InvalidFormat for eval.case_timeout_secs, got: {msg}"
+        );
+    }
+
+    /// The guard is a floor, not a ban: any positive timeout still validates.
+    #[tokio::test]
+    async fn config_validate_accepts_positive_eval_case_timeout() {
+        eval_case_timeout_config(1)
+            .validate()
+            .expect("a 1s eval.case_timeout_secs must validate");
+        eval_case_timeout_config(300)
+            .validate()
+            .expect("a 300s eval.case_timeout_secs must validate");
     }
 
     // effective_summary_provider precedence — agent → profile → None.
