@@ -98,6 +98,15 @@ impl CredentialRotation {
         pool
     }
 
+    /// Number of distinct credentials currently resolvable for this rotation.
+    ///
+    /// A pool of one cannot rotate, so callers use this to keep the
+    /// pre-rotation retry/backoff contract for single-key profiles instead of
+    /// treating "rotation is configured" as "an alternate credential exists".
+    fn pool_len(&self) -> usize {
+        self.pool().len()
+    }
+
     fn select(&self, start_after: Option<usize>) -> Option<SelectedCredential> {
         let pool = self.pool();
         if pool.is_empty() {
@@ -1100,6 +1109,19 @@ impl ReliableModelProviderEntry {
             .transpose()
     }
 
+    /// Whether this entry has more than one credential to rotate between.
+    ///
+    /// Rotation being *configured* is not the same as rotation being
+    /// *possible*: every non-empty API-key alias gets a `CredentialRotation`,
+    /// including single-key profiles. Only a pool of two or more can actually
+    /// rotate, so the rate-limit paths gate the "stop retrying, rotate
+    /// instead" behavior on this rather than on `credential_rotation.is_some()`.
+    fn can_rotate_credentials(&self) -> bool {
+        self.credential_rotation
+            .as_ref()
+            .is_some_and(|rotation| rotation.pool_len() > 1)
+    }
+
     fn rotate_after_rate_limit(
         &self,
         current: &BoundProvider,
@@ -1563,7 +1585,10 @@ impl ModelProvider for ReliableModelProvider {
                             }
 
                             if rate_limited && !rotated {
-                                if entry.credential_rotation.is_some() {
+                                // Only stop retrying when an alternate credential
+                                // actually exists. A single-key profile keeps the
+                                // pre-rotation `provider_retries` contract.
+                                if entry.can_rotate_credentials() {
                                     break;
                                 }
                                 if self.model_providers.len() > 1 {
@@ -1805,7 +1830,10 @@ impl ModelProvider for ReliableModelProvider {
                             }
 
                             if rate_limited && !rotated {
-                                if entry.credential_rotation.is_some() {
+                                // Only stop retrying when an alternate credential
+                                // actually exists. A single-key profile keeps the
+                                // pre-rotation `provider_retries` contract.
+                                if entry.can_rotate_credentials() {
                                     break;
                                 }
                                 if self.model_providers.len() > 1 {
@@ -2088,7 +2116,10 @@ impl ModelProvider for ReliableModelProvider {
                             }
 
                             if rate_limited && !rotated {
-                                if entry.credential_rotation.is_some() {
+                                // Only stop retrying when an alternate credential
+                                // actually exists. A single-key profile keeps the
+                                // pre-rotation `provider_retries` contract.
+                                if entry.can_rotate_credentials() {
                                     break;
                                 }
                                 if self.model_providers.len() > 1 {
@@ -2332,7 +2363,10 @@ impl ModelProvider for ReliableModelProvider {
                             }
 
                             if rate_limited && !rotated {
-                                if entry.credential_rotation.is_some() {
+                                // Only stop retrying when an alternate credential
+                                // actually exists. A single-key profile keeps the
+                                // pre-rotation `provider_retries` contract.
+                                if entry.can_rotate_credentials() {
                                     break;
                                 }
                                 if self.model_providers.len() > 1 {
@@ -4071,7 +4105,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_cooled_credential_is_not_retried() {
+    async fn single_credential_keeps_provider_retries_after_rate_limit() {
+        // Regression: every non-empty API-key alias gets a `CredentialRotation`,
+        // including one-key profiles. Gating the rate-limit `break` on
+        // "rotation is configured" silently dropped `provider_retries` for every
+        // single-key user. A pool of one cannot rotate, so the pre-rotation
+        // retry/backoff contract must survive.
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let provider = keyed_reliable(vec!["bad-only".into()], 3, Arc::clone(&seen), None);
 
@@ -4080,7 +4119,35 @@ mod tests {
             .await
             .expect_err("the only credential is rate limited");
 
-        assert_eq!(&*seen.lock(), &["bad-only"]);
+        assert_eq!(
+            &*seen.lock(),
+            &["bad-only", "bad-only", "bad-only", "bad-only"],
+            "a single-key profile must still consume max_retries + 1 attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_credential_rate_limit_still_rotates_instead_of_retrying() {
+        // Positive direction: with a real pool, a 429 must rotate to the next
+        // credential rather than burning retries on the cooled one. Keeps the
+        // single-key fix above from being satisfied by "always retry".
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let provider = keyed_reliable(
+            vec!["bad-first".into(), "healthy".into()],
+            3,
+            Arc::clone(&seen),
+            None,
+        );
+
+        assert_eq!(
+            provider.simple_chat("hello", "test", None).await.unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            &*seen.lock(),
+            &["bad-first", "healthy"],
+            "a rate-limited key with an alternate must rotate on the first retry"
+        );
     }
 
     #[tokio::test]
