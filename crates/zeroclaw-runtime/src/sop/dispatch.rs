@@ -3157,6 +3157,15 @@ mod tests {
                 "SopTriggerSource::{source} has drifted from its documented ingress classification"
             );
         }
+
+        // Keep the iterator arm meaningful: a NEW variant fails at the
+        // (wildcard-free) match in `ingress_kind`, at `expected` above, and
+        // here, so the count can never silently drift out of sync.
+        assert_eq!(
+            SopTriggerSource::iter().count(),
+            9,
+            "a trigger source was added or removed — classify it above"
+        );
     }
 
     /// The webhook trigger source is live: the gateway routes it through

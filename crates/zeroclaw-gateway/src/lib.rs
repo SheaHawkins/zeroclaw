@@ -7079,6 +7079,90 @@ path = "{trigger_path}"
         );
     }
 
+    /// B2 property test: `idempotency_storage_key` must be injective over the
+    /// whole `(namespace, caller_key)` space, not just the two collisions the
+    /// reviewers happened to name. Exhaustively cross-products adversarial
+    /// components that are rich in the separator character and asserts distinct
+    /// inputs never share an encoding.
+    #[test]
+    fn idempotency_storage_key_is_injective_over_adversarial_inputs() {
+        let namespaces = [
+            None,
+            Some(""),
+            Some(":"),
+            Some("sop:/sop/a"),
+            Some("sop:/sop/a:b"),
+            Some("sop:/sop/a:b:c"),
+            Some("sop:/sop/deploy"),
+            Some("1:x"),
+            Some("global"),
+            Some("ns"),
+        ];
+        let caller_keys = ["", ":", "b:c", "c", "k", "sop:/sop/deploy:k", "1:x", "ns"];
+
+        let mut seen: std::collections::HashMap<String, (Option<&str>, &str)> =
+            std::collections::HashMap::new();
+        for namespace in namespaces {
+            for caller_key in caller_keys {
+                let encoded = idempotency_storage_key(namespace, caller_key);
+                if let Some(previous) = seen.insert(encoded.clone(), (namespace, caller_key)) {
+                    assert_eq!(
+                        previous,
+                        (namespace, caller_key),
+                        "encoding collision: {previous:?} and {:?} both map to {encoded}",
+                        (namespace, caller_key),
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            namespaces.len() * caller_keys.len(),
+            "every distinct (namespace, caller_key) pair must have a distinct encoding"
+        );
+    }
+
+    /// B2 counterpart: injectivity must not have broken the *intended*
+    /// duplicate suppression — the same path with the same key is still a replay.
+    #[tokio::test]
+    async fn sop_idempotency_same_path_same_key_still_suppresses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let (state, secret) = with_webhook_secret(state);
+        let mut headers = webhook_secret_header(&secret);
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("dup-key"));
+
+        let first = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            headers.clone(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_parsed: serde_json::Value =
+            serde_json::from_slice(&first.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(first_parsed["status"], "accepted");
+
+        let second = api_sop_webhook::handle_sop_webhook(
+            State(state),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            headers,
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_parsed: serde_json::Value =
+            serde_json::from_slice(&second.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(
+            second_parsed["status"], "duplicate",
+            "the intended same-path same-key replay suppression must survive the new encoding"
+        );
+    }
+
     #[tokio::test]
     async fn sop_dispatch_rejected_when_no_credentials_configured() {
         let tmp = tempfile::tempdir().unwrap();
