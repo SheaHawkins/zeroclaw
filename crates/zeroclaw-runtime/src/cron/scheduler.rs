@@ -929,17 +929,28 @@ tokio::task_local! {
 /// `execute_and_persist_job` before it persists the result and calls
 /// `release_job`. A stalled backend (network stall, subprocess hang, lock
 /// contention) must never delay that critical path indefinitely, so the
-/// whole purge attempt (memory construction plus the backend call) runs
-/// under `ISOLATED_SESSION_PURGE_TIMEOUT`. On timeout the cleanup is
-/// abandoned (logged at WARN) rather than awaited further; the successful,
-/// fast-cleanup path is unaffected.
+/// whole purge attempt — memory construction *and* the backend call — runs
+/// inside one `supervise_wall_clock` boundary under
+/// `ISOLATED_SESSION_PURGE_TIMEOUT`. Both halves must be inside it: with the
+/// supported audited wrapper, `AuditedMemory::purge_session` performs a
+/// synchronous SQLite `execute` under a mutex in `log_audit` *before* its
+/// first await, so leaving the call inline under a same-runtime timer would
+/// let a contended `audit.db` starve the cleanup deadline and re-pin
+/// `locked_at`. On timeout the cleanup is abandoned (logged at WARN) rather
+/// than awaited further; the successful, fast-cleanup path is unaffected.
 async fn purge_isolated_session(
     config: &Config,
     job: &CronJob,
     agent_alias: &str,
     session_path: &std::path::Path,
 ) {
-    if !matches!(job.session_target, SessionTarget::Isolated) {
+    // Gate before doing any work. A `uses_memory = false` job runs memory-free
+    // end to end (`AgentRunOverrides::memory_free` binds `NoneMemory` and drops
+    // the persistent memory tools), so it has no session to purge. Without this
+    // check such a job would still construct the configured backend and reach
+    // out to Qdrant/PostgreSQL for a session it never wrote — an unnecessary
+    // external call, and an unnecessary way to reach the stall paths above.
+    if !matches!(job.session_target, SessionTarget::Isolated) || !job.uses_memory {
         return;
     }
     let mem_session_key = zeroclaw_api::session_keys::sanitize_session_key(&format!(
@@ -947,8 +958,8 @@ async fn purge_isolated_session(
         session_path.display()
     ));
 
-    // Owned copies: the construction below runs on a spawned task, which must
-    // be `'static` and so cannot borrow `config` / `agent_alias`.
+    // Owned copies: the supervised future is driven off this task and so must
+    // be `'static`; it cannot borrow `config` / `agent_alias`.
     let owned_config = config.clone();
     let owned_alias = agent_alias.to_string();
     let owned_api_key = config
@@ -956,7 +967,8 @@ async fn purge_isolated_session(
         .and_then(|e| e.api_key.as_deref().map(str::to_string));
 
     // Read the task-local here, on the caller's task: task-locals are NOT
-    // inherited by spawned tasks, so this must be captured before any spawn.
+    // inherited across the supervision boundary, so this must be captured
+    // before handing the future over.
     #[cfg(test)]
     let test_purge_memory = TEST_PURGE_MEMORY.try_with(Arc::clone).ok();
 
@@ -967,29 +979,20 @@ async fn purge_isolated_session(
             return;
         }
 
-        // Construct the backend on its own task for the same reason the agent
-        // run is spawned above: `create_memory_for_agent` can block inside a
-        // single poll (PostgreSQL connect/migrate joins a thread), which would
-        // otherwise starve this cleanup deadline and delay lock release.
-        let construct = ::zeroclaw_spawn::spawn!(async move {
-            zeroclaw_memory::create_memory_for_agent(
-                &owned_config,
-                &owned_alias,
-                owned_api_key.as_deref(),
-            )
-            .await
-        });
-        let abort = construct.abort_handle();
-        match construct.await {
-            Ok(Ok(mem)) => {
-                let _ = mem.purge_session(&mem_session_key).await;
-            }
-            // Construction failed or the task died; cleanup is best-effort.
-            Ok(Err(_)) | Err(_) => abort.abort(),
-        }
+        let Ok(mem) = zeroclaw_memory::create_memory_for_agent(
+            &owned_config,
+            &owned_alias,
+            owned_api_key.as_deref(),
+        )
+        .await
+        else {
+            // Construction failed; cleanup is best-effort.
+            return;
+        };
+        let _ = mem.purge_session(&mem_session_key).await;
     };
 
-    if time::timeout(ISOLATED_SESSION_PURGE_TIMEOUT, purge)
+    if supervise_wall_clock(ISOLATED_SESSION_PURGE_TIMEOUT, purge)
         .await
         .is_err()
     {
