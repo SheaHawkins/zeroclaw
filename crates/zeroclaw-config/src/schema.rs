@@ -19913,6 +19913,16 @@ impl Config {
                 ),
             }
         }
+        // A zero live turn timeout produces a zero-duration `tokio::time::timeout`,
+        // which makes every live turn fail on the first scheduling boundary. Reject
+        // it here rather than letting the harness look intermittently broken.
+        if self.eval.case_timeout_secs == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "eval.case_timeout_secs",
+                "eval.case_timeout_secs must be greater than zero (a zero timeout expires every live turn immediately)",
+            );
+        }
         let mut lucid_aliases: Vec<&String> = self.storage.lucid.keys().collect();
         lucid_aliases.sort();
         for alias in lucid_aliases {
@@ -36951,6 +36961,31 @@ allowed_users = []
         let cfg = eval_live_provider_config("");
         cfg.validate()
             .expect("empty eval.live_provider must validate");
+    }
+
+    #[tokio::test]
+    async fn config_validate_rejects_zero_eval_case_timeout() {
+        // A zero timeout yields a zero-duration `tokio::time::timeout`, so every
+        // live turn expires at the first scheduling boundary.
+        let mut cfg = eval_live_provider_config("");
+        cfg.eval.case_timeout_secs = 0;
+        let msg = format!(
+            "{:#}",
+            cfg.validate()
+                .expect_err("zero eval.case_timeout_secs must fail")
+        );
+        assert!(
+            msg.contains("eval.case_timeout_secs") && msg.contains("greater than zero"),
+            "expected InvalidNumericRange for eval.case_timeout_secs, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_validate_accepts_positive_eval_case_timeout() {
+        let mut cfg = eval_live_provider_config("");
+        cfg.eval.case_timeout_secs = 1;
+        cfg.validate()
+            .expect("a positive eval.case_timeout_secs must validate");
     }
 
     // effective_summary_provider precedence — agent → profile → None.
