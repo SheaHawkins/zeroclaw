@@ -180,18 +180,90 @@ enum AttachmentDisposition {
     Permanent,
 }
 
+/// Classify a local workspace filesystem error into a retry disposition.
+///
+/// Retrying the CDN cannot clear an unwritable workspace. If every local
+/// I/O error is `Retryable`, the cursor is retained and the listener
+/// re-fetches the same batch forever, holding every later WeChat message
+/// behind a condition that will never resolve on its own. So errors that
+/// need operator action are `Permanent`: the attachment is skipped, the
+/// batch commits, and inbound delivery keeps flowing.
+///
+/// Genuinely transient conditions — a temporarily unavailable mount, a
+/// full disk, an interrupted call — stay `Retryable` and keep the
+/// existing bounded backoff.
+fn classify_workspace_io(err: &std::io::Error) -> AttachmentDisposition {
+    use std::io::ErrorKind;
+    match err.kind() {
+        // Operator-action conditions: permissions, a read-only mount, a
+        // workspace path that is not (or is not under) a directory, or a
+        // malformed path. None of these change by retrying.
+        ErrorKind::PermissionDenied
+        | ErrorKind::ReadOnlyFilesystem
+        | ErrorKind::NotADirectory
+        | ErrorKind::IsADirectory
+        | ErrorKind::InvalidInput
+        | ErrorKind::InvalidFilename => AttachmentDisposition::Permanent,
+        // Transient: unavailable mount, ENOSPC, EINTR, and anything the
+        // std mapping does not name.
+        _ => AttachmentDisposition::Retryable,
+    }
+}
+
+/// ERROR-level, operator-visible record of a workspace write that cannot
+/// be retried away, naming the path and the decision taken.
+fn record_workspace_io_failure(
+    path: &Path,
+    err: &std::io::Error,
+    disposition: &AttachmentDisposition,
+    what: &str,
+) {
+    let permanent = matches!(disposition, AttachmentDisposition::Permanent);
+    let decision = if permanent {
+        "attachment skipped permanently; batch will commit so inbound delivery keeps flowing"
+    } else {
+        "attachment held for retry; batch cursor retained"
+    };
+    let attrs = ::serde_json::json!({
+        "error": format!("{err}"),
+        "error_kind": format!("{:?}", err.kind()),
+        "workspace_path": path.display().to_string(),
+        "permanent": permanent,
+        "decision": decision,
+    });
+    if permanent {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(attrs),
+            what
+        );
+    } else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(attrs),
+            what
+        );
+    }
+}
+
 /// Why downloading/decrypting an inbound attachment failed, classified
 /// so the caller can pick a retryable-vs-permanent `AttachmentDisposition`.
 ///
 /// Network and transport-layer failures are `Retryable`: connection
-/// errors, request timeouts, CDN HTTP 5xx, CDN HTTP 429, CDN HTTP 408,
-/// and transient local
-/// I/O errors on the workspace write. Content and parse-layer failures
-/// are `Permanent`: CDN HTTP 4xx other than 408/429 (the object is gone),
-/// decrypt/decode failures, and unsupported/oversized content. When an
-/// error does not map cleanly to either bucket, the default is
-/// `Retryable` for network/transport-layer errors and `Permanent` for
-/// content/parse-layer errors.
+/// errors, request timeouts, CDN HTTP 5xx, CDN HTTP 429, and CDN HTTP
+/// 408. Content and parse-layer failures are `Permanent`: CDN HTTP 4xx
+/// other than 408/429 (the object is gone), decrypt/decode failures, and
+/// unsupported/oversized content. When an error does not map cleanly to
+/// either bucket, the default is `Retryable` for network/transport-layer
+/// errors and `Permanent` for content/parse-layer errors.
+///
+/// Local workspace I/O is not classified here — it is classified by
+/// `classify_workspace_io`, which splits transient conditions from ones
+/// only an operator can clear.
 #[derive(Debug)]
 enum AttachmentBuildFailure {
     Retryable(String),
@@ -1660,32 +1732,31 @@ impl WeChatChannel {
 
         let save_dir = workspace_dir.join("wechat_files");
         if let Err(err) = tokio::fs::create_dir_all(&save_dir).await {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-                "Failed to create WeChat attachment dir"
+            // Local filesystem, not the CDN: a permission problem, a
+            // read-only mount, or a non-directory workspace path is not
+            // cleared by retrying, and holding the cursor for it wedges
+            // every later message behind this batch.
+            let disposition = classify_workspace_io(&err);
+            record_workspace_io_failure(
+                &save_dir,
+                &err,
+                &disposition,
+                "failed to create WeChat attachment dir",
             );
-            // io::Error on the workspace side: transient local I/O per the
-            // default mapping, so treat as retryable.
-            return AttachmentDisposition::Retryable;
+            return disposition;
         }
 
         let local_path = save_dir.join(&spec.file_name);
         if let Err(err) = tokio::fs::write(&local_path, bytes).await {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                &format!(
-                    "Failed to save WeChat attachment to {}: {err}",
-                    local_path.display()
-                )
+            // Same policy as the directory create above.
+            let disposition = classify_workspace_io(&err);
+            record_workspace_io_failure(
+                &local_path,
+                &err,
+                &disposition,
+                "failed to save WeChat attachment",
             );
-            // io::Error on the write itself: transient local I/O per the
-            // default mapping, so treat as retryable.
-            return AttachmentDisposition::Retryable;
+            return disposition;
         }
 
         AttachmentDisposition::Ready(format_attachment_content(
@@ -3951,6 +4022,167 @@ mod tests {
             "cursor_after_batch",
             "cursor must advance once the held batch finally delivers in full"
         );
+    }
+
+    /// Unit-level companion to the listener regression below: the
+    /// classification split itself. Conditions only an operator can clear
+    /// are `Permanent`; genuinely transient ones stay `Retryable`.
+    #[test]
+    fn classify_workspace_io_splits_operator_action_from_transient() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::ReadOnlyFilesystem,
+            ErrorKind::NotADirectory,
+            ErrorKind::IsADirectory,
+            ErrorKind::InvalidInput,
+            ErrorKind::InvalidFilename,
+        ] {
+            assert_eq!(
+                classify_workspace_io(&Error::new(kind, "boom")),
+                AttachmentDisposition::Permanent,
+                "{kind:?} cannot be cleared by retrying the CDN"
+            );
+        }
+        for kind in [
+            ErrorKind::StorageFull,
+            ErrorKind::Interrupted,
+            ErrorKind::TimedOut,
+            ErrorKind::Other,
+        ] {
+            assert_eq!(
+                classify_workspace_io(&Error::new(kind, "boom")),
+                AttachmentDisposition::Retryable,
+                "{kind:?} may clear on its own"
+            );
+        }
+    }
+
+    /// Invariant: an unwritable workspace must not wedge inbound
+    /// delivery. Every local filesystem error used to map to
+    /// `Retryable`, so a `PermissionDenied` workspace held the cursor and
+    /// re-fetched the same batch forever — every later WeChat message
+    /// stuck behind a condition retrying can never clear.
+    ///
+    /// Here the workspace is a read-only directory, so `create_dir_all`
+    /// of `wechat_files` fails with `PermissionDenied` on every pass. The
+    /// batch must be classified permanent: the attachment is dropped, the
+    /// text still delivers, and the cursor commits so the next batch can
+    /// flow.
+    #[tokio::test]
+    async fn listen_does_not_hold_batch_forever_on_unwritable_workspace() {
+        use std::os::unix::fs::PermissionsExt;
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        // Read-only workspace: creating `wechat_files/` inside it is
+        // EACCES, and no amount of CDN retrying changes that.
+        let mut perms = std::fs::metadata(&workspace_dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&workspace_dir, perms).unwrap();
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "original_cursor"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([
+                    {
+                        "from_user_id": "user_a",
+                        "message_id": 1,
+                        "create_time_ms": 1_700_000_000_000u64,
+                        "item_list": [
+                            {"type": 1, "text_item": {"text": "hello"}},
+                            {
+                                "type": 2,
+                                "image_item": {
+                                    "media": {"encrypt_query_param": "enc_param_1"}
+                                }
+                            }
+                        ]
+                    }
+                ]),
+            )))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "cursor_after_batch"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([]),
+            )))
+            .mount(&mock_server)
+            .await;
+        // The CDN is healthy throughout: the only failure is local.
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-image-bytes".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let ch = wechat_channel_for_mock_with_workspace(
+            state_dir.clone(),
+            workspace_dir.clone(),
+            mock_server.uri(),
+        );
+        *ch.cursor.lock() = "original_cursor".to_string();
+        ch.save_sync_data();
+        let ch = Arc::new(ch);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        // Delivery must not be wedged: the text arrives promptly, well
+        // inside the first backoff step, instead of being held.
+        let msg = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("an unwritable workspace must not hold inbound delivery")
+            .expect("channel closed before delivery");
+        assert_eq!(msg.sender, "user_a");
+        assert!(
+            msg.content.contains("hello"),
+            "the text must still be delivered, got: {}",
+            msg.content
+        );
+        assert!(
+            !msg.content.contains("[IMAGE:"),
+            "the attachment is unsaveable, so no marker may be claimed, got: {}",
+            msg.content
+        );
+
+        // And the cursor must move on, or the next batch never arrives.
+        let mut committed = false;
+        for _ in 0..100 {
+            if *ch.cursor.lock() == "cursor_after_batch" {
+                committed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            committed,
+            "an unclearable local I/O failure must not retain the cursor: still at {:?}",
+            *ch.cursor.lock()
+        );
+
+        handle.abort();
+        let _ = handle.await;
+
+        // Restore write permission so the tempdir can be cleaned up.
+        let mut perms = std::fs::metadata(&workspace_dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&workspace_dir, perms).unwrap();
     }
 
     /// The restart-while-cursor-pending regression required by #9187's
