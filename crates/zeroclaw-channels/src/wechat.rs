@@ -4185,12 +4185,12 @@ mod tests {
         std::fs::set_permissions(&workspace_dir, perms).unwrap();
     }
 
-    /// The restart-while-cursor-pending regression required by #9187's
-    /// acceptance criteria, and the gap the same-process test above does
-    /// NOT cover: the process must be able to die *while the batch is
-    /// still held* and have a freshly constructed channel — built through
-    /// `WeChatChannel::new` from the persisted state dir, exactly like a
-    /// supervised restart — re-poll that batch and deliver it once.
+    /// The restart-while-cursor-pending regression, and the gap the
+    /// same-process test above does NOT cover: the process must be able
+    /// to die *while the batch is still held* and have a freshly
+    /// constructed channel — built through `WeChatChannel::new` from the
+    /// persisted state dir, exactly like a supervised restart — re-poll
+    /// that batch and deliver it once.
     ///
     /// Pass 1 holds the batch (CDN 503) and the listener is aborted
     /// before the cursor ever commits, so `sync.json` still carries the
