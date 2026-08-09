@@ -412,7 +412,15 @@ mod tests {
             name: name.to_string(),
             source: "f.json".to_string(),
             record: Some(record(name)),
-            grades: Vec::new(),
+            // Every case carries at least one grade: `CaseReport::passed()`
+            // fails closed on an empty grade list, so a grade-less "passing"
+            // fixture would not model a real passing case.
+            grades: vec![zeroclaw_eval::grader::GradeResult {
+                check: "response_contains(\"x\")".to_string(),
+                passed: true,
+                detail: "found".to_string(),
+                category: zeroclaw_eval::grader::GradeCategory::Response,
+            }],
             error: if passed {
                 None
             } else {

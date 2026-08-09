@@ -31,9 +31,15 @@ pub struct CaseReport {
 }
 
 impl CaseReport {
-    /// A case passes when it ran without error and every check passed.
+    /// A case passes when it ran without error, produced at least one grade, and
+    /// every check passed.
+    ///
+    /// The non-empty requirement is the terminal fail-closed guard: an empty
+    /// grade list satisfies `.all()` vacuously, so a case that asserted nothing
+    /// — or that errored before any grade was produced — would otherwise be
+    /// reported green by a required CI gate.
     pub fn passed(&self) -> bool {
-        self.error.is_none() && self.grades.iter().all(|g| g.passed)
+        self.error.is_none() && !self.grades.is_empty() && self.grades.iter().all(|g| g.passed)
     }
 
     fn checks_passed(&self) -> usize {
@@ -41,10 +47,11 @@ impl CaseReport {
     }
 
     /// Partial-credit score: fraction of checks passed. A case with no checks
-    /// scores 1.0 (it passes vacuously). Informational; the gate is pass/fail.
+    /// scores 0.0 — it asserted nothing, so it earned no credit. Informational;
+    /// the gate is pass/fail.
     pub fn score(&self) -> f64 {
         if self.grades.is_empty() {
-            1.0
+            0.0
         } else {
             self.checks_passed() as f64 / self.grades.len() as f64
         }
@@ -402,7 +409,12 @@ mod tests {
             name: name.to_string(),
             source: "fixture.json".to_string(),
             record: None,
-            grades: Vec::new(),
+            // The representative outcome's grades, as `run_case_repeated`
+            // returns them: it selects the first failing repetition when one
+            // exists, otherwise a passing one. A repeated case is never
+            // grade-less in production, and `passed()` no longer treats an
+            // empty grade list as a pass.
+            grades: vec![grade("response", passes >= k, "")],
             error: None,
             repeat: Some(crate::stats::RepeatStats::from_runs(k, &runs)),
             cluster: cluster.map(str::to_string),
@@ -616,8 +628,36 @@ mod tests {
         );
         // A run error fails the case even when every check passed.
         assert!(!case("a", vec![grade("c1", true, "")], Some("trace exhausted")).passed());
-        // No checks and no error passes vacuously.
-        assert!(case("a", vec![], None).passed());
+    }
+
+    /// Fail closed at the terminal layer: an empty grade list satisfies
+    /// `.all()` vacuously, so a case that asserted nothing - or that errored
+    /// before producing a grade - would be reported green by the required
+    /// regression gate. A green case must mean at least one assertion ran.
+    #[test]
+    fn empty_grade_list_is_not_a_pass() {
+        let report = case("assertion-free", vec![], None);
+        assert!(report.error.is_none());
+        assert!(report.grades.is_empty());
+        assert!(
+            !report.passed(),
+            "a case with no grades must not pass vacuously"
+        );
+        assert_eq!(
+            report.score(),
+            0.0,
+            "a case that asserted nothing earns no partial credit"
+        );
+
+        // And it gates: a grade-less case fails the suite.
+        let suite = SuiteReport {
+            cases: vec![report],
+        };
+        assert!(!suite.all_passed());
+        assert_eq!(
+            suite.exit_code(crate::baseline::SuiteKind::Regression, None),
+            1
+        );
     }
 
     #[test]

@@ -42,6 +42,7 @@ fn default_repeat() -> u32 {
 
 /// Pre-run environment preparation for a case.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaseSetup {
     /// Files written into the case's temp workspace before the run.
     /// Keys are workspace-relative paths; absolute paths and `..` are rejected.
@@ -97,7 +98,12 @@ pub struct TraceToolCall {
 }
 
 /// Declarative expectations for grading a run.
+///
+/// `deny_unknown_fields`: a misspelled expectation such as `response_contians`
+/// would otherwise deserialize into the default (empty) block and the case would
+/// pass without asserting anything.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TraceExpects {
     /// Substrings the final response must contain.
     #[serde(default)]
@@ -133,6 +139,7 @@ pub struct TraceExpects {
 
 /// End-state checks against the case workspace after the run.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceExpects {
     /// Workspace-relative paths that must exist as a regular file after the run
     /// (a directory at the path does not satisfy the check).
@@ -150,6 +157,7 @@ pub struct WorkspaceExpects {
 /// Resource ceilings for the run (all optional; each present bound is one
 /// inclusive check, `actual <= max`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BudgetExpects {
     /// Max accumulated input tokens reported by the provider.
     #[serde(default)]
@@ -168,6 +176,99 @@ pub struct BudgetExpects {
     pub max_llm_calls: Option<u32>,
 }
 
+impl TraceExpects {
+    /// Number of effective assertions this block declares — i.e. how many
+    /// [`GradeResult`](crate::grader::GradeResult)s grading it will produce.
+    /// Zero means the case asserts nothing and cannot produce a meaningful
+    /// green.
+    pub fn assertion_count(&self) -> usize {
+        let mut n = self.response_contains.len()
+            + self.response_not_contains.len()
+            + self.tools_used.len()
+            + self.tools_not_used.len()
+            + self.response_matches.len()
+            + self.response_json.len()
+            + usize::from(self.max_tool_calls.is_some())
+            + usize::from(self.all_tools_succeeded.is_some());
+        if let Some(ws) = &self.workspace {
+            n += ws.assertion_count();
+        }
+        if let Some(budget) = &self.budget {
+            n += budget.assertion_count();
+        }
+        n
+    }
+
+    /// Reject expectation shapes that parse but can never assert anything:
+    /// empty needles (which match every response vacuously) and declared-but-
+    /// empty `workspace` / `budget` blocks.
+    fn validate(&self) -> anyhow::Result<()> {
+        for (field, needles) in [
+            ("response_contains", &self.response_contains),
+            ("response_not_contains", &self.response_not_contains),
+            ("response_matches", &self.response_matches),
+        ] {
+            if needles.iter().any(|n| n.is_empty()) {
+                anyhow::bail!("expects.{field} must not contain an empty string");
+            }
+        }
+        for (field, tools) in [
+            ("tools_used", &self.tools_used),
+            ("tools_not_used", &self.tools_not_used),
+        ] {
+            if tools.iter().any(|t| t.trim().is_empty()) {
+                anyhow::bail!("expects.{field} must not contain an empty tool name");
+            }
+        }
+        if let Some(ws) = &self.workspace {
+            ws.validate()?;
+        }
+        if let Some(budget) = &self.budget
+            && budget.assertion_count() == 0
+        {
+            anyhow::bail!("expects.budget is declared but sets no bound");
+        }
+        Ok(())
+    }
+}
+
+impl WorkspaceExpects {
+    fn assertion_count(&self) -> usize {
+        self.file_exists.len()
+            + self.file_absent.len()
+            + self.file_contains.values().map(Vec::len).sum::<usize>()
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.assertion_count() == 0 {
+            anyhow::bail!("expects.workspace is declared but asserts nothing");
+        }
+        for (path, needles) in &self.file_contains {
+            if needles.is_empty() {
+                anyhow::bail!("expects.workspace.file_contains[{path:?}] lists no substring");
+            }
+            if needles.iter().any(|n| n.is_empty()) {
+                // An empty needle matches every file, so it is an assertion in
+                // name only.
+                anyhow::bail!(
+                    "expects.workspace.file_contains[{path:?}] must not contain an empty substring"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl BudgetExpects {
+    fn assertion_count(&self) -> usize {
+        usize::from(self.max_input_tokens.is_some())
+            + usize::from(self.max_output_tokens.is_some())
+            + usize::from(self.max_total_tokens.is_some())
+            + usize::from(self.max_duration_ms.is_some())
+            + usize::from(self.max_llm_calls.is_some())
+    }
+}
+
 impl LlmTrace {
     /// The identity used in reports and receipts: the explicit `id` when set,
     /// otherwise `model_name`.
@@ -175,12 +276,40 @@ impl LlmTrace {
         self.id.as_deref().unwrap_or(&self.model_name)
     }
 
-    /// Load a trace from a JSON file.
-    pub fn from_file(path: &Path) -> anyhow::Result<Self> {
+    /// Fail closed on a case that can never assert anything.
+    ///
+    /// Three permissive layers used to compose into a vacuous green: the
+    /// expectation structs deserialized permissively, `grade_run` returned no
+    /// grades for an empty expectation block, and `CaseReport::passed()` treated
+    /// an empty grade list as a pass. A fixture in the required
+    /// `evals/regression` gate could therefore pass without making a single
+    /// assertion, or even calling a provider. A green result must mean at least
+    /// one declared assertion actually ran.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.expects.validate()?;
+        if self.expects.assertion_count() == 0 {
+            anyhow::bail!(
+                "eval case {:?} declares no effective assertion; a case that asserts nothing cannot pass",
+                self.display_id()
+            );
+        }
+        Ok(())
+    }
+
+    /// Load a trace from a JSON file, without the assertion-contract check.
+    fn parse_file(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("reading trace fixture {}", path.display()))?;
-        let trace: LlmTrace = serde_json::from_str(&content)
-            .with_context(|| format!("parsing trace fixture {}", path.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("parsing trace fixture {}", path.display()))
+    }
+
+    /// Load a trace from a JSON file and enforce its assertion contract.
+    pub fn from_file(path: &Path) -> anyhow::Result<Self> {
+        let trace = Self::parse_file(path)?;
+        trace
+            .validate()
+            .with_context(|| format!("validating trace fixture {}", path.display()))?;
         Ok(trace)
     }
 }
@@ -282,10 +411,17 @@ pub fn load_suite(dir: &Path) -> anyhow::Result<Vec<(PathBuf, LlmTrace)>> {
 
     let mut out = Vec::with_capacity(paths.len());
     for path in paths {
-        let trace = LlmTrace::from_file(&path)?;
+        let trace = LlmTrace::parse_file(&path)?;
         out.push((path, trace));
     }
+    // Identity first: a collision or blank id is a suite-level defect and the
+    // clearest thing to report. Then the per-case assertion contract.
     validate_suite_identities(&out)?;
+    for (path, trace) in &out {
+        trace
+            .validate()
+            .with_context(|| format!("validating trace fixture {}", path.display()))?;
+    }
     Ok(out)
 }
 
@@ -342,7 +478,11 @@ mod tests {
     #[test]
     fn from_file_reads_and_parses_trace() {
         let path = std::env::temp_dir().join("zeroclaw_eval_case_from_file_test.json");
-        std::fs::write(&path, r#"{"model_name":"demo","turns":[]}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"model_name":"demo","turns":[],"expects":{"response_contains":["x"]}}"#,
+        )
+        .unwrap();
         let t = LlmTrace::from_file(&path).unwrap();
         assert_eq!(t.model_name, "demo");
         let _ = std::fs::remove_file(&path);
@@ -419,8 +559,8 @@ mod tests {
         let dir = std::env::temp_dir().join("zeroclaw_eval_case_suite_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("b.json"), r#"{"model_name":"b","turns":[]}"#).unwrap();
-        std::fs::write(dir.join("a.json"), r#"{"model_name":"a","turns":[]}"#).unwrap();
+        std::fs::write(dir.join("b.json"), &asserting_fixture("b")).unwrap();
+        std::fs::write(dir.join("a.json"), &asserting_fixture("a")).unwrap();
         std::fs::write(dir.join("note.txt"), "ignored").unwrap();
         let suite = load_suite(&dir).unwrap();
         assert_eq!(suite.len(), 2); // the .txt file is ignored
@@ -474,6 +614,14 @@ mod tests {
         assert_eq!(paths, vec![dir.join("a.json"), dir.join("b.json")]);
     }
 
+    /// A minimal fixture that satisfies the assertion contract, so identity
+    /// tests exercise identity validation rather than the contract check.
+    fn asserting_fixture(id: &str) -> String {
+        format!(
+            r#"{{"model_name":"{id}","id":"{id}","turns":[],"expects":{{"response_contains":["x"]}}}}"#
+        )
+    }
+
     fn suite_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(name);
         let _ = std::fs::remove_dir_all(&dir);
@@ -487,16 +635,8 @@ mod tests {
     #[test]
     fn load_suite_rejects_duplicate_case_ids() {
         let dir = suite_dir("zeroclaw_eval_case_dup_id_test");
-        std::fs::write(
-            dir.join("a_failing.json"),
-            r#"{"model_name":"m","id":"duplicate","turns":[]}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("b_passing.json"),
-            r#"{"model_name":"other","id":"duplicate","turns":[]}"#,
-        )
-        .unwrap();
+        std::fs::write(dir.join("a_failing.json"), &asserting_fixture("duplicate")).unwrap();
+        std::fs::write(dir.join("b_passing.json"), &asserting_fixture("duplicate")).unwrap();
         let err = load_suite(&dir).expect_err("duplicate case ids must not load");
         let rendered = format!("{err:#}");
         assert!(
@@ -515,11 +655,7 @@ mod tests {
     #[test]
     fn load_suite_rejects_empty_case_id() {
         let dir = suite_dir("zeroclaw_eval_case_empty_id_test");
-        std::fs::write(
-            dir.join("blank.json"),
-            r#"{"model_name":"m","id":"","turns":[]}"#,
-        )
-        .unwrap();
+        std::fs::write(dir.join("blank.json"), &asserting_fixture("")).unwrap();
         let err = load_suite(&dir).expect_err("an empty case id must not load");
         let rendered = format!("{err:#}");
         assert!(
@@ -534,7 +670,7 @@ mod tests {
     #[test]
     fn load_suite_rejects_whitespace_only_effective_id() {
         let dir = suite_dir("zeroclaw_eval_case_ws_id_test");
-        std::fs::write(dir.join("ws.json"), r#"{"model_name":"   ","turns":[]}"#).unwrap();
+        std::fs::write(dir.join("ws.json"), &asserting_fixture("   ")).unwrap();
         let err = load_suite(&dir).expect_err("a whitespace-only case id must not load");
         assert!(format!("{err:#}").contains("empty case id"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -544,9 +680,131 @@ mod tests {
     #[test]
     fn load_suite_accepts_distinct_case_ids() {
         let dir = suite_dir("zeroclaw_eval_case_ok_id_test");
-        std::fs::write(dir.join("a.json"), r#"{"model_name":"m","id":"a","turns":[]}"#).unwrap();
-        std::fs::write(dir.join("b.json"), r#"{"model_name":"m","id":"b","turns":[]}"#).unwrap();
+        std::fs::write(dir.join("a.json"), &asserting_fixture("a")).unwrap();
+        std::fs::write(dir.join("b.json"), &asserting_fixture("b")).unwrap();
         assert_eq!(load_suite(&dir).unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A typo such as `response_contians` silently deserialized into the default
+    /// (empty) expectations block, so the case asserted nothing and passed.
+    /// `deny_unknown_fields` makes it a load error naming the field.
+    #[test]
+    fn rejects_unknown_expectation_field() {
+        let err = serde_json::from_str::<LlmTrace>(
+            r#"{"model_name":"typo","turns":[],"expects":{"response_contians":["hi"]}}"#,
+        )
+        .expect_err("a misspelled expectation must not deserialize");
+        assert!(
+            err.to_string().contains("response_contians"),
+            "error must name the offending field, got: {err}"
+        );
+    }
+
+    /// The same guard on the nested blocks.
+    #[test]
+    fn rejects_unknown_nested_expectation_field() {
+        assert!(
+            serde_json::from_str::<LlmTrace>(
+                r#"{"model_name":"t","turns":[],"expects":{"workspace":{"file_exsits":["a"]}}}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<LlmTrace>(
+                r#"{"model_name":"t","turns":[],"expects":{"budget":{"max_tokens":5}}}"#
+            )
+            .is_err()
+        );
+    }
+
+    /// No turns and no effective expectation: the case cannot assert anything,
+    /// so it must not load into a gate that treats loading as certification.
+    #[test]
+    fn rejects_assertion_free_case() {
+        let trace: LlmTrace = serde_json::from_str(r#"{"model_name":"empty","turns":[]}"#).unwrap();
+        let err = trace
+            .validate()
+            .expect_err("an assertion-free case must be rejected");
+        assert!(
+            err.to_string().contains("no effective assertion"),
+            "got: {err}"
+        );
+    }
+
+    /// A declared-but-empty `workspace` / `budget` block asserts nothing.
+    #[test]
+    fn rejects_empty_expectation_blocks() {
+        for json in [
+            r#"{"model_name":"t","turns":[],"expects":{"workspace":{}}}"#,
+            r#"{"model_name":"t","turns":[],"expects":{"budget":{}}}"#,
+        ] {
+            let trace: LlmTrace = serde_json::from_str(json).unwrap();
+            assert!(
+                trace.validate().is_err(),
+                "an empty expectation block must be rejected: {json}"
+            );
+        }
+    }
+
+    /// An empty `file_contains` needle matches every file, so it is an
+    /// assertion in name only.
+    #[test]
+    fn rejects_empty_file_contains_needle() {
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{"model_name":"t","turns":[],"expects":{"workspace":{"file_contains":{"out.txt":[""]}}}}"#,
+        )
+        .unwrap();
+        let err = trace
+            .validate()
+            .expect_err("an empty file_contains needle must be rejected");
+        assert!(err.to_string().contains("empty substring"), "got: {err}");
+
+        let empty_list: LlmTrace = serde_json::from_str(
+            r#"{"model_name":"t","turns":[],"expects":{"workspace":{"file_contains":{"out.txt":[]}}}}"#,
+        )
+        .unwrap();
+        assert!(empty_list.validate().is_err());
+    }
+
+    /// The same vacuity applies to an empty response needle.
+    #[test]
+    fn rejects_empty_response_needle() {
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{"model_name":"t","turns":[],"expects":{"response_contains":[""]}}"#,
+        )
+        .unwrap();
+        assert!(trace.validate().is_err());
+    }
+
+    /// The contract counts every expectation shape, so a case asserting only a
+    /// budget bound or only a workspace check is still valid.
+    #[test]
+    fn accepts_cases_whose_only_assertion_is_a_block() {
+        for json in [
+            r#"{"model_name":"t","turns":[],"expects":{"budget":{"max_llm_calls":2}}}"#,
+            r#"{"model_name":"t","turns":[],"expects":{"workspace":{"file_exists":["out.txt"]}}}"#,
+            r#"{"model_name":"t","turns":[],"expects":{"max_tool_calls":0}}"#,
+        ] {
+            let trace: LlmTrace = serde_json::from_str(json).unwrap();
+            assert!(trace.validate().is_ok(), "must accept: {json}");
+            assert!(trace.expects.assertion_count() >= 1);
+        }
+    }
+
+    /// The four shipped regression fixtures must satisfy the new contract; the
+    /// gate they back is the reason the contract exists.
+    #[test]
+    fn shipped_regression_fixtures_satisfy_the_assertion_contract() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals/regression");
+        let suite = load_suite(&dir).expect("shipped regression suite must load");
+        assert!(!suite.is_empty());
+        for (path, trace) in &suite {
+            assert!(
+                trace.expects.assertion_count() > 0,
+                "{} asserts nothing",
+                path.display()
+            );
+        }
     }
 }

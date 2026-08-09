@@ -427,6 +427,22 @@ pub async fn grade_run(
     for grader in &graders {
         grades.extend(grader.grade(record, &ctx).await);
     }
+    if grades.is_empty() {
+        // Fail closed. A case that produced no grade asserted nothing, so a
+        // "pass" here would be vacuous. `LlmTrace::validate()` rejects such
+        // cases at load, but grade_run is also reachable with a
+        // programmatically built trace, so it must not return an empty Vec that
+        // CaseReport::passed() could read as success.
+        grades.push(GradeResult::new(
+            "declared_assertions".to_string(),
+            false,
+            format!(
+                "eval case {:?} produced no grades; a case that asserts nothing cannot pass",
+                trace.display_id()
+            ),
+            GradeCategory::Response,
+        ));
+    }
     grades
 }
 
@@ -505,6 +521,53 @@ mod tests {
     fn empty_expectations_produce_no_results() {
         let out = evaluate_expects(&TraceExpects::default(), &run("hi", &[], true));
         assert!(out.is_empty());
+    }
+
+    /// `evaluate_expects` legitimately returns nothing for an empty block (see
+    /// above), so `grade_run` — the layer whose output feeds
+    /// `CaseReport::passed()` — must not pass an empty grade list upward. It
+    /// substitutes a failing `declared_assertions` grade instead.
+    #[tokio::test]
+    async fn grade_run_fails_closed_on_a_case_with_no_assertions() {
+        let trace: crate::case::LlmTrace =
+            serde_json::from_str(r#"{"model_name":"vacuous","turns":[]}"#).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let grades = grade_run(&trace, &run("anything at all", &[], true), tmp.path()).await;
+
+        assert_eq!(grades.len(), 1, "expected a substituted grade: {grades:?}");
+        assert_eq!(grades[0].check, "declared_assertions");
+        assert!(
+            !grades[0].passed,
+            "a case that asserts nothing must not grade green"
+        );
+        assert!(grades[0].detail.contains("vacuous"));
+
+        // The report layer therefore fails the case rather than passing it.
+        let report = crate::report::CaseReport {
+            name: trace.display_id().to_string(),
+            source: "vacuous.json".to_string(),
+            record: None,
+            grades,
+            error: None,
+            repeat: None,
+            cluster: None,
+        };
+        assert!(!report.passed());
+    }
+
+    /// The guard is not blanket: a case with a real assertion still grades
+    /// normally and can be green.
+    #[tokio::test]
+    async fn grade_run_returns_real_grades_when_the_case_asserts() {
+        let trace: crate::case::LlmTrace = serde_json::from_str(
+            r#"{"model_name":"real","turns":[],"expects":{"response_contains":["ok"]}}"#,
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let grades = grade_run(&trace, &run("ok then", &[], true), tmp.path()).await;
+        assert_eq!(grades.len(), 1);
+        assert_eq!(grades[0].check, r#"response_contains("ok")"#);
+        assert!(grades[0].passed);
     }
 
     #[test]
