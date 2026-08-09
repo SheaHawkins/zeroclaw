@@ -597,13 +597,22 @@ enum EditMessageResult {
 
 /// Outcome of attempting to parse a single incoming Telegram update.
 ///
-/// `SkipPermanent` covers both "not applicable to this parser" (try the next
-/// one) and genuine permanent skips (unauthorized sender, mention gate,
-/// duration/size limits, missing config) — in every one of those cases the
-/// update itself is fully handled and safe to acknowledge. `RetryTransient`
-/// is reserved for fallible I/O (file download, transcription, disk writes)
-/// so the caller can leave the update unacknowledged and retry it on the
-/// next poll instead of silently dropping it.
+/// ⚠️ This enum is a *parser* outcome, not the acknowledgement source of
+/// truth. `SkipPermanent` is overloaded: it means both "this parser does not
+/// apply, try the next one" and "this update is genuinely, permanently
+/// handled" (unauthorized sender, mention gate, duration/size limits, missing
+/// config). Those two meanings are only safe to conflate because the parser
+/// chain is mutually exclusive and attempted in a fixed order (text → voice →
+/// attachment), so a `SkipPermanent` that falls out of the *last* parser is
+/// always a genuine permanent skip.
+///
+/// Whether an update is acknowledged is therefore decided by
+/// [`TelegramChannel::process_update`] together with [`UpdateOutcome`] — read
+/// those two to reason about offset advancement, not this enum alone.
+/// `RetryTransient` is reserved for fallible I/O (file download,
+/// transcription, disk writes) so the caller can leave the update
+/// unacknowledged and retry it on the next poll instead of silently dropping
+/// it.
 enum UpdateDisposition {
     // Boxed: `ChannelMessage` is far larger than the unit variants, and this
     // enum is constructed on every incoming update regardless of outcome.
@@ -3406,8 +3415,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 }
             }
 
-            // callback_query is not a regular message; it carries no
-            // fallible I/O, so it's always safe to acknowledge.
+            // A callback_query is terminal for inbound processing: there is
+            // no message to deliver downstream, so nothing can be lost by
+            // acknowledging it. The answerCallbackQuery above is a
+            // best-effort UI acknowledgement — it does perform HTTP I/O and
+            // its failure is logged, but a failed spinner dismissal must not
+            // hold up the offset, since retrying the update would re-run the
+            // approval side effect that has already been applied.
             if let Some(uid) = uid {
                 *offset = uid + 1;
             }
