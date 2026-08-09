@@ -642,6 +642,108 @@ enum UpdateOutcome {
     ReceiverClosed,
 }
 
+/// Why a Telegram `getFile` lookup failed, classified for retry purposes.
+///
+/// The offset repair in this PR only helps if a failure that can never
+/// succeed is distinguished from one that can. Telegram answers an invalid or
+/// expired `file_id` with `200 OK` and an `ok: false` envelope carrying
+/// `error_code: 400`; treating that as transient head-of-line blocks every
+/// later update indefinitely, because the offset never advances past an
+/// update whose download will never succeed.
+///
+/// Classification is deliberately conservative: only a confidently permanent
+/// vendor rejection is `Permanent`. 5xx, 429, transport errors, malformed
+/// bodies, and anything unrecognised stay `Transient`, because retrying a
+/// recoverable failure is safe while skipping a recoverable one loses a
+/// message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileLookupFailure {
+    /// Retrying may succeed: 5xx, 429, transport failure, malformed or
+    /// unrecognised response.
+    Transient,
+    /// Retrying can never succeed: an explicit `ok: false` with a 4xx
+    /// `error_code` other than 429 (invalid/expired file id, file too big,
+    /// forbidden). Safe to acknowledge and move past.
+    Permanent,
+}
+
+/// A `getFile` failure with the vendor diagnostics preserved.
+///
+/// The previous code mapped every failure to a single generic
+/// "missing file_path in response" string, discarding Telegram's
+/// `error_code` and `description` — the exact evidence an operator needs to
+/// tell an expired file id from an outage.
+#[derive(Debug)]
+pub(crate) struct FileLookupError {
+    pub(crate) kind: FileLookupFailure,
+    pub(crate) message: String,
+}
+
+impl std::fmt::Display for FileLookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl FileLookupError {
+    fn transient(message: impl Into<String>) -> Self {
+        Self {
+            kind: FileLookupFailure::Transient,
+            message: message.into(),
+        }
+    }
+
+    fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            kind: FileLookupFailure::Permanent,
+            message: message.into(),
+        }
+    }
+
+    /// Map a `getFile` response onto a classified failure.
+    ///
+    /// `status` is the HTTP status; `body` is the parsed JSON envelope when
+    /// one could be parsed. Telegram returns errors both as non-2xx statuses
+    /// and as `200 OK` with `ok: false`, so both shapes are inspected.
+    pub(crate) fn classify(status: reqwest::StatusCode, body: Option<&serde_json::Value>) -> Self {
+        let ok_flag = body
+            .and_then(|b| b.get("ok"))
+            .and_then(serde_json::Value::as_bool);
+        let error_code = body
+            .and_then(|b| b.get("error_code"))
+            .and_then(serde_json::Value::as_i64);
+        let description = body
+            .and_then(|b| b.get("description"))
+            .and_then(serde_json::Value::as_str);
+
+        // The effective vendor code: Telegram's own `error_code` when it
+        // supplied one, otherwise the HTTP status.
+        let code = error_code.unwrap_or_else(|| i64::from(status.as_u16()));
+
+        let detail = format!(
+            "Telegram getFile failed (http {}, error_code {}, ok {}): {}",
+            status.as_u16(),
+            error_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            ok_flag
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            description.unwrap_or("no description"),
+        );
+
+        // 429 is a rate limit: explicitly retryable despite being 4xx.
+        // Everything 4xx other than 429, when the vendor confirms failure
+        // via `ok: false` or a non-success HTTP status, is permanent.
+        let vendor_rejected = ok_flag == Some(false) || !status.is_success();
+        if vendor_rejected && (400..500).contains(&code) && code != 429 {
+            Self::permanent(detail)
+        } else {
+            Self::transient(detail)
+        }
+    }
+}
+
 fn normalize_telegram_api_base(api_base: &str) -> String {
     api_base.trim_end_matches('/').to_string()
 }
@@ -1747,22 +1849,43 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     }
 
     /// Get the file path for a Telegram file ID via the Bot API.
-    async fn get_file_path(&self, file_id: &str) -> anyhow::Result<String> {
+    ///
+    /// Failures carry the vendor's HTTP status, `ok` flag, `error_code`, and
+    /// `description`, classified as [`FileLookupFailure::Permanent`] or
+    /// `Transient` so the caller can acknowledge an update whose download can
+    /// never succeed instead of retrying it forever.
+    async fn get_file_path(&self, file_id: &str) -> Result<String, FileLookupError> {
         let url = self.api_url("getFile");
-        let resp = self
+        let resp = match self
             .http_client()
             .get(&url)
             .query(&[("file_id", file_id)])
             .send()
             .await
-            .context("Failed to call Telegram getFile")?;
+        {
+            Ok(r) => r,
+            // A transport failure says nothing about the file id.
+            Err(e) => {
+                return Err(FileLookupError::transient(format!(
+                    "Failed to call Telegram getFile: {e}"
+                )));
+            }
+        };
 
-        let data: serde_json::Value = resp.json().await?;
-        data.get("result")
+        let status = resp.status();
+        let body: Option<serde_json::Value> = resp.json().await.ok();
+
+        // The happy path: a usable file_path regardless of envelope noise.
+        if let Some(path) = body
+            .as_ref()
+            .and_then(|b| b.get("result"))
             .and_then(|r| r.get("file_path"))
             .and_then(serde_json::Value::as_str)
-            .map(String::from)
-            .context("Telegram getFile: missing file_path in response")
+        {
+            return Ok(path.to_string());
+        }
+
+        Err(FileLookupError::classify(status, body.as_ref()))
     }
 
     /// Download a file from the Telegram CDN.
@@ -1940,10 +2063,18 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
+                        .with_attrs(::serde_json::json!({
+                            "error": zeroclaw_runtime::security::scrub(&format!("{}", e)),
+                            "classification": format!("{:?}", e.kind),
+                        })),
                     "Failed to get attachment file path"
                 );
-                return UpdateDisposition::RetryTransient;
+                // A permanently rejected file id can never download; retrying
+                // it head-of-line blocks every later update forever.
+                return match e.kind {
+                    FileLookupFailure::Permanent => UpdateDisposition::SkipPermanent,
+                    FileLookupFailure::Transient => UpdateDisposition::RetryTransient,
+                };
             }
         };
 
@@ -2110,10 +2241,18 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
+                        .with_attrs(::serde_json::json!({
+                            "error": zeroclaw_runtime::security::scrub(&format!("{}", e)),
+                            "classification": format!("{:?}", e.kind),
+                        })),
                     "Failed to get voice file path"
                 );
-                return UpdateDisposition::RetryTransient;
+                // See the attachment path: a permanent vendor rejection must
+                // not hold the offset, or the batch never drains.
+                return match e.kind {
+                    FileLookupFailure::Permanent => UpdateDisposition::SkipPermanent,
+                    FileLookupFailure::Transient => UpdateDisposition::RetryTransient,
+                };
             }
         };
 
@@ -7867,6 +8006,240 @@ mod tests {
                  #9517 localized these through the Fluent catalogue"
             );
         }
+    }
+
+    /// A `getFile` failure must carry Telegram's own diagnostics and be
+    /// classified conservatively. Only a confidently permanent vendor
+    /// rejection may be `Permanent`; everything else retries, because
+    /// retrying a recoverable failure is safe while skipping one loses a
+    /// message.
+    #[test]
+    fn get_file_failures_classify_permanent_vendor_rejections_only() {
+        use reqwest::StatusCode;
+
+        // Telegram's real shape for an invalid/expired file id: HTTP 200
+        // with an `ok: false` envelope. This is the case that used to
+        // head-of-line block forever.
+        let expired = serde_json::json!({
+            "ok": false,
+            "error_code": 400,
+            "description": "Bad Request: invalid file_id",
+        });
+        let e = FileLookupError::classify(StatusCode::OK, Some(&expired));
+        assert_eq!(
+            e.kind,
+            FileLookupFailure::Permanent,
+            "an ok:false 400 is permanent: {e}"
+        );
+        // The vendor evidence must survive into the message.
+        assert!(e.message.contains("400"), "error_code missing: {e}");
+        assert!(
+            e.message.contains("invalid file_id"),
+            "description missing: {e}"
+        );
+
+        // File too big — also permanent.
+        let too_big = serde_json::json!({
+            "ok": false,
+            "error_code": 400,
+            "description": "Bad Request: file is too big",
+        });
+        assert_eq!(
+            FileLookupError::classify(StatusCode::OK, Some(&too_big)).kind,
+            FileLookupFailure::Permanent
+        );
+
+        // Forbidden — permanent.
+        let forbidden = serde_json::json!({
+            "ok": false,
+            "error_code": 403,
+            "description": "Forbidden: bot was blocked by the user",
+        });
+        assert_eq!(
+            FileLookupError::classify(StatusCode::FORBIDDEN, Some(&forbidden)).kind,
+            FileLookupFailure::Permanent
+        );
+
+        // 429 is a rate limit: retryable despite being 4xx.
+        let rate_limited = serde_json::json!({
+            "ok": false,
+            "error_code": 429,
+            "description": "Too Many Requests: retry after 30",
+        });
+        assert_eq!(
+            FileLookupError::classify(StatusCode::TOO_MANY_REQUESTS, Some(&rate_limited)).kind,
+            FileLookupFailure::Transient,
+            "429 must stay transient"
+        );
+
+        // 5xx is an outage: retryable.
+        let outage = serde_json::json!({
+            "ok": false,
+            "error_code": 500,
+            "description": "Internal Server Error",
+        });
+        assert_eq!(
+            FileLookupError::classify(StatusCode::INTERNAL_SERVER_ERROR, Some(&outage)).kind,
+            FileLookupFailure::Transient
+        );
+
+        // A malformed body with no usable envelope: unrecognised, so
+        // transient. Never guess permanence.
+        let malformed = serde_json::json!({"unexpected": "shape"});
+        assert_eq!(
+            FileLookupError::classify(StatusCode::OK, Some(&malformed)).kind,
+            FileLookupFailure::Transient
+        );
+        assert_eq!(
+            FileLookupError::classify(StatusCode::OK, None).kind,
+            FileLookupFailure::Transient
+        );
+    }
+
+    /// End-to-end proof of the liveness property: an update whose file id
+    /// Telegram permanently rejects must be acknowledged, so a later update
+    /// behind it in the ordered batch is still delivered.
+    ///
+    /// Before the classification, `getFile` mapped every failure to
+    /// `RetryTransient`, so this update pinned the offset and the message
+    /// behind it could never arrive.
+    #[tokio::test]
+    async fn listen_permanently_rejected_file_id_does_not_block_later_updates() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        mount_telegram_startup_probe(&mock_server).await;
+
+        let uid_bad = 8_000;
+        let uid_good = 8_001;
+        let bad = telegram_document_update(uid_bad, 60, 222, "alice", "expired999", "gone.pdf");
+        let good = telegram_text_update(uid_good, 61, 222, "alice", "i am behind the bad one");
+
+        mount_telegram_get_updates(&mock_server, 0, serde_json::json!([bad, good])).await;
+        mount_telegram_get_updates(&mock_server, uid_good + 1, serde_json::json!([])).await;
+
+        // Telegram's real permanent-rejection shape: 200 OK, ok:false, 400.
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 400,
+                "description": "Bad Request: invalid file_id",
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = Arc::new(
+            TelegramChannel::new(
+                "test-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["alice".to_string()]),
+                false,
+            )
+            .with_api_base(mock_server.uri())
+            .with_workspace_dir(workspace.path().to_path_buf()),
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        // The update behind the permanently rejected one must arrive.
+        let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out: a permanently rejected file id head-of-line blocked the batch")
+            .expect("channel closed before delivering the update behind the rejected one");
+        assert_eq!(msg.content, "i am behind the bad one");
+
+        assert!(
+            telegram_wait_for_main_loop_offset(&mock_server, uid_good + 1, Duration::from_secs(5))
+                .await,
+            "offset never advanced past the permanently rejected update"
+        );
+
+        handle.abort();
+    }
+
+    /// The other half of the contract: a *transient* `getFile` failure must
+    /// still pin the offset. Classification must not become a blanket
+    /// "acknowledge on any error", which would reintroduce message loss.
+    #[tokio::test]
+    async fn listen_transient_file_failure_still_holds_the_offset() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        mount_telegram_startup_probe(&mock_server).await;
+
+        let uid = 8_100;
+        let doc = telegram_document_update(uid, 70, 333, "alice", "flaky999", "later.pdf");
+
+        mount_telegram_get_updates(&mock_server, 0, serde_json::json!([doc])).await;
+        mount_telegram_get_updates(&mock_server, uid + 1, serde_json::json!([])).await;
+
+        // 500 twice (transient), then success — the offset must stay at 0
+        // across the failures and only advance once the download works.
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(2)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {"file_path": "documents/later.pdf"}
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/file/bot[^/]+/.*$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"pdf bytes".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = Arc::new(
+            TelegramChannel::new(
+                "test-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["alice".to_string()]),
+                false,
+            )
+            .with_api_base(mock_server.uri())
+            .with_workspace_dir(workspace.path().to_path_buf()),
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        // The update is retried, not skipped, and eventually delivered.
+        let msg = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("timed out: a transient failure was wrongly skipped instead of retried")
+            .expect("channel closed before delivering the retried attachment");
+        assert!(
+            msg.content.contains("later.pdf"),
+            "unexpected content: {}",
+            msg.content
+        );
+
+        // More than one poll at the un-advanced offset proves it was held.
+        let held_polls = telegram_main_loop_getupdates_bodies(&mock_server)
+            .await
+            .iter()
+            .filter(|b| b.get("offset").and_then(serde_json::Value::as_i64) == Some(0))
+            .count();
+        assert!(
+            held_polls >= 2,
+            "a transient failure must hold the offset for a retry, saw {held_polls} poll(s) at 0"
+        );
+
+        handle.abort();
     }
 
     // ─────────────────────────────────────────────────────────────────────
