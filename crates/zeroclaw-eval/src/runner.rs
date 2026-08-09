@@ -15,6 +15,7 @@ use crate::case::{LlmTrace, load_suite};
 use crate::grader::{GradeResult, grade_run};
 use crate::observer::RecordingObserver;
 use crate::record::RunRecord;
+use crate::replay::ReplayHandle;
 use crate::report::{CaseReport, SuiteReport};
 use crate::tools::default_tools;
 
@@ -29,8 +30,29 @@ pub struct CaseOutcome {
 
 /// Factory that builds a fresh model provider for one case run. Injected so
 /// replay, live, and deterministic tests share one runner code path.
-pub type ProviderFactory =
-    Box<dyn Fn(&LlmTrace) -> anyhow::Result<Box<dyn ModelProvider>> + Send + Sync>;
+pub type ProviderFactory = Box<dyn Fn(&LlmTrace) -> anyhow::Result<CaseProvider> + Send + Sync>;
+
+/// The provider for one case run, plus the optional replay handle the runner needs
+/// to police turn boundaries.
+///
+/// The provider itself is opaque to the runner (it is injected as a boxed
+/// `ModelProvider`), so the per-turn consumption contract cannot be enforced through
+/// the trait. Replay therefore hands the runner a [`ReplayHandle`] alongside the
+/// provider; live mode has no scripted steps and supplies `None`.
+pub struct CaseProvider {
+    pub provider: Box<dyn ModelProvider>,
+    pub replay: Option<ReplayHandle>,
+}
+
+impl CaseProvider {
+    /// A provider with no replay turn-boundary contract (live mode, test doubles).
+    pub fn plain(provider: Box<dyn ModelProvider>) -> Self {
+        Self {
+            provider,
+            replay: None,
+        }
+    }
+}
 
 /// Everything a case run needs that differs between replay, live, and tests.
 ///
@@ -55,10 +77,12 @@ impl RunDeps {
         Self {
             mode: Mode::Replay,
             provider: Box::new(|trace| {
-                Ok(
-                    Box::new(crate::replay::TraceLlmProvider::try_from_trace(trace)?)
-                        as Box<dyn ModelProvider>,
-                )
+                let replay = crate::replay::TraceLlmProvider::try_from_trace(trace)?;
+                let handle = replay.handle();
+                Ok(CaseProvider {
+                    provider: Box::new(replay) as Box<dyn ModelProvider>,
+                    replay: Some(handle),
+                })
             }),
             provider_ref: "scripted".to_string(),
             live_tools: Vec::new(),
@@ -139,7 +163,10 @@ async fn run_replay_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<Cas
     let memory: Arc<dyn Memory> = Arc::from(create_memory(&mem_cfg, tmp.path(), None)?);
 
     let observer = Arc::new(RecordingObserver::new());
-    let provider = (deps.provider)(trace)?;
+    let CaseProvider {
+        provider,
+        replay: replay_handle,
+    } = (deps.provider)(trace)?;
 
     let mut agent = Agent::builder()
         .model_provider(provider)
@@ -152,8 +179,13 @@ async fn run_replay_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<Cas
 
     let start = std::time::Instant::now();
     let mut final_response = String::new();
-    for turn in &trace.turns {
+    for (turn_index, turn) in trace.turns.iter().enumerate() {
         final_response = agent.turn(&turn.user_input).await?;
+        // Enforce the turn boundary: every step scripted for this turn must have been
+        // consumed before the next turn begins, so responses cannot bleed across turns.
+        if let Some(handle) = &replay_handle {
+            handle.finish_turn(turn_index)?;
+        }
     }
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -268,6 +300,75 @@ mod tests {
             err.to_string().contains("no scripted steps"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn over_specified_turn_is_an_error() {
+        // The turn declares two steps but the agent makes a single chat() call, so the
+        // extra step is left unconsumed. Under a flat cross-turn queue this passed
+        // silently; it must now surface as a turn-scoped case error rather than bleed
+        // into the next turn (and, via --write-baseline, freeze a wrong transcript).
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "test-over-specified",
+                "turns": [{ "user_input": "Hi", "steps": [
+                    { "response": { "type": "text", "content": "Hello there." } },
+                    { "response": { "type": "text", "content": "unused extra step" } }
+                ] }],
+                "expects": {}
+            }"#,
+        )
+        .unwrap();
+        let err = match run_case(&trace, &RunDeps::replay()).await {
+            Ok(_) => panic!("expected an error: an over-specified turn left a step unconsumed"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("over-specifies") || msg.contains("never requested"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_two_never_replays_turn_ones_leftover_response() {
+        // End-to-end turn-boundary check through the real runner: turn 0 scripts an
+        // extra step that the agent never requests, and turn 1 scripts its own reply.
+        // A flattened queue would hand turn 0's leftover to turn 1, produce
+        // "LEAKED-FROM-TURN-ONE" as the final response, and still report Ok.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "test-cross-turn-bleed",
+                "turns": [
+                    { "user_input": "first", "steps": [
+                        { "response": { "type": "text", "content": "first reply" } },
+                        { "response": { "type": "text", "content": "LEAKED-FROM-TURN-ONE" } }
+                    ] },
+                    { "user_input": "second", "steps": [
+                        { "response": { "type": "text", "content": "second reply" } }
+                    ] }
+                ],
+                "expects": {}
+            }"#,
+        )
+        .unwrap();
+        match run_case(&trace, &RunDeps::replay()).await {
+            Ok(outcome) => panic!(
+                "cross-turn bleed went undetected; final response was {:?}",
+                outcome.record.final_response
+            ),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("over-specifies") || msg.contains("never requested"),
+                    "the run must fail at the turn boundary, not later: {msg}"
+                );
+                assert!(
+                    msg.contains("turn 0"),
+                    "the error must name the offending turn: {msg}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

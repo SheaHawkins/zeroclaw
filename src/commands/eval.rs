@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use zeroclaw_config::schema::Config;
 use zeroclaw_eval::baseline::{self, Baseline, CaseComparison, SuiteKind};
-use zeroclaw_eval::{CaseReport, LlmTrace, Mode, RunDeps, SuiteReport};
+use zeroclaw_eval::{CaseProvider, CaseReport, LlmTrace, Mode, RunDeps, SuiteReport};
 use zeroclaw_runtime::agent::agent::build_session_model_provider;
 use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 
@@ -243,7 +243,7 @@ fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
                 provider: Box::new(move |_trace: &LlmTrace| {
                     let (provider, _provider_type, _resolved_model) =
                         build_session_model_provider(&cfg, &provider_ref, None)?;
-                    Ok(provider)
+                    Ok(CaseProvider::plain(provider))
                 }),
                 provider_ref: receipt_ref,
                 live_tools: config.eval.live_allowed_tools.clone(),

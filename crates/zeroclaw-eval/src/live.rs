@@ -121,7 +121,9 @@ pub async fn run_live_case(
     let memory: Arc<dyn Memory> = Arc::from(create_memory(&mem_cfg, tmp.path(), None)?);
 
     let observer = Arc::new(RecordingObserver::new());
-    let provider = (deps.provider)(trace)?;
+    // Live mode has no scripted steps, so there is no per-turn replay contract to
+    // police here; the handle (when a test double supplies one) is unused.
+    let provider = (deps.provider)(trace)?.provider;
     // Resolve the dispatcher from the provider's capabilities so XML-dialect
     // providers work; a default agent config routes purely by capability.
     let dispatcher =
@@ -188,6 +190,7 @@ mod tests {
     use super::*;
     use crate::Mode;
     use crate::replay::TraceLlmProvider;
+    use crate::runner::CaseProvider;
     use async_trait::async_trait;
     use std::collections::BTreeMap;
     use std::time::Duration;
@@ -202,6 +205,7 @@ mod tests {
         live_tools: Vec<String>,
         timeout: Duration,
     ) -> RunDeps {
+        let provider = move |trace: &LlmTrace| Ok(CaseProvider::plain(provider(trace)?));
         RunDeps {
             mode: Mode::Live,
             provider: Box::new(provider),
