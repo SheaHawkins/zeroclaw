@@ -123,9 +123,15 @@ impl std::fmt::Display for Abandoned {
 ///
 /// Use this — never a bare `spawn!` + `timeout` — for any deadline that is
 /// documented to operators as a hard bound.
-pub(crate) async fn supervise_wall_clock<T, F>(deadline: Duration, f: F) -> Result<T, Abandoned>
+/// Note the boxed-future parameter: it erases the supervised future's type at
+/// this boundary. `agent::run`'s future is deeply nested, and the crate
+/// deliberately carries no raised `recursion_limit`, so taking a bare generic
+/// `F: Future` here overflows type resolution. Callers pass `Box::pin(...)`.
+pub(crate) async fn supervise_wall_clock<T>(
+    deadline: Duration,
+    f: std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>,
+) -> Result<T, Abandoned>
 where
-    F: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -282,9 +288,10 @@ pub async fn deliver_and_classify_run_result(
         let d_job = job.clone();
         let d_output = output.clone();
         let deadline = delivery_timeout();
-        match supervise_wall_clock(deadline, async move {
-            deliver_if_configured(&d_config, &d_job, &d_output).await
-        })
+        match supervise_wall_clock(
+            deadline,
+            Box::pin(async move { deliver_if_configured(&d_config, &d_job, &d_output).await }),
+        )
         .await
         {
             Ok(res) => res,
@@ -918,6 +925,19 @@ tokio::task_local! {
     static TEST_PURGE_MEMORY: Arc<dyn zeroclaw_api::memory_traits::Memory>;
 }
 
+// Test-only seam: simulates a memory backend *construction* that blocks
+// without yielding — the PostgreSQL backend spawns an initializer thread and
+// immediately `join()`s it while it connects, initializes schema and runs
+// migrations, with `connect_timeout_secs` defaulting to `None`. Blocking the
+// thread (rather than sleeping asynchronously) is the point: it reproduces
+// construction that cannot observe a timer. Deterministic where pointing a
+// real backend at an unroutable address would be timing- and
+// environment-dependent.
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_PURGE_CONSTRUCT_BLOCK: Duration;
+}
+
 /// Best-effort purge of an Isolated cron run's per-run memory session. The
 /// Isolated session path (`cron-{run_session_id}`) is unique per run, so a
 /// timed-out run whose dropped agent future may still have an in-flight
@@ -971,8 +991,17 @@ async fn purge_isolated_session(
     // before handing the future over.
     #[cfg(test)]
     let test_purge_memory = TEST_PURGE_MEMORY.try_with(Arc::clone).ok();
+    #[cfg(test)]
+    let test_construct_block = TEST_PURGE_CONSTRUCT_BLOCK.try_with(|d| *d).ok();
 
     let purge = async move {
+        #[cfg(test)]
+        if let Some(d) = test_construct_block {
+            // Stands in for a backend construction that blocks without
+            // yielding; the real call follows the same shape.
+            std::thread::sleep(d);
+        }
+
         #[cfg(test)]
         if let Some(mem) = test_purge_memory {
             let _ = mem.purge_session(&mem_session_key).await;
@@ -992,7 +1021,7 @@ async fn purge_isolated_session(
         let _ = mem.purge_session(&mem_session_key).await;
     };
 
-    if supervise_wall_clock(ISOLATED_SESSION_PURGE_TIMEOUT, purge)
+    if supervise_wall_clock(ISOLATED_SESSION_PURGE_TIMEOUT, Box::pin(purge))
         .await
         .is_err()
     {
@@ -1132,28 +1161,30 @@ async fn run_agent_job_with_timeout(
             let run_allowed_tools = job.allowed_tools.clone();
             let supervised = supervise_wall_clock(
                 timeout,
-                async move {
-                    #[cfg(test)]
-                    if let Some(d) = pre_run_block {
-                        std::thread::sleep(d);
+                Box::pin(
+                    async move {
+                        #[cfg(test)]
+                        if let Some(d) = pre_run_block {
+                            std::thread::sleep(d);
+                        }
+                        Box::pin(crate::agent::run(
+                            cron_config,
+                            &run_alias,
+                            Some(prefixed_prompt),
+                            None,
+                            model_override,
+                            run_temperature,
+                            vec![],
+                            false,
+                            Some(run_session_path),
+                            run_allowed_tools,
+                            zeroclaw_api::ingress::TurnOrigin::Cron,
+                            run_overrides,
+                        ))
+                        .await
                     }
-                    Box::pin(crate::agent::run(
-                        cron_config,
-                        &run_alias,
-                        Some(prefixed_prompt),
-                        None,
-                        model_override,
-                        run_temperature,
-                        vec![],
-                        false,
-                        Some(run_session_path),
-                        run_allowed_tools,
-                        zeroclaw_api::ingress::TurnOrigin::Cron,
-                        run_overrides,
-                    ))
-                    .await
-                }
-                .instrument(subagent_span),
+                    .instrument(subagent_span),
+                ),
             )
             .await;
 
@@ -2702,6 +2733,684 @@ mod tests {
         assert!(
             cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
             "job lock must be released even when run setup blocks past the deadline"
+        );
+    }
+
+    /// Stands in for a memory backend whose `purge_session` blocks its thread
+    /// **synchronously before its first await**, modelling the supported
+    /// audited wrapper: `AuditedMemory::purge_session` calls `log_audit`
+    /// before awaiting the inner backend, and `log_audit` performs a
+    /// synchronous SQLite `execute` under a mutex. `StallingPurgeMemory`
+    /// yields at `pending()` and so cannot cover this shape -- a same-runtime
+    /// timer can still be polled while a future is parked, but not while a
+    /// worker is blocked inside synchronous code.
+    #[derive(Default)]
+    struct SyncBlockingPurgeMemory {
+        purge_attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        block_for: Duration,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SyncBlockingPurgeMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "sync-blocking-purge-memory"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ::zeroclaw_api::memory_traits::Memory for SyncBlockingPurgeMemory {
+        fn name(&self) -> &str {
+            "sync-blocking-purge-memory"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: ::zeroclaw_api::memory_traits::MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(
+            &self,
+            _key: &str,
+        ) -> anyhow::Result<Option<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&::zeroclaw_api::memory_traits::MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: ::zeroclaw_api::memory_traits::MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        /// Blocks the calling thread before ever awaiting -- the pre-await
+        /// synchronous write that `ISOLATED_SESSION_PURGE_TIMEOUT` must bound.
+        async fn purge_session(&self, _session_id: &str) -> anyhow::Result<usize> {
+            self.purge_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(self.block_for);
+            Ok(0)
+        }
+    }
+
+    /// Counts construction attempts so a test can assert the backend is never
+    /// built. Purging through it is a hard failure: reaching `purge_session`
+    /// means the `uses_memory` gate did not hold.
+    #[derive(Default)]
+    struct CountingPurgeMemory {
+        purge_attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CountingPurgeMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "counting-purge-memory"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ::zeroclaw_api::memory_traits::Memory for CountingPurgeMemory {
+        fn name(&self) -> &str {
+            "counting-purge-memory"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: ::zeroclaw_api::memory_traits::MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(
+            &self,
+            _key: &str,
+        ) -> anyhow::Result<Option<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&::zeroclaw_api::memory_traits::MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: ::zeroclaw_api::memory_traits::MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn purge_session(&self, _session_id: &str) -> anyhow::Result<usize> {
+            self.purge_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(0)
+        }
+    }
+
+    // One worker on purpose. This is the case the existing two-worker
+    // regression cannot cover: with a single worker, a run that blocks
+    // without yielding occupies the ONLY thread that could poll a
+    // same-runtime timer, so `spawn!` + `timeout` degrades from a
+    // wall-clock bound to a cooperative one exactly when it matters.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn cron_agent_timeout_releases_lock_with_single_worker() {
+        let tmp = TempDir::new().unwrap();
+        let (addr, _accepts) = spawn_hanging_server().await;
+        let mut config = test_config_with_hanging_provider(&tmp, addr).await;
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .agentic_timeout_secs = Some(1);
+
+        let job = cron::add_agent_job(
+            &config,
+            TEST_AGENT,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "Say hello",
+            SessionTarget::Main,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job should be claimable before the run"
+        );
+
+        let security = test_security(&config);
+        let component = unique_component("single-worker-timeout-release");
+
+        let started = std::time::Instant::now();
+        // 8s of synchronous setup against a 1s deadline: the pass/fail split
+        // is unambiguous even on loaded CI.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            TEST_PRE_RUN_BLOCK.scope(
+                Duration::from_secs(8),
+                Box::pin(execute_and_persist_job(
+                    &config, &security, TEST_AGENT, &job, &component,
+                )),
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        let (job_id, success, output) = outcome.unwrap_or_else(|_| {
+            panic!(
+                "execute_and_persist_job did not return within the outer test bound \
+                 ({elapsed:?}); with one worker the deadline must still fire while the \
+                 run's synchronous setup is blocked"
+            )
+        });
+
+        assert_eq!(job_id, job.id);
+        assert!(!success);
+        assert!(
+            output.starts_with(AGENT_JOB_TIMEOUT_PREFIX),
+            "a run whose setup blocks past the deadline must be reported as a \
+             timeout, got: {output}"
+        );
+        // Far below the 8s block, so this can only pass if the deadline fired
+        // independently of the blocking setup rather than after it finished.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the claim was only released after the blocking setup completed \
+             ({elapsed:?}); with a single worker the deadline must not depend on \
+             the run yielding"
+        );
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job lock must be released after a single-worker agent-run timeout"
+        );
+    }
+
+    // Every worker occupied by a synchronously-blocked run. Two workers, four
+    // concurrent blocked runs: even the "spare worker" that the existing
+    // two-worker regression relies on is gone, so a shared-pool timer has
+    // nothing left to poll it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cron_agent_timeout_releases_lock_when_all_workers_occupied() {
+        const CONCURRENT_RUNS: usize = 4;
+
+        let tmp = TempDir::new().unwrap();
+        let (addr, _accepts) = spawn_hanging_server().await;
+        let mut config = test_config_with_hanging_provider(&tmp, addr).await;
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .agentic_timeout_secs = Some(1);
+
+        let mut jobs = Vec::new();
+        for _ in 0..CONCURRENT_RUNS {
+            let job = cron::add_agent_job(
+                &config,
+                TEST_AGENT,
+                None,
+                crate::cron::Schedule::Cron {
+                    expr: "*/5 * * * *".into(),
+                    tz: None,
+                },
+                "Say hello",
+                SessionTarget::Main,
+                None,
+                None,
+                false,
+                None,
+                true,
+            )
+            .unwrap();
+            assert!(
+                cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+                "job should be claimable before the run"
+            );
+            jobs.push(job);
+        }
+
+        let started = std::time::Instant::now();
+        let mut handles = Vec::new();
+        for job in &jobs {
+            let run_config = config.clone();
+            let run_job = job.clone();
+            let component = unique_component("all-workers-timeout-release");
+            handles.push(::zeroclaw_spawn::spawn!(async move {
+                let security = test_security(&run_config);
+                TEST_PRE_RUN_BLOCK
+                    .scope(
+                        Duration::from_secs(8),
+                        Box::pin(execute_and_persist_job(
+                            &run_config,
+                            &security,
+                            TEST_AGENT,
+                            &run_job,
+                            &component,
+                        )),
+                    )
+                    .await
+            }));
+        }
+
+        let mut results = Vec::new();
+        for handle in handles {
+            let joined = tokio::time::timeout(Duration::from_secs(20), handle)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "a supervised run did not return within the outer test bound; \
+                         with every worker occupied by synchronous setup the deadline \
+                         must still fire"
+                    )
+                })
+                .expect("run task joined");
+            results.push(joined);
+        }
+        let elapsed = started.elapsed();
+
+        for (job, (job_id, success, output)) in jobs.iter().zip(&results) {
+            assert_eq!(*job_id, job.id);
+            assert!(!success);
+            assert!(
+                output.starts_with(AGENT_JOB_TIMEOUT_PREFIX),
+                "unexpected output: {output}"
+            );
+        }
+
+        // Sequential cooperative fallback would take at least 8s (and, with
+        // four blocked runs over two workers, closer to 16s).
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "runs were only released after their blocking setup completed \
+             ({elapsed:?}); the deadline must hold when all workers are occupied"
+        );
+        for job in &jobs {
+            assert!(
+                cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+                "every job lock must be released when all workers are occupied"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn isolated_purge_releases_lock_when_audit_write_blocks_before_await() {
+        // Blocker: only `create_memory_for_agent` was moved off this task; the
+        // `mem.purge_session` call ran inline inside the future wrapped by
+        // `ISOLATED_SESSION_PURGE_TIMEOUT`. `AuditedMemory::purge_session`
+        // performs a synchronous SQLite write in `log_audit` BEFORE its first
+        // await, so a contended `audit.db` blocks the worker and the cleanup
+        // timer cannot be polled -- re-pinning `locked_at`. `StallingPurgeMemory`
+        // parks at `pending()` and cannot reproduce this.
+        let tmp = TempDir::new().unwrap();
+        let (addr, _accepts) = spawn_hanging_server().await;
+        let mut config = test_config_with_hanging_provider(&tmp, addr).await;
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .agentic_timeout_secs = Some(1);
+
+        let job = cron::add_agent_job(
+            &config,
+            TEST_AGENT,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "Say hello",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job should be claimable before the run"
+        );
+
+        let security = test_security(&config);
+        let component = unique_component("isolated-purge-sync-block-release");
+        let purge_attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // 10s of synchronous blocking against the 3s purge deadline.
+        let blocking_memory: Arc<dyn ::zeroclaw_api::memory_traits::Memory> =
+            Arc::new(SyncBlockingPurgeMemory {
+                purge_attempts: std::sync::Arc::clone(&purge_attempts),
+                block_for: Duration::from_secs(10),
+            });
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            TEST_PURGE_MEMORY.scope(
+                blocking_memory,
+                Box::pin(execute_and_persist_job(
+                    &config, &security, TEST_AGENT, &job, &component,
+                )),
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        let (job_id, success, output) = outcome.unwrap_or_else(|_| {
+            panic!(
+                "execute_and_persist_job did not return within the outer test bound \
+                 ({elapsed:?}); a purge that blocks synchronously before its first \
+                 await must not block persist/release_job"
+            )
+        });
+
+        assert_eq!(job_id, job.id);
+        assert!(!success);
+        assert!(
+            output.starts_with(AGENT_JOB_TIMEOUT_PREFIX),
+            "unexpected output: {output}"
+        );
+        assert_eq!(
+            purge_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the purge must actually have been attempted, otherwise this test \
+             proves nothing about the deadline"
+        );
+        // 1s run deadline + 3s purge deadline, with slack for loaded CI, but
+        // far below the 10s synchronous block.
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "the claim was only released after the blocking purge completed \
+             ({elapsed:?}); the cleanup deadline must not depend on the purge \
+             reaching an await point"
+        );
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job lock must be released when the purge blocks before its first await"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn isolated_purge_releases_lock_when_backend_construction_blocks() {
+        // Blocker: backend construction was spawned and its `JoinHandle`
+        // dropped on timeout. Dropping a handle detaches the task rather than
+        // cancelling it, so a construction blocked inside a single poll (the
+        // PostgreSQL initializer thread `join()`, whose `connect_timeout_secs`
+        // defaults to `None`) both outlived the cleanup deadline and, with no
+        // spare worker, prevented the timer from firing at all.
+        let tmp = TempDir::new().unwrap();
+        let (addr, _accepts) = spawn_hanging_server().await;
+        let mut config = test_config_with_hanging_provider(&tmp, addr).await;
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .agentic_timeout_secs = Some(1);
+
+        let job = cron::add_agent_job(
+            &config,
+            TEST_AGENT,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "Say hello",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job should be claimable before the run"
+        );
+
+        let security = test_security(&config);
+        let component = unique_component("isolated-purge-construction-block");
+
+        let started = std::time::Instant::now();
+        // 10s of blocking construction against the 3s purge deadline.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            TEST_PURGE_CONSTRUCT_BLOCK.scope(
+                Duration::from_secs(10),
+                Box::pin(execute_and_persist_job(
+                    &config, &security, TEST_AGENT, &job, &component,
+                )),
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        let (job_id, success, output) = outcome.unwrap_or_else(|_| {
+            panic!(
+                "execute_and_persist_job did not return within the outer test bound \
+                 ({elapsed:?}); a blocked backend construction must not hold the claim"
+            )
+        });
+
+        assert_eq!(job_id, job.id);
+        assert!(!success);
+        assert!(
+            output.starts_with(AGENT_JOB_TIMEOUT_PREFIX),
+            "unexpected output: {output}"
+        );
+        // 1s run deadline + 3s purge deadline plus CI slack, far below the
+        // 10s blocking construction.
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "the claim was only released after the blocking construction \
+             completed ({elapsed:?}); dropping a JoinHandle detaches the task \
+             rather than cancelling it, so construction must be supervised"
+        );
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job lock must be released when backend construction blocks"
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_job_without_memory_does_not_construct_backend() {
+        // `uses_memory = false` runs memory-free end to end (`NoneMemory`, no
+        // persistent memory tools), so there is no session to purge. Before
+        // the gate, `purge_isolated_session` checked only
+        // `SessionTarget::Isolated` and therefore still constructed the
+        // configured backend and reached out to Qdrant/PostgreSQL for a
+        // session the run never wrote.
+        let tmp = TempDir::new().unwrap();
+        let (addr, _accepts) = spawn_hanging_server().await;
+        let mut config = test_config_with_hanging_provider(&tmp, addr).await;
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .agentic_timeout_secs = Some(1);
+
+        let job = cron::add_agent_job(
+            &config,
+            TEST_AGENT,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "Say hello",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            // The whole point: an Isolated job that uses no memory.
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job should be claimable before the run"
+        );
+
+        let security = test_security(&config);
+        let component = unique_component("isolated-no-memory-no-purge");
+        let purge_attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting_memory: Arc<dyn ::zeroclaw_api::memory_traits::Memory> =
+            Arc::new(CountingPurgeMemory {
+                purge_attempts: std::sync::Arc::clone(&purge_attempts),
+            });
+
+        let (job_id, success, output) = TEST_PURGE_MEMORY
+            .scope(
+                counting_memory,
+                Box::pin(execute_and_persist_job(
+                    &config, &security, TEST_AGENT, &job, &component,
+                )),
+            )
+            .await;
+
+        assert_eq!(job_id, job.id);
+        assert!(!success);
+        assert!(
+            output.starts_with(AGENT_JOB_TIMEOUT_PREFIX),
+            "unexpected output: {output}"
+        );
+        assert_eq!(
+            purge_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a uses_memory = false job must not reach a memory backend at all"
+        );
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job lock must still be released for a memory-free isolated job"
         );
     }
 
