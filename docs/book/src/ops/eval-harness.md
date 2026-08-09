@@ -54,8 +54,13 @@ A live case omits scripted `steps` (the provider produces the responses) and may
 declare `tools` it needs. Its `setup` can seed workspace files with
 `workspace_files` and long-term memory with a `memory` map of key to content. The
 harness stores each seed as an unscoped Core memory entry before the first turn.
-Memory keys follow the same rules as workspace expectation paths: they must be
-non-empty, relative, and cannot contain `..`.
+
+Memory keys are restricted to `[A-Za-z0-9._/-]+` on top of the workspace
+expectation-path rules (non-empty, relative, no `..`). The narrower grammar exists
+because only a memory *value* passes through the content scanner, while the raw
+*key* is rendered into provider-visible prompt context — so whitespace, newlines,
+and control characters in a key would be an unscanned channel into the model's
+context. An unsafe key fails the case before the live provider is constructed.
 
 Seeds pass through the production memory content scanner before persistence.
 Flagged secret-like content or unsafe instructions fail the case before the live
@@ -87,7 +92,7 @@ Each live case runs inside a constrained execution envelope:
 | Shell | Rejected before provider construction because the compact runtime registry cannot guarantee a portable OS sandbox; the harness never falls back to `NoopSandbox`. |
 | Autonomy | `Supervised`, never `Full`. |
 | Approvals | Non-interactive backchannel manager: allowlisted tools auto-approve; anything else that reaches the approval gate is auto-denied (deterministic case failure). |
-| Timeout | Each turn is bounded by `[eval].case_timeout_secs` (default 120); a slow turn fails the case rather than hanging. |
+| Timeout | Each turn is bounded by `[eval].case_timeout_secs` (default 120, must be greater than zero); a slow turn fails the case rather than hanging. |
 
 Cases that declare memory setup or expectations, or that receive an allowlisted
 memory tool, use a fresh SQLite memory backend at `memory/brain.db` under the case
@@ -187,14 +192,32 @@ Memory checks (category `side_effect`), under `memory`:
 
 - `present` / `absent`: exact keys that must / must not exist after the run.
 - `contains`: a map of exact key to substrings that must appear in that entry's
-  content. Each map value must contain at least one substring; an empty list is
-  a failed malformed expectation rather than a vacuous pass.
+  content.
 
 Memory checks query the case's isolated memory backend by exact key rather than
 using ranked recall. Each key is validated before the backend is queried; an
 empty, absolute, or `..`-containing key is a failed check, never a memory access.
 Memory expectations are live-mode only; replay rejects their declaration and
 names `--mode live` in the error.
+
+### Expectation blocks must assert something
+
+A grader that emits zero grades reports as passing, because "every grade passed"
+is vacuously true over an empty list. To close that false-green path, `workspace`
+and `memory` blocks are validated when the fixture is loaded, and a fixture that
+fails validation becomes a named failed case in the report — it can never render
+green. Rejected shapes:
+
+- **Unknown fields.** Both blocks are `deny_unknown_fields`, so a typo such as
+  `"presnt"` fails at parse time instead of silently deserializing into an empty
+  block that asserts nothing.
+- **An empty block.** `"memory": {}` or `"workspace": {}` declares no checks;
+  remove the block or populate it.
+- **An empty needle list.** `"contains": { "project/status": [] }` asserts
+  nothing about that key.
+- **An empty-string needle.** `"contains": { "project/status": [""] }` passes
+  for every stored value, since every string contains the empty string. A check
+  that cannot fail is not a check.
 
 Budget checks (category `budget`), under `budget`, each an inclusive bound:
 `max_input_tokens`, `max_output_tokens`, `max_total_tokens`, `max_duration_ms`,

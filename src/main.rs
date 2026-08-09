@@ -1051,14 +1051,21 @@ Examples:
     #[command(long_about = "\
 Run the agent evaluation harness.
 
-Phase 0 supports deterministic replay: every `*.json` trace fixture in the suite \
-directory is replayed through the real agent loop and graded against its declarative \
-expectations. No network calls, fully deterministic. Exits non-zero if any case fails, \
-so it can gate CI.
+Replay mode (the default) replays every `*.json` trace fixture in the suite directory \
+through the real agent loop and grades it against its declarative expectations. No \
+network calls, fully deterministic. Exits non-zero if any case fails, so it can gate CI.
+
+Live mode (`--mode live`) runs each case against a real configured provider instead of \
+scripted responses: it makes real network calls and costs real tokens. It is opt-in and \
+never runs in CI by default. Configure it with `[eval].live_provider` (a dotted \
+`providers.models` reference; empty disables live mode), `[eval].live_allowed_tools` \
+(the tool allowlist a case's requested tools are intersected with; empty allows no real \
+tools), and `[eval].case_timeout_secs` (per-turn wall-clock timeout).
 
 Examples:
   zeroclaw eval run                                  # replay ./evals/regression
-  zeroclaw eval run --suite evals/regression --format json")]
+  zeroclaw eval run --suite evals/regression --format json
+  zeroclaw eval run --mode live                      # real provider, real tokens")]
     Eval {
         #[command(subcommand)]
         eval_command: EvalCommands,
