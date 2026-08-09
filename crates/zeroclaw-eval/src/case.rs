@@ -217,17 +217,40 @@ pub fn validate_workspace_rel_path(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Collect the `*.json` fixture paths from an eval-suite directory listing,
+/// sorted by path for stable ordering.
+///
+/// Fails closed: an entry-level I/O error (an unreadable entry, or one that
+/// disappears while the directory is being enumerated) is propagated with the
+/// suite path as context rather than skipped. Dropping such an entry would
+/// silently shrink the certified suite, and the regression-suite CI gate would
+/// report green for an incomplete `evals/regression` directory.
+///
+/// Takes the listing as an iterator so the failure path is directly testable
+/// without depending on a platform-specific way of provoking a `readdir` error.
+fn collect_suite_paths<I>(dir: &Path, entries: I) -> anyhow::Result<Vec<PathBuf>>
+where
+    I: IntoIterator<Item = std::io::Result<PathBuf>>,
+{
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let path = entry.with_context(|| {
+            format!("reading an entry of eval suite directory {}", dir.display())
+        })?;
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
 /// Load every `*.json` trace fixture in `dir`, sorted by path for stable ordering.
 pub fn load_suite(dir: &Path) -> anyhow::Result<Vec<(PathBuf, LlmTrace)>> {
     let read = std::fs::read_dir(dir)
         .with_context(|| format!("reading eval suite directory {}", dir.display()))?;
 
-    let mut paths: Vec<PathBuf> = read
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
-        .collect();
-    paths.sort();
+    let paths = collect_suite_paths(dir, read.map(|entry| entry.map(|e| e.path())))?;
 
     let mut out = Vec::with_capacity(paths.len());
     for path in paths {
@@ -375,5 +398,50 @@ mod tests {
         assert_eq!(suite[0].1.model_name, "a"); // sorted by path
         assert_eq!(suite[1].1.model_name, "b");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fail closed: `load_suite`'s directory-listing pass must propagate an
+    /// entry-level I/O error instead of dropping the entry. A dropped entry
+    /// would silently shrink the suite that the regression CI gate certifies.
+    ///
+    /// The error is injected through `collect_suite_paths`, the exact iterator
+    /// pass `load_suite` runs its `read_dir` results through, because provoking
+    /// a genuine per-entry `readdir` failure is platform-specific and racy.
+    #[test]
+    fn load_suite_propagates_entry_errors() {
+        let dir = Path::new("/some/eval/suite");
+        let entries = vec![
+            Ok(dir.join("a.json")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "entry vanished mid-enumeration",
+            )),
+            Ok(dir.join("b.json")),
+        ];
+        let err = collect_suite_paths(dir, entries)
+            .expect_err("an unreadable directory entry must not be skipped");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("/some/eval/suite"),
+            "error must name the suite directory, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("entry vanished mid-enumeration"),
+            "error must preserve the underlying I/O cause, got: {rendered}"
+        );
+    }
+
+    /// The injectable collector is the same filter/sort the directory walk uses,
+    /// so the failure test above covers the real `load_suite` path.
+    #[test]
+    fn collect_suite_paths_filters_json_and_sorts() {
+        let dir = Path::new("/some/eval/suite");
+        let entries = vec![
+            Ok(dir.join("b.json")),
+            Ok(dir.join("note.txt")),
+            Ok(dir.join("a.json")),
+        ];
+        let paths = collect_suite_paths(dir, entries).unwrap();
+        assert_eq!(paths, vec![dir.join("a.json"), dir.join("b.json")]);
     }
 }
