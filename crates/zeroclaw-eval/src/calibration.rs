@@ -322,6 +322,64 @@ mod tests {
     }
 
     #[test]
+    fn judge_gate_stays_off_for_empty_calibration_file() {
+        // `touch <calibration_path>` must NOT be sufficient to arm the gate.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write(tmp.path(), "");
+        let d = decide_gate(true, &p, REF, &[], &[]);
+        assert!(!d.gates(), "an empty file must not arm judge_gate");
+        assert!(d.refusal().is_some_and(|r| r.contains("is empty")));
+    }
+
+    #[test]
+    fn judge_gate_stays_off_for_directory_at_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("cal.json");
+        std::fs::create_dir(&dir).unwrap();
+        let d = decide_gate(true, &dir, REF, &[], &[]);
+        assert!(!d.gates(), "a directory must not arm judge_gate");
+        assert!(d.refusal().is_some_and(|r| r.contains("directory")));
+    }
+
+    #[test]
+    fn judge_gate_stays_off_for_malformed_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write(tmp.path(), "{not json");
+        let d = decide_gate(true, &p, REF, &[], &[]);
+        assert!(!d.gates(), "malformed JSON must not arm judge_gate");
+        assert!(
+            d.refusal()
+                .is_some_and(|r| r.contains("not a valid v1 record"))
+        );
+    }
+
+    #[test]
+    fn judge_gate_rejects_mismatched_judge_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write(tmp.path(), &valid_json("openai.other:gpt-y", 50, "0.9"));
+        let d = decide_gate(true, &p, REF, &[], &[]);
+        assert!(!d.gates(), "a calibration for another judge must not gate");
+        assert!(
+            d.refusal()
+                .is_some_and(|r| r.contains("was issued for judge"))
+        );
+    }
+
+    #[test]
+    fn judge_gate_rejects_insufficient_labels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write(tmp.path(), &valid_json(REF, 49, "0.9"));
+        assert!(!decide_gate(true, &p, REF, &[], &[]).gates());
+    }
+
+    #[test]
+    fn judge_gate_rejects_agreement_below_floor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write(tmp.path(), &valid_json(REF, 50, "0.5"));
+        assert!(!decide_gate(true, &p, REF, &[], &[]).gates());
+    }
+
+    #[test]
     fn gated_judge_refuses_provider_fallback() {
         // A calibration authorizes ONE identity. If the provider can fail over to
         // another alias, a successful call may be served by an uncalibrated judge.
