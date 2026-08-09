@@ -16,22 +16,29 @@ pub struct CaseReport {
 }
 
 impl CaseReport {
-    /// A case passes when it ran without error and every check passed.
+    /// A case passes when it ran without error, produced at least one check, and
+    /// every check passed.
+    ///
+    /// Fail closed on the empty-grade case: a report with no grades asserted
+    /// nothing about the run, so treating it as a pass would let a vacuous
+    /// fixture — or a case that errored before grading — certify green.
     pub fn passed(&self) -> bool {
-        self.error.is_none() && self.grades.iter().all(|g| g.passed)
+        self.error.is_none() && !self.grades.is_empty() && self.grades.iter().all(|g| g.passed)
     }
 
     fn checks_passed(&self) -> usize {
         self.grades.iter().filter(|g| g.passed).count()
     }
 
-    /// Partial-credit score: fraction of checks passed. A case with no checks
-    /// scores 1.0 (it passes vacuously). Informational; the gate is pass/fail.
-    pub fn score(&self) -> f64 {
+    /// Partial-credit score: fraction of checks passed, or `None` when the case
+    /// produced no checks (it errored before grading, or asserted nothing).
+    /// A vacuous case is not a perfect one, so it has no score rather than 1.0.
+    /// Informational; the gate is pass/fail.
+    pub fn score(&self) -> Option<f64> {
         if self.grades.is_empty() {
-            1.0
+            None
         } else {
-            self.checks_passed() as f64 / self.grades.len() as f64
+            Some(self.checks_passed() as f64 / self.grades.len() as f64)
         }
     }
 
@@ -195,8 +202,40 @@ mod tests {
         );
         // A run error fails the case even when every check passed.
         assert!(!case("a", vec![grade("c1", true, "")], Some("trace exhausted")).passed());
-        // No checks and no error passes vacuously.
-        assert!(case("a", vec![], None).passed());
+        // No checks and no error now FAILS: a case that asserted nothing must
+        // not certify green.
+        assert!(!case("a", vec![], None).passed());
+    }
+
+    #[test]
+    fn case_with_no_grades_has_no_score_and_does_not_pass() {
+        let vacuous = case("vacuous", vec![], None);
+        assert!(
+            !vacuous.passed(),
+            "a case with zero checks must not pass vacuously"
+        );
+        assert_eq!(
+            vacuous.score(),
+            None,
+            "a case with zero checks has no score, not a perfect one"
+        );
+    }
+
+    #[test]
+    fn errored_case_reports_null_score_in_json() {
+        // Regression: an errored case used to emit `passed: false` next to
+        // `score: 1.0`, so machine consumers read a provider/setup failure as a
+        // perfect run.
+        let suite = SuiteReport {
+            cases: vec![case("err", vec![], Some("provider timed out"))],
+        };
+        let json: serde_json::Value = serde_json::from_str(&suite.to_json()).unwrap();
+        assert_eq!(json["cases"][0]["passed"].as_bool(), Some(false));
+        assert!(
+            json["cases"][0]["score"].is_null(),
+            "errored case must not report a numeric score, got: {}",
+            json["cases"][0]["score"]
+        );
     }
 
     #[test]
@@ -315,7 +354,7 @@ mod tests {
             error: None,
         };
         // score = 3/4 passed.
-        assert!((report.score() - 0.75).abs() < f64::EPSILON);
+        assert!((report.score().unwrap() - 0.75).abs() < f64::EPSILON);
         let totals = report.category_totals();
         assert_eq!(totals["response"]["passed"].as_u64(), Some(1));
         assert_eq!(totals["response"]["total"].as_u64(), Some(2));
