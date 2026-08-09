@@ -2712,11 +2712,48 @@ fn configured_gateway_webhook_secret_hash(state: &AppState) -> Option<String> {
         .map(hash_webhook_secret)
 }
 
+/// Immutable snapshot of the credential policy applied to ONE request.
+///
+/// `AppState::config` is a live `Arc<RwLock<Config>>` that the config
+/// PUT/PATCH handlers and `POST /admin/reload` legitimately mutate while a
+/// request is in flight. Reading the policy twice therefore lets a single
+/// request straddle two security states: a headerless request can pass an
+/// "unconfigured" read and then satisfy a "configured" read after an operator
+/// inserts a secret, and a request bearing a revoked secret can pass a read
+/// against the old secret and then be admitted merely because a replacement is
+/// present.
+///
+/// This verdict is produced by exactly one policy read inside
+/// [`authorize_webhook_request`] and is then threaded through dispatch. No
+/// downstream code re-reads `state.config` for an authorization decision, so
+/// live rotation takes effect at *next*-request granularity instead of mixing
+/// two security states inside one request.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WebhookAuthVerdict {
+    /// `gateway.require_pairing` was on in this snapshot AND the bearer token verified.
+    pairing_verified: bool,
+    /// `gateway.webhook_secret` was set in this snapshot AND `X-Webhook-Secret` matched it.
+    secret_verified: bool,
+    /// At least one control was configured in this same snapshot.
+    any_control_configured: bool,
+}
+
+impl WebhookAuthVerdict {
+    /// The composition rule the docs state: at least one control must be
+    /// configured, and every configured control must have passed. A verdict is
+    /// only ever constructed after every configured control passed, so both
+    /// facts come from the SAME snapshot and insertion/rotation cannot straddle
+    /// them.
+    fn may_dispatch_sop(self) -> bool {
+        self.any_control_configured && (self.pairing_verified || self.secret_verified)
+    }
+}
+
 fn authorize_webhook_request(
     state: &AppState,
     peer_addr: SocketAddr,
     headers: &HeaderMap,
-) -> Result<(), WebhookJsonResponse> {
+) -> Result<WebhookAuthVerdict, WebhookJsonResponse> {
     let rate_key = client_key_from_request(Some(peer_addr), headers, state.trust_forwarded_headers);
     if !state.rate_limiter.allow_webhook(&rate_key) {
         ::zeroclaw_log::record!(
@@ -2732,7 +2769,17 @@ fn authorize_webhook_request(
         return Err((StatusCode::TOO_MANY_REQUESTS, Json(err)));
     }
 
-    if state.pairing.require_pairing() {
+    // ── The single authorization policy read for this request ──
+    // Everything below decides from `snapshot_secret_hash` / `require_pairing`
+    // captured here; `state.config` is never consulted again for an
+    // authorization decision on this request.
+    let snapshot_secret_hash = configured_gateway_webhook_secret_hash(state);
+    let require_pairing = state.pairing.require_pairing();
+    let any_control_configured = require_pairing || snapshot_secret_hash.is_some();
+    let mut pairing_verified = false;
+    let mut secret_verified = false;
+
+    if require_pairing {
         if let Err(e) = state.auth_limiter.check_rate_limit(&rate_key) {
             ::zeroclaw_log::record!(
                 WARN,
@@ -2765,9 +2812,10 @@ fn authorize_webhook_request(
             });
             return Err((StatusCode::UNAUTHORIZED, Json(err)));
         }
+        pairing_verified = true;
     }
 
-    if let Some(secret_hash) = configured_gateway_webhook_secret_hash(state) {
+    if let Some(secret_hash) = snapshot_secret_hash.as_deref() {
         let header_hash = headers
             .get("X-Webhook-Secret")
             .and_then(|v| v.to_str().ok())
@@ -2775,7 +2823,9 @@ fn authorize_webhook_request(
             .filter(|value| !value.is_empty())
             .map(hash_webhook_secret);
         match header_hash {
-            Some(val) if constant_time_eq(&val, &secret_hash) => {}
+            Some(val) if constant_time_eq(&val, secret_hash) => {
+                secret_verified = true;
+            }
             _ => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -2789,7 +2839,11 @@ fn authorize_webhook_request(
         }
     }
 
-    Ok(())
+    Ok(WebhookAuthVerdict {
+        pairing_verified,
+        secret_verified,
+        any_control_configured,
+    })
 }
 
 fn check_webhook_idempotency(
@@ -2825,23 +2879,22 @@ fn check_webhook_idempotency(
     ))
 }
 
-/// Whether the gateway has at least one webhook credential control
-/// configured (pairing bearer or a webhook secret). `authorize_webhook_request`
-/// above already rejects the request if a *configured* control's check
-/// fails, so by the time callers reach this point "configured" implies
-/// "already verified for this request".
-fn has_configured_webhook_credential(state: &AppState) -> bool {
-    state.pairing.require_pairing() || configured_gateway_webhook_secret_hash(state).is_some()
-}
-
 /// Fail closed before a SOP run starts. Starting a SOP run authorizes real
 /// side effects, so — unlike the chat-only `/webhook` fallback, which keeps
 /// its existing default-open policy — dispatch must not proceed when both
 /// `gateway.require_pairing` and the webhook secret are unset (the official
 /// container's default configuration). Repo policy is "new external surfaces
 /// default closed".
-fn require_sop_dispatch_credentials(state: &AppState) -> Result<(), WebhookJsonResponse> {
-    if has_configured_webhook_credential(state) {
+///
+/// This is a PURE function over the request-scoped [`WebhookAuthVerdict`]
+/// produced by the single policy read in [`authorize_webhook_request`]. It
+/// deliberately takes no `&AppState`: re-reading the live config here is what
+/// let a request straddle two security states across a concurrent config
+/// mutation.
+fn require_sop_dispatch_credentials(
+    verdict: WebhookAuthVerdict,
+) -> Result<(), WebhookJsonResponse> {
+    if verdict.may_dispatch_sop() {
         return Ok(());
     }
     ::zeroclaw_log::record!(
@@ -2867,11 +2920,10 @@ async fn handle_webhook(
     headers: HeaderMap,
     body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    if let Err(response) = authorize_webhook_request(&state, peer_addr, &headers) {
-        return response;
-    }
-
-    // ── Parse body ──
+    let auth_verdict = match authorize_webhook_request(&state, peer_addr, &headers) {
+        Ok(verdict) => verdict,
+        Err(response) => return response,
+    };
     let Json(webhook_body) = match body {
         Ok(b) => b,
         Err(e) => {
@@ -2901,7 +2953,7 @@ async fn handle_webhook(
     };
 
     if has_matching_sop {
-        if let Err(response) = require_sop_dispatch_credentials(&state) {
+        if let Err(response) = require_sop_dispatch_credentials(auth_verdict) {
             return response;
         }
         if let Some(response) = check_webhook_idempotency(&state, &headers, None) {
@@ -6695,6 +6747,177 @@ path = "{trigger_path}"
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     }
 
+    /// Count SOP runs the engine has ever started (active + finished), so a
+    /// race test can prove *no run was started*, not merely that the HTTP
+    /// status was 401.
+    fn started_run_count(state: &AppState) -> usize {
+        let engine = state.sop_engine.as_ref().expect("engine").lock().unwrap();
+        engine.active_runs().len() + engine.run_summaries(None).len()
+    }
+
+    /// B1 insertion race: pairing disabled and no secret configured, so a
+    /// headerless request is authorized against an "unconfigured" snapshot.
+    /// An operator then writes `gateway.webhook_secret` into the live config
+    /// *after* authorization but before dispatch. The old two-read design would
+    /// see a configured control on the second read and admit a request that
+    /// presented nothing; the request-scoped verdict must reject it.
+    #[tokio::test]
+    async fn sop_dispatch_uses_authorization_snapshot_when_secret_added_midrequest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+
+        // Read #1: no control configured at all.
+        let verdict = authorize_webhook_request(&state, test_connect_info().0, &HeaderMap::new())
+            .expect("no configured control -> authorization itself passes");
+
+        // Concurrent operator action lands between authorization and dispatch.
+        state.config.write().gateway.webhook_secret = Some(generate_test_secret());
+
+        // The dispatch decision must come from the snapshot, not the new config.
+        let rejection = require_sop_dispatch_credentials(verdict)
+            .expect_err("a request that presented no credential must not dispatch a SOP");
+        assert_eq!(rejection.0, StatusCode::UNAUTHORIZED);
+
+        // And end-to-end through the route: the headerless caller now fails the
+        // (newly configured) secret check outright and still starts no run.
+        let response = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            HeaderMap::new(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            started_run_count(&state),
+            0,
+            "no SOP run may start for a request that presented no credential"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// B1 rotation race: secret A is configured and the caller presents A, so
+    /// read #1 verifies genuinely. The live config then rotates to secret B
+    /// before dispatch. The in-flight request is judged on its own snapshot
+    /// (accepted), while rotation takes effect at *next*-request granularity:
+    /// a subsequent A request is rejected and a B request is accepted.
+    #[tokio::test]
+    async fn sop_dispatch_uses_authorization_snapshot_during_secret_rotation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let secret_a = generate_test_secret();
+        state.config.write().gateway.webhook_secret = Some(secret_a.clone());
+
+        let verdict = authorize_webhook_request(
+            &state,
+            test_connect_info().0,
+            &webhook_secret_header(&secret_a),
+        )
+        .expect("the presented secret matches the live policy at read #1");
+
+        // Rotation lands between authorization and dispatch.
+        let secret_b = generate_test_secret();
+        state.config.write().gateway.webhook_secret = Some(secret_b.clone());
+
+        assert!(
+            require_sop_dispatch_credentials(verdict).is_ok(),
+            "a request that genuinely verified its snapshot's secret keeps that verdict"
+        );
+
+        // Next-request granularity: the retired secret is now rejected...
+        assert!(
+            authorize_webhook_request(
+                &state,
+                test_connect_info().0,
+                &webhook_secret_header(&secret_a),
+            )
+            .is_err(),
+            "a subsequent request bearing the retired secret must be rejected"
+        );
+        // ...and the replacement is accepted and may dispatch.
+        let rotated = authorize_webhook_request(
+            &state,
+            test_connect_info().0,
+            &webhook_secret_header(&secret_b),
+        )
+        .expect("the rotated secret authorizes the next request");
+        assert!(require_sop_dispatch_credentials(rotated).is_ok());
+    }
+
+    /// B1 on `/webhook`, where body parsing and trigger matching sit between
+    /// authorization and the dispatch credential check — the widest window.
+    /// A headerless request must not become dispatchable because a secret was
+    /// inserted while the body was being parsed.
+    #[tokio::test]
+    async fn webhook_path_snapshot_survives_body_parse_and_trigger_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/webhook");
+
+        let verdict = authorize_webhook_request(&state, test_connect_info().0, &HeaderMap::new())
+            .expect("no configured control -> authorization itself passes");
+
+        // Simulate the parse/match window: config mutates before dispatch.
+        assert!(
+            api_sop_webhook::has_matching_webhook_sop(&state, "/webhook").unwrap(),
+            "fixture must load a matching /webhook trigger"
+        );
+        state.config.write().gateway.webhook_secret = Some(generate_test_secret());
+
+        assert!(
+            require_sop_dispatch_credentials(verdict).is_err(),
+            "the /webhook SOP branch must judge the snapshot, not the mutated config"
+        );
+
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "deploy".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            started_run_count(&state),
+            0,
+            "no SOP run may start on the /webhook path either"
+        );
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            0,
+            "and it must not silently fall back to the chat/model path"
+        );
+    }
+
+    /// B1 purity: the dispatch gate decides only from the request-scoped
+    /// verdict. Two verdict values with identical contents must produce
+    /// identical decisions regardless of what the live config says, which is
+    /// only possible because the function never touches `AppState`.
+    #[tokio::test]
+    async fn require_sop_dispatch_credentials_is_pure_over_verdict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _provider) = webhook_sop_state(&tmp, "/sop/deploy");
+
+        let unconfigured =
+            authorize_webhook_request(&state, test_connect_info().0, &HeaderMap::new())
+                .expect("no control configured");
+        let before = require_sop_dispatch_credentials(unconfigured).is_ok();
+
+        // Flip the live config to the opposite policy in every way we can.
+        state.config.write().gateway.webhook_secret = Some(generate_test_secret());
+        let after = require_sop_dispatch_credentials(unconfigured).is_ok();
+
+        assert_eq!(
+            before, after,
+            "the decision must depend only on the verdict, never on live state"
+        );
+        assert!(!before, "an unconfigured snapshot must fail closed");
+    }
+
     #[tokio::test]
     async fn sop_dispatch_rejected_when_no_credentials_configured() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7181,7 +7404,9 @@ path = "{trigger_path}"
             "channel listener aliases must never become gateway credentials"
         );
         assert!(
-            require_sop_dispatch_credentials(&state).is_err(),
+            authorize_webhook_request(&state, test_connect_info().0, &HeaderMap::new())
+                .map(require_sop_dispatch_credentials)
+                .is_ok_and(|dispatch| dispatch.is_err()),
             "multiple channel aliases without a gateway credential must fail closed"
         );
 

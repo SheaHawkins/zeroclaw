@@ -146,13 +146,16 @@ pub async fn handle_sop_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(response) = authorize_webhook_request(&state, peer_addr, &headers) {
-        return response.into_response();
-    }
+    let auth_verdict = match authorize_webhook_request(&state, peer_addr, &headers) {
+        Ok(verdict) => verdict,
+        Err(response) => return response.into_response(),
+    };
     // `/sop/*` is side-effecting and has no open chat fallback. After the
     // shared rate/auth checks above, fail closed before parsing the body or
     // consulting daemon-owned SOP state so anonymous callers cannot probe it.
-    if let Err(response) = require_sop_dispatch_credentials(&state) {
+    // The decision comes from the request-scoped verdict captured above, never
+    // from a second read of the live config.
+    if let Err(response) = require_sop_dispatch_credentials(auth_verdict) {
         return response.into_response();
     }
 
