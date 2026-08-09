@@ -14,6 +14,10 @@ pub enum GradeCategory {
     SideEffect,
     Budget,
     Judge,
+    /// The run itself, independent of any declared expectation. Lets a case that
+    /// deliberately declares no expectations still emit one honest grade instead
+    /// of an empty vector (see [`RunCompletedGrader`]).
+    Run,
 }
 
 /// The outcome of a single check.
@@ -71,6 +75,33 @@ impl Grader for ExpectationsGrader {
 
     async fn grade(&self, run: &RunRecord, _ctx: &GradeContext<'_>) -> Vec<GradeResult> {
         evaluate_expects(&self.expects, run)
+    }
+}
+
+/// Emits one grade recording that the run reached grading at all.
+///
+/// This exists so "no grades" can never mean "passed". [`CaseReport::passed`]
+/// requires a non-empty grade vector, which would otherwise make a case with
+/// `allow_no_expectations` unpassable; this grader gives such a case one honest
+/// thing to report instead of an empty vector. Every case gets it, so the
+/// invariant "a graded case has at least one grade" holds unconditionally.
+///
+/// [`CaseReport::passed`]: crate::report::CaseReport::passed
+pub struct RunCompletedGrader;
+
+#[async_trait::async_trait]
+impl Grader for RunCompletedGrader {
+    fn name(&self) -> &str {
+        "run_completed"
+    }
+
+    async fn grade(&self, _run: &RunRecord, _ctx: &GradeContext<'_>) -> Vec<GradeResult> {
+        vec![GradeResult::new(
+            "run_completed".to_string(),
+            true,
+            "the case ran to completion and reached grading",
+            GradeCategory::Run,
+        )]
     }
 }
 
@@ -183,23 +214,44 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
     out
 }
 
-/// Build the case's graders and run them while the workspace is alive, returning
-/// every grade concatenated. Phase 0 / this milestone's grader set is just
-/// [`ExpectationsGrader`]; later milestones extend it from the case declarations.
+/// The production grader catalog for a case: the checks every case gets, in the
+/// order their grades appear in the report.
+///
+/// Split out from [`grade_run`] so the runner can accept a caller-supplied
+/// catalog (`run_case_with_graders`) while still defaulting to exactly this set
+/// — a test-injected grader therefore runs on the same code path production
+/// uses, not a parallel one.
+pub fn default_graders(trace: &crate::case::LlmTrace) -> Vec<Box<dyn Grader>> {
+    vec![
+        Box::new(RunCompletedGrader),
+        Box::new(ExpectationsGrader {
+            expects: trace.expects.clone(),
+        }),
+    ]
+}
+
+/// Run `graders` against the record while the case workspace is still alive,
+/// returning every grade concatenated.
+pub async fn grade_with(
+    graders: &[Box<dyn Grader>],
+    record: &RunRecord,
+    workspace: &std::path::Path,
+) -> Vec<GradeResult> {
+    let ctx = GradeContext { workspace };
+    let mut grades = Vec::new();
+    for grader in graders {
+        grades.extend(grader.grade(record, &ctx).await);
+    }
+    grades
+}
+
+/// Build the case's default graders and run them while the workspace is alive.
 pub async fn grade_run(
     trace: &crate::case::LlmTrace,
     record: &RunRecord,
     workspace: &std::path::Path,
 ) -> Vec<GradeResult> {
-    let ctx = GradeContext { workspace };
-    let graders: Vec<Box<dyn Grader>> = vec![Box::new(ExpectationsGrader {
-        expects: trace.expects.clone(),
-    })];
-    let mut grades = Vec::new();
-    for grader in &graders {
-        grades.extend(grader.grade(record, &ctx).await);
-    }
-    grades
+    grade_with(&default_graders(trace), record, workspace).await
 }
 
 #[cfg(test)]
