@@ -508,6 +508,34 @@ mod tests {
     }
 
     #[test]
+    fn quickstart_terminal_size_unknown_is_defined_in_every_locale() {
+        // The checklist fails closed when `Term::size_checked()` returns None.
+        // That path is only reachable through this key, so a locale missing it
+        // would render the raw `{key}` placeholder to the user at exactly the
+        // moment we are refusing to draw an unverifiable menu.
+        for (source, locale) in channel_approval_locale_sources() {
+            let message =
+                format_ftl_message(source, locale, "cli-quickstart-terminal-size-unknown", &[])
+                    .unwrap_or_else(|| {
+                        panic!("{locale}: cli-quickstart-terminal-size-unknown should be defined")
+                    });
+            assert!(
+                !message.trim().is_empty(),
+                "{locale}: cli-quickstart-terminal-size-unknown should not be empty"
+            );
+            assert!(
+                !message.contains('{'),
+                "{locale}: the message takes no arguments; got {message:?}"
+            );
+        }
+
+        assert_eq!(
+            get_english_cli_string_with_args("cli-quickstart-terminal-size-unknown", &[]),
+            "Quickstart could not determine the terminal size, so it cannot verify the checklist fits. Run it from a terminal that reports its dimensions, or use `zeroclaw config set <path> <value>` for headless configuration."
+        );
+    }
+
+    #[test]
     fn disk_approval_override_cannot_rewrite_parser_commands() {
         let sources = CliFtlSources {
             locale: "es".to_string(),
