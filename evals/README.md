@@ -10,6 +10,7 @@ Suites of agent evaluation cases for `zeroclaw eval run` (crate: `crates/zerocla
 
 - Source cases from real failures (bug tracker, support reports). Start small; 20–50 good cases beat 500 vague ones.
 - Every case states its class: a **positive** case (behavior must happen) or a **negative** case (behavior must NOT happen — e.g. `tools_not_used`, `response_not_contains`, `max_tool_calls: 0`). Keep the suite balanced; one-sided evals create one-sided optimization.
+- Every case must assert something. The loader rejects a fixture whose `expects` block can never produce a grade, and rejects unknown keys outright so a misspelled expectation is a load error rather than a silently empty block. A case that deliberately asserts nothing declares `"allow_no_expectations": true`; it still reports a `run_completed` grade. See "Every case must assert something" in `docs/book/src/ops/eval-harness.md`.
 - The two-experts test: two people reading the case must independently reach the same pass/fail verdict from the case text alone. If they wouldn't, the case is ambiguous — tighten it.
 - A replay case's scripted steps double as its reference solution: they prove the task is solvable.
 - Privacy: fixtures ship forever. Placeholder identities only (`zeroclaw_user`, `example.com`) per `docs/book/src/contributing/privacy.md`. Never paste real transcripts, names, keys, or hostnames.
