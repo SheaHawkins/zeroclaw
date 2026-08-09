@@ -2542,6 +2542,21 @@ impl Channel for WeChatChannel {
                 /// it is deferred the same way as delivery: a held batch
                 /// re-polls these messages, and running the side effect on
                 /// every held pass would spam pairing replies.
+                ///
+                /// Liveness trade-off, accepted deliberately: a `/bind`
+                /// that arrives in the same batch as a later message whose
+                /// attachment keeps failing retryably waits behind that
+                /// attachment, even though pairing does not depend on it.
+                /// The alternative — carving control-plane messages out of
+                /// the deferral — reintroduces the repeated-reply bug this
+                /// staging exists to fix, since a held batch re-delivers
+                /// the same `/bind` on every pass. The exposure is bounded:
+                /// only a CDN failure that keeps reporting retryable can
+                /// sustain it (a local workspace failure an operator must
+                /// clear is classified `Permanent` by
+                /// `classify_workspace_io`, so it commits rather than
+                /// holding), and the hold itself backs off to
+                /// `ATTACHMENT_RETRY_MAX_DELAY`.
                 Unauthorized { from_user_id: String, text: String },
             }
             let mut staged: Vec<StagedInbound> = Vec::new();
