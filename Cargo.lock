@@ -13284,6 +13284,7 @@ version = "0.8.4"
 dependencies = [
  "anyhow",
  "async-trait",
+ "quick-xml",
  "regex",
  "serde",
  "serde_json",
