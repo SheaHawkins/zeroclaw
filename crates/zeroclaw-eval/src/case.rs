@@ -192,17 +192,37 @@ pub fn validate_workspace_rel_path(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Collect the sorted `*.json` paths from an already-opened directory listing.
+///
+/// Split out of [`load_suite`] so the fail-closed entry handling can be driven
+/// directly by a test with an injected entry-level I/O error: a real mid-iteration
+/// `readdir(3)` failure cannot be provoked portably.
+///
+/// Fail closed: a dropped entry silently shrinks the suite that CI then
+/// certifies as green, so any entry error aborts discovery with suite context.
+fn collect_suite_paths<I>(dir: &Path, entries: I) -> anyhow::Result<Vec<PathBuf>>
+where
+    I: IntoIterator<Item = std::io::Result<PathBuf>>,
+{
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let path = entry.with_context(|| {
+            format!("reading an entry of eval suite directory {}", dir.display())
+        })?;
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
 /// Load every `*.json` trace fixture in `dir`, sorted by path for stable ordering.
 pub fn load_suite(dir: &Path) -> anyhow::Result<Vec<(PathBuf, LlmTrace)>> {
     let read = std::fs::read_dir(dir)
         .with_context(|| format!("reading eval suite directory {}", dir.display()))?;
 
-    let mut paths: Vec<PathBuf> = read
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
-        .collect();
-    paths.sort();
+    let paths = collect_suite_paths(dir, read.map(|entry| entry.map(|entry| entry.path())))?;
 
     let mut out = Vec::with_capacity(paths.len());
     for path in paths {
@@ -322,5 +342,43 @@ mod tests {
         assert_eq!(suite[0].1.model_name, "a"); // sorted by path
         assert_eq!(suite[1].1.model_name, "b");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_suite_propagates_entry_error_instead_of_shrinking() {
+        // Two readable fixtures plus one entry that fails at the iterator level:
+        // discovery must abort, not certify the readable subset.
+        let dir = std::path::Path::new("/eval/suite");
+        let entries: Vec<std::io::Result<PathBuf>> = vec![
+            Ok(dir.join("a.json")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "permission denied",
+            )),
+            Ok(dir.join("b.json")),
+        ];
+        let err = collect_suite_paths(dir, entries)
+            .expect_err("an entry-level error must abort suite discovery");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("/eval/suite"),
+            "error must name the suite directory, got: {chain}"
+        );
+        assert!(
+            chain.contains("permission denied"),
+            "error must retain the underlying cause, got: {chain}"
+        );
+    }
+
+    #[test]
+    fn collect_suite_paths_filters_and_sorts_on_the_healthy_path() {
+        let dir = std::path::Path::new("/eval/suite");
+        let entries: Vec<std::io::Result<PathBuf>> = vec![
+            Ok(dir.join("b.json")),
+            Ok(dir.join("note.txt")),
+            Ok(dir.join("a.json")),
+        ];
+        let paths = collect_suite_paths(dir, entries).unwrap();
+        assert_eq!(paths, vec![dir.join("a.json"), dir.join("b.json")]);
     }
 }
