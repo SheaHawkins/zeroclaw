@@ -3765,6 +3765,81 @@ data: {\"type\":\"message_stop\"}\n\n";
         }
     }
 
+    /// Category token used to prove the refusal category never reaches a
+    /// rendered string. Deliberately unlike any real native category so a
+    /// match can only come from interpolating `category` itself.
+    const CATEGORY_SENTINEL: &str = "zc-category-sentinel";
+
+    /// Build the typed refusal error the way the provider does, carrying
+    /// [`CATEGORY_SENTINEL`] as the native refusal category.
+    fn refusal_error_with_sentinel_category() -> AnthropicRefusalError {
+        let json = format!(
+            r#"{{
+                "content": [],
+                "stop_reason": "refusal",
+                "stop_details": {{"type": "refusal", "category": "{CATEGORY_SENTINEL}"}},
+                "usage": {{"input_tokens": 10, "output_tokens": 0}}
+            }}"#
+        );
+        let resp: NativeChatResponse = serde_json::from_str(&json).unwrap();
+        AnthropicModelProvider::check_refusal(&resp, "claude-sonnet-4-6")
+            .expect_err("stop_reason=refusal must produce a typed refusal error")
+    }
+
+    /// The orchestrator's actual user-facing call shape is
+    /// `sanitize_api_error(&e.to_string())` (crates/zeroclaw-channels/src/
+    /// orchestrator/mod.rs). Pin the end-to-end boundary, not just `Display`:
+    /// the sanitizer only scrubs secrets and truncates, so anything `Display`
+    /// emits reaches the user intact.
+    #[test]
+    fn sanitized_refusal_reply_omits_category() {
+        let err = refusal_error_with_sentinel_category();
+
+        let user_facing = crate::sanitize_api_error(&err.to_string());
+        assert!(
+            !user_facing.contains(CATEGORY_SENTINEL),
+            "refusal category leaked into the user-facing reply: {user_facing}"
+        );
+        assert_eq!(user_facing, ANTHROPIC_REFUSAL_MESSAGE);
+
+        // Same boundary for the thinking-stream mapping, which the
+        // orchestrator renders through the identical sanitizer.
+        let stream_err = StreamError::ModelProvider(ANTHROPIC_REFUSAL_MESSAGE.to_string());
+        let stream_text = crate::sanitize_api_error(&stream_err.to_string());
+        assert!(
+            !stream_text.contains(CATEGORY_SENTINEL),
+            "refusal category leaked into the streamed reply: {stream_text}"
+        );
+    }
+
+    /// `reliable.rs::compact_error_detail` renders provider errors with the
+    /// anyhow alternate formatter (`{err:#}`), which walks the source chain.
+    /// A category-bearing `Display` — or a category-bearing source — would
+    /// leak there too, so pin that rendering as well.
+    #[test]
+    fn refusal_error_alternate_format_omits_category() {
+        let err = anyhow::Error::new(refusal_error_with_sentinel_category());
+        for rendered in [format!("{err}"), format!("{err:#}"), format!("{err:?}")] {
+            assert!(
+                !rendered.contains(CATEGORY_SENTINEL),
+                "refusal category leaked into an error rendering: {rendered}"
+            );
+        }
+    }
+
+    /// The fix removes the category from rendered text only — it must not
+    /// silently drop the structured-logging / reliability signal.
+    #[test]
+    fn refusal_error_retains_category_for_logging() {
+        let err = refusal_error_with_sentinel_category();
+        assert_eq!(
+            err.category.as_deref(),
+            Some(CATEGORY_SENTINEL),
+            "category must stay on the typed error for structured logs"
+        );
+        assert_eq!(err.requested_model, "claude-sonnet-4-6");
+    }
+
     #[test]
     fn end_turn_response_unaffected_by_new_fields() {
         let json = r#"{
