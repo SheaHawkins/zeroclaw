@@ -3059,14 +3059,12 @@ data: {\"type\":\"message_stop\"}\n\n";
         });
 
         // Create model_provider pointing at mock server
-        let model_provider = AnthropicModelProvider {
-            alias: "test".to_string(),
-            credential: Some("test-key".to_string()),
-            base_url: format!("http://{addr}"),
-            max_tokens: 4096,
-            timeout_secs: 120,
-            schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
-        };
+        let model_provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .max_tokens(4096)
+            .timeout_secs(120)
+            .build();
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)
         let messages = vec![
@@ -3655,14 +3653,61 @@ data: {\"type\":\"message_stop\"}\n\n";
         (addr, handle)
     }
 
+    /// Guard against the `E0063` drift class that took this crate's entire
+    /// lib-test target down (CI `Lint` + `Test` + `CI Required Gate` all red
+    /// at head `59273cd1`): a `#[cfg(test)]` struct literal of
+    /// `AnthropicModelProvider` names every field explicitly, so adding a
+    /// private field to the struct — as the tool-schema memoization work did
+    /// with `schema_cache` — is a hard compile break in test-only code that
+    /// `cargo build` cannot see.
+    ///
+    /// A runtime assertion cannot catch a compile error, so this inspects the
+    /// source instead: no test-module code may hand-roll the provider. The
+    /// builder supplies every optional field, so `builder(..).build()` is
+    /// immune to future field additions.
+    #[test]
+    fn test_module_never_hand_rolls_provider_struct_literal() {
+        // Assembled at runtime so this test's own source cannot match it.
+        let needle = format!("{}{}", "AnthropicModelProvider", " {");
+        let source = include_str!("anthropic.rs");
+
+        let tests_start = source
+            .find("\nmod tests {")
+            .expect("anthropic.rs must have a `mod tests` block");
+
+        let offenders: Vec<usize> = source[tests_start..]
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let trimmed = line.trim_start();
+                trimmed.contains(&needle)
+                    && !trimmed.starts_with("///")
+                    && !trimmed.starts_with("//")
+                    // `fn f() -> AnthropicModelProvider {` and `impl … {` open
+                    // a block, they do not construct anything.
+                    && !trimmed.contains("->")
+                    && !trimmed.starts_with("impl")
+            })
+            .map(|(idx, _)| source[..tests_start].lines().count() + idx)
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "test code must construct the provider via \
+             `AnthropicModelProvider::builder(..).build()`, not a struct \
+             literal — a literal names every field and breaks to compile \
+             (E0063) the moment a private field is added. Offending \
+             anthropic.rs line(s): {offenders:?}"
+        );
+    }
+
     fn refusal_test_provider(addr: std::net::SocketAddr) -> AnthropicModelProvider {
-        AnthropicModelProvider {
-            alias: "test".to_string(),
-            credential: Some("test-key".to_string()),
-            base_url: format!("http://{addr}"),
-            max_tokens: 4096,
-            timeout_secs: 120,
-        }
+        AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .max_tokens(4096)
+            .timeout_secs(120)
+            .build()
     }
 
     #[tokio::test]
