@@ -121,7 +121,7 @@ pub async fn run_live_case(
     let memory: Arc<dyn Memory> = Arc::from(create_memory(&mem_cfg, tmp.path(), None)?);
 
     let observer = Arc::new(RecordingObserver::new());
-    let provider = (deps.provider)(trace)?;
+    let provider = (deps.provider)(trace)?.provider;
     // Resolve the dispatcher from the provider's capabilities so XML-dialect
     // providers work; a default agent config routes purely by capability.
     let dispatcher =
@@ -206,7 +206,9 @@ mod tests {
     ) -> RunDeps {
         RunDeps {
             mode: Mode::Live,
-            provider: Box::new(provider),
+            provider: Box::new(move |trace| {
+                Ok(crate::runner::BuiltProvider::plain(provider(trace)?))
+            }),
             provider_ref: "test.model:test".to_string(),
             live_tools,
             case_timeout: timeout,

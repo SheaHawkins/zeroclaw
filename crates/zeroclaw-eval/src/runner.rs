@@ -27,10 +27,35 @@ pub struct CaseOutcome {
     pub grades: Vec<GradeResult>,
 }
 
+/// Asserts that the turn with the given index consumed exactly the LLM
+/// round-trips its fixture scripts. Supplied by providers that own per-turn
+/// state (replay); `None` for providers where the concept does not apply (live).
+pub type TurnBoundary = Box<dyn Fn(usize) -> anyhow::Result<()> + Send + Sync>;
+
+/// A model provider built for one case run, plus the optional end-of-turn
+/// assertion that provider exposes.
+///
+/// This is how the replay dependency surfaces its turn-boundary invariant to the
+/// runner without the runner knowing the concrete provider type: the runner only
+/// sees "call this after each turn, if present".
+pub struct BuiltProvider {
+    pub provider: Box<dyn ModelProvider>,
+    pub turn_boundary: Option<TurnBoundary>,
+}
+
+impl BuiltProvider {
+    /// A provider with no turn-boundary invariant to enforce (live, stubs).
+    pub fn plain(provider: Box<dyn ModelProvider>) -> Self {
+        Self {
+            provider,
+            turn_boundary: None,
+        }
+    }
+}
+
 /// Factory that builds a fresh model provider for one case run. Injected so
 /// replay, live, and deterministic tests share one runner code path.
-pub type ProviderFactory =
-    Box<dyn Fn(&LlmTrace) -> anyhow::Result<Box<dyn ModelProvider>> + Send + Sync>;
+pub type ProviderFactory = Box<dyn Fn(&LlmTrace) -> anyhow::Result<BuiltProvider> + Send + Sync>;
 
 /// Everything a case run needs that differs between replay, live, and tests.
 ///
@@ -57,10 +82,12 @@ impl RunDeps {
         Self {
             mode: Mode::Replay,
             provider: Box::new(|trace| {
-                Ok(
-                    Box::new(crate::replay::TraceLlmProvider::try_from_trace(trace)?)
-                        as Box<dyn ModelProvider>,
-                )
+                let provider = crate::replay::TraceLlmProvider::try_from_trace(trace)?;
+                let handle = provider.handle();
+                Ok(BuiltProvider {
+                    provider: Box::new(provider) as Box<dyn ModelProvider>,
+                    turn_boundary: Some(Box::new(move |turn_index| handle.finish_turn(turn_index))),
+                })
             }),
             provider_ref: "scripted".to_string(),
             live_tools: Vec::new(),
@@ -142,10 +169,11 @@ async fn run_replay_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<Cas
     let memory: Arc<dyn Memory> = Arc::from(create_memory(&mem_cfg, tmp.path(), None)?);
 
     let observer = Arc::new(RecordingObserver::new());
-    let provider = (deps.provider)(trace)?;
+    let built = (deps.provider)(trace)?;
+    let turn_boundary = built.turn_boundary;
 
     let mut agent = Agent::builder()
-        .model_provider(provider)
+        .model_provider(built.provider)
         .tools(default_tools())
         .memory(memory)
         .observer(observer.clone())
@@ -155,8 +183,14 @@ async fn run_replay_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<Cas
 
     let start = std::time::Instant::now();
     let mut final_response = String::new();
-    for turn in &trace.turns {
+    for (turn_index, turn) in trace.turns.iter().enumerate() {
         final_response = agent.turn(&turn.user_input).await?;
+        // Turn boundary: the turn must have consumed exactly its scripted steps,
+        // so responses cannot bleed across turns and a trailing over-specified
+        // step cannot be silently ignored.
+        if let Some(boundary) = turn_boundary.as_ref() {
+            boundary(turn_index)?;
+        }
     }
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -318,6 +352,114 @@ mod tests {
         // The judge ran and stamped its ref (which joins the comparability key).
         assert_eq!(outcome.record.judge_ref.as_deref(), Some("judge.m:x"));
         assert!(outcome.grades.iter().any(|g| g.check == "judge:h"));
+    }
+
+    #[tokio::test]
+    async fn over_specified_turn_is_an_error() {
+        // The turn declares two steps but the agent makes a single chat() call, so the
+        // extra step is left unconsumed. Under a flat queue this passed silently and the
+        // leftover became the NEXT turn's response; now it must surface as a turn-scoped
+        // error rather than bleed across the boundary.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "test-over-specified",
+                "turns": [
+                    { "user_input": "Hi", "steps": [
+                        { "response": { "type": "text", "content": "Hello there." } },
+                        { "response": { "type": "text", "content": "unused extra step" } }
+                    ] },
+                    { "user_input": "And goodbye?", "steps": [
+                        { "response": { "type": "text", "content": "Goodbye!" } }
+                    ] }
+                ],
+                "expects": {}
+            }"#,
+        )
+        .unwrap();
+        let err = match run_case(&trace, &RunDeps::replay()).await {
+            Ok(_) => panic!("expected an error: an over-specified turn left a step unconsumed"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("over-specifies") || msg.contains("never requested"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("turn 0"),
+            "the error must name the offending turn index: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn over_specified_final_turn_is_an_error() {
+        // The case the flattening made invisible: an extra step in the LAST turn has no
+        // following turn to bleed into, so a flat queue simply drops it and the run goes
+        // green while replaying a different conversation than the fixture declares.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "test-over-specified-final",
+                "turns": [
+                    { "user_input": "Hi", "steps": [
+                        { "response": { "type": "text", "content": "Hello there." } }
+                    ] },
+                    { "user_input": "And goodbye?", "steps": [
+                        { "response": { "type": "text", "content": "Goodbye!" } },
+                        { "response": { "type": "text", "content": "silently ignored" } }
+                    ] }
+                ],
+                "expects": {}
+            }"#,
+        )
+        .unwrap();
+        let err = match run_case(&trace, &RunDeps::replay()).await {
+            Ok(_) => panic!("expected an error: the final turn left a step unconsumed"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("over-specifies") || msg.contains("never requested"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("turn 1"),
+            "the error must name the offending turn index: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn under_specified_turn_is_an_error() {
+        // Turn 0 scripts a tool call but no follow-up text, so the agent asks for a
+        // second response within turn 0. With per-turn queues that is exhaustion of
+        // turn 0 — it must NOT borrow turn 1's scripted step.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "test-under-specified",
+                "turns": [
+                    { "user_input": "Echo hello", "steps": [
+                        { "response": { "type": "tool_calls", "tool_calls": [{ "id": "call_1", "name": "echo", "arguments": {"message": "hello"} }] } }
+                    ] },
+                    { "user_input": "And goodbye?", "steps": [
+                        { "response": { "type": "text", "content": "Goodbye!" } }
+                    ] }
+                ],
+                "expects": {}
+            }"#,
+        )
+        .unwrap();
+        let err = match run_case(&trace, &RunDeps::replay()).await {
+            Ok(_) => panic!("expected an error: turn 0 requested more steps than scripted"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("more LLM responses than the trace provides"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("turn 0"),
+            "the exhaustion error must name the turn index: {msg}"
+        );
     }
 
     #[tokio::test]
