@@ -126,6 +126,7 @@ pub struct TraceExpects {
 
 /// End-state checks against the case workspace after the run.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceExpects {
     /// Workspace-relative paths that must exist as a regular file after the run
     /// (a directory at the path does not satisfy the check).
@@ -140,8 +141,37 @@ pub struct WorkspaceExpects {
     pub file_contains: std::collections::BTreeMap<String, Vec<String>>,
 }
 
+impl WorkspaceExpects {
+    /// A workspace expectation block that declares no checks is a fixture bug, not a
+    /// pass: it produces zero grades, and a case with zero grades renders green.
+    /// Empty `file_contains` lists and empty-string needles are the same defect in a
+    /// different shape — `str::contains("")` is always true.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.file_exists.is_empty()
+            && self.file_absent.is_empty()
+            && self.file_contains.is_empty()
+        {
+            anyhow::bail!(
+                "`expects.workspace` declares no checks; remove it or add file_exists/file_absent/file_contains"
+            );
+        }
+        for (path, needles) in &self.file_contains {
+            if needles.is_empty() {
+                anyhow::bail!("`expects.workspace.file_contains[{path}]` is an empty list");
+            }
+            if needles.iter().any(|n| n.is_empty()) {
+                anyhow::bail!(
+                    "`expects.workspace.file_contains[{path}]` has an empty-string needle, which always matches"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 /// End-state checks against the case memory after the run.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryExpects {
     /// Memory keys that must be present after the run.
     #[serde(default)]
@@ -152,6 +182,29 @@ pub struct MemoryExpects {
     /// Memory key -> substrings that must appear in that entry.
     #[serde(default)]
     pub contains: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+impl MemoryExpects {
+    /// A memory expectation block that declares no checks is a fixture bug, not a pass.
+    /// See [`WorkspaceExpects::validate`] for the same reasoning.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.present.is_empty() && self.absent.is_empty() && self.contains.is_empty() {
+            anyhow::bail!(
+                "`expects.memory` declares no checks; remove it or add present/absent/contains"
+            );
+        }
+        for (key, needles) in &self.contains {
+            if needles.is_empty() {
+                anyhow::bail!("`expects.memory.contains[{key}]` is an empty list");
+            }
+            if needles.iter().any(|n| n.is_empty()) {
+                anyhow::bail!(
+                    "`expects.memory.contains[{key}]` has an empty-string needle, which always matches"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Resource ceilings for the run (all optional; each present bound is one
@@ -196,7 +249,24 @@ impl LlmTrace {
             .with_context(|| format!("reading trace fixture {}", path.display()))?;
         let trace: LlmTrace = serde_json::from_str(&content)
             .with_context(|| format!("parsing trace fixture {}", path.display()))?;
+        trace
+            .validate()
+            .with_context(|| format!("validating trace fixture {}", path.display()))?;
         Ok(trace)
+    }
+
+    /// Structural validation applied after deserialization: expectation blocks that
+    /// declare no checks emit zero grades, and a case with zero grades is reported as
+    /// passing. Rejecting them here means a malformed fixture aborts the run with a
+    /// named path instead of silently rendering green.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(workspace) = &self.expects.workspace {
+            workspace.validate()?;
+        }
+        if let Some(memory) = &self.expects.memory {
+            memory.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -222,7 +292,20 @@ pub fn validate_workspace_rel_path(path: &str) -> anyhow::Result<()> {
 }
 
 /// Load every `*.json` trace fixture in `dir`, sorted by path for stable ordering.
+/// Fails on the first fixture that does not parse or does not validate.
 pub fn load_suite(dir: &Path) -> anyhow::Result<Vec<(PathBuf, LlmTrace)>> {
+    let mut out = Vec::new();
+    for (path, trace) in load_suite_entries(dir)? {
+        out.push((path, trace?));
+    }
+    Ok(out)
+}
+
+/// Like [`load_suite`], but keeps the per-fixture load error instead of aborting the
+/// whole directory. The runner uses this so a single malformed fixture becomes one
+/// FAILED case in the report — named, and counted against `all_passed()` — rather
+/// than either aborting the suite or, worse, grading green.
+pub fn load_suite_entries(dir: &Path) -> anyhow::Result<Vec<(PathBuf, anyhow::Result<LlmTrace>)>> {
     let read = std::fs::read_dir(dir)
         .with_context(|| format!("reading eval suite directory {}", dir.display()))?;
 
@@ -235,7 +318,7 @@ pub fn load_suite(dir: &Path) -> anyhow::Result<Vec<(PathBuf, LlmTrace)>> {
 
     let mut out = Vec::with_capacity(paths.len());
     for path in paths {
-        let trace = LlmTrace::from_file(&path)?;
+        let trace = LlmTrace::from_file(&path);
         out.push((path, trace));
     }
     Ok(out)
@@ -421,6 +504,148 @@ mod tests {
         assert_eq!(suite.len(), 2); // the .txt file is ignored
         assert_eq!(suite[0].1.model_name, "a"); // sorted by path
         assert_eq!(suite[1].1.model_name, "b");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- B1: vacuous memory/workspace expectations must not grade green ---
+
+    #[test]
+    fn memory_expects_rejects_unknown_field() {
+        // A one-character typo used to deserialize into an empty `MemoryExpects`,
+        // producing a grader that emits zero grades — i.e. a silent no-op assertion.
+        let err = serde_json::from_str::<MemoryExpects>(r#"{"presnt":["project/status"]}"#)
+            .expect_err("unknown field must be rejected");
+        assert!(
+            err.to_string().contains("presnt"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn workspace_expects_rejects_unknown_field() {
+        let err = serde_json::from_str::<WorkspaceExpects>(r#"{"file_exits":["out.txt"]}"#)
+            .expect_err("unknown field must be rejected");
+        assert!(
+            err.to_string().contains("file_exits"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_memory_expects_block_is_rejected() {
+        let trace: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","turns":[],"expects":{"memory":{}}}"#)
+                .unwrap();
+        let err = trace
+            .validate()
+            .expect_err("`memory: {}` declares no checks");
+        assert!(
+            err.to_string().contains("expects.memory"),
+            "error should name the offending block: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_workspace_expects_block_is_rejected() {
+        let trace: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","turns":[],"expects":{"workspace":{}}}"#)
+                .unwrap();
+        let err = trace
+            .validate()
+            .expect_err("`workspace: {}` declares no checks");
+        assert!(
+            err.to_string().contains("expects.workspace"),
+            "error should name the offending block: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_contains_list_is_rejected() {
+        let expects: MemoryExpects =
+            serde_json::from_str(r#"{"contains":{"project/status":[]}}"#).unwrap();
+        let err = expects
+            .validate()
+            .expect_err("empty needle list asserts nothing");
+        assert!(
+            err.to_string().contains("project/status") && err.to_string().contains("empty list"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_contains_needle_is_rejected() {
+        // `str::contains("")` is always true, so an empty needle passes for any
+        // stored value — a check that can never fail is not a check.
+        let expects: MemoryExpects =
+            serde_json::from_str(r#"{"contains":{"project/status":[""]}}"#).unwrap();
+        let err = expects
+            .validate()
+            .expect_err("empty-string needle always matches");
+        assert!(
+            err.to_string().contains("empty-string needle"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_file_contains_list_is_rejected() {
+        let expects: WorkspaceExpects =
+            serde_json::from_str(r#"{"file_contains":{"out.txt":[]}}"#).unwrap();
+        let err = expects
+            .validate()
+            .expect_err("empty needle list asserts nothing");
+        assert!(
+            err.to_string().contains("out.txt") && err.to_string().contains("empty list"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_file_contains_needle_is_rejected() {
+        let expects: WorkspaceExpects =
+            serde_json::from_str(r#"{"file_contains":{"out.txt":[""]}}"#).unwrap();
+        let err = expects
+            .validate()
+            .expect_err("empty-string needle always matches");
+        assert!(
+            err.to_string().contains("empty-string needle"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn populated_expectation_blocks_still_validate() {
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "m",
+                "turns": [],
+                "expects": {
+                    "memory": { "contains": { "project/status": ["green"] } },
+                    "workspace": { "file_exists": ["out.txt"] }
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(trace.validate().is_ok());
+    }
+
+    #[test]
+    fn from_file_rejects_a_malformed_expectation_block() {
+        let dir = std::env::temp_dir().join("zeroclaw_eval_case_validate_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vacuous.json");
+        std::fs::write(
+            &path,
+            r#"{"model_name":"vacuous","turns":[],"expects":{"memory":{}}}"#,
+        )
+        .unwrap();
+        let err = LlmTrace::from_file(&path).expect_err("malformed fixture must not load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("vacuous.json") && msg.contains("expects.memory"),
+            "error should name the fixture path and the block: {msg}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
