@@ -8,9 +8,7 @@ use std::sync::Arc;
 use zeroclaw_api::tool::Tool;
 use zeroclaw_config::autonomy::AutonomyLevel;
 use zeroclaw_config::policy::SecurityPolicy;
-use zeroclaw_config::schema::{
-    AliasedAgentConfig, MemoryConfig, RiskProfileConfig, RuntimeKind,
-};
+use zeroclaw_config::schema::{AliasedAgentConfig, MemoryConfig, RiskProfileConfig, RuntimeKind};
 use zeroclaw_memory::{Memory, create_memory};
 use zeroclaw_runtime::agent::agent::{Agent, tool_dispatcher_for_provider};
 use zeroclaw_runtime::approval::ApprovalManager;
@@ -411,7 +409,10 @@ mod tests {
 
         let msg = err.to_string();
         assert!(msg.contains("enforcing sandbox"), "unexpected error: {msg}");
-        assert!(msg.contains("test-noop"), "error should name the backend: {msg}");
+        assert!(
+            msg.contains("test-noop"),
+            "error should name the backend: {msg}"
+        );
     }
 
     /// The pass-through sandbox must not claim confinement — this is the
