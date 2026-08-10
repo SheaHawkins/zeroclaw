@@ -301,6 +301,261 @@ mod tests {
         assert_eq!(registry[0].name(), "echo");
     }
 
+    /// A backend that is "available" (it can always be constructed) but provides
+    /// no OS-level confinement — exactly the shape of the pass-through sandbox
+    /// the production path used to install silently.
+    #[derive(Debug, Default)]
+    struct NonEnforcingSandbox;
+
+    impl Sandbox for NonEnforcingSandbox {
+        fn wrap_command(&self, _cmd: &mut std::process::Command) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn is_enforcing(&self) -> bool {
+            false
+        }
+
+        fn name(&self) -> &str {
+            "test-noop"
+        }
+
+        fn description(&self) -> &str {
+            "test double with no confinement"
+        }
+    }
+
+    fn live_policy(workspace: &Path, tools: &[String]) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.to_path_buf(),
+            workspace_only: true,
+            allowed_tools: Some(tools.to_vec()),
+            ..SecurityPolicy::default()
+        })
+    }
+
+    /// The production registry must never hand back a shell tool over a
+    /// pass-through sandbox. Asserted through the real `live_tool_registry`, not
+    /// a hand-assembled registry.
+    #[test]
+    fn live_shell_tool_is_sandbox_enforcing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let effective = vec!["shell".to_string()];
+        let policy = live_policy(tmp.path(), &effective);
+
+        let observed: std::cell::Cell<Option<bool>> = std::cell::Cell::new(None);
+        let registry = live_tool_registry_with_sandbox(&effective, policy, |workspace_dir| {
+            let sandbox = create_sandbox(
+                &RiskProfileConfig::default().sandbox_config(),
+                RuntimeKind::default().as_wire(),
+                Some(workspace_dir),
+            );
+            observed.set(Some(sandbox.is_enforcing()));
+            sandbox
+        });
+
+        match observed.get() {
+            // Platform has a real backend: the registry must build, and it must
+            // have been built over the enforcing sandbox.
+            Some(true) => {
+                let registry = registry.expect("enforcing backend yields a registry");
+                assert!(registry.iter().any(|t| t.name() == "shell"));
+            }
+            // Platform has none: the registry must refuse rather than quietly
+            // hand back an unconfined shell.
+            Some(false) => {
+                let err = match registry {
+                    Ok(_) => panic!("no enforcing backend must fail closed"),
+                    Err(e) => e,
+                };
+                assert!(
+                    err.to_string().contains("enforcing sandbox"),
+                    "unexpected error: {err}"
+                );
+            }
+            None => panic!("sandbox factory was never invoked for a non-empty allowlist"),
+        }
+    }
+
+    /// Fail closed: when the platform offers only a pass-through backend, the
+    /// registry must return an error naming the sandbox requirement.
+    #[test]
+    fn live_tool_registry_fails_closed_without_enforcing_sandbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let effective = vec!["shell".to_string()];
+        let policy = live_policy(tmp.path(), &effective);
+
+        let err = match live_tool_registry_with_sandbox(&effective, policy, |_| {
+            Arc::new(NonEnforcingSandbox) as Arc<dyn Sandbox>
+        }) {
+            Ok(_) => panic!("non-enforcing backend must fail closed"),
+            Err(e) => e,
+        };
+
+        let msg = err.to_string();
+        assert!(msg.contains("enforcing sandbox"), "unexpected error: {msg}");
+        assert!(msg.contains("test-noop"), "error should name the backend: {msg}");
+    }
+
+    /// The pass-through sandbox must not claim confinement — this is the
+    /// predicate the fail-closed check rests on.
+    #[test]
+    fn noop_sandbox_is_not_enforcing() {
+        use zeroclaw_runtime::security::NoopSandbox;
+        assert!(!NoopSandbox.is_enforcing());
+        assert!(NoopSandbox.is_available());
+    }
+
+    /// An allowlisted name with no sandboxed tool behind it must be an error,
+    /// not a silently smaller registry.
+    #[test]
+    fn live_tool_registry_rejects_unknown_allowlisted_tool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let effective = vec!["definitely_not_a_tool".to_string()];
+        let policy = live_policy(tmp.path(), &effective);
+
+        let err = match live_tool_registry_with_sandbox(&effective, policy, |_| {
+            Arc::new(AlwaysEnforcingSandbox) as Arc<dyn Sandbox>
+        }) {
+            Ok(_) => panic!("unknown tool name must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("definitely_not_a_tool"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A test double that reports confinement, so registry-shape assertions do
+    /// not depend on which backend the host platform happens to provide.
+    #[derive(Debug, Default)]
+    struct AlwaysEnforcingSandbox;
+
+    impl Sandbox for AlwaysEnforcingSandbox {
+        fn wrap_command(&self, _cmd: &mut std::process::Command) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn is_enforcing(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "test-enforcing"
+        }
+
+        fn description(&self) -> &str {
+            "test double reporting confinement"
+        }
+    }
+
+    /// Build the live shell tool exactly as production does, or report why no
+    /// enforcing backend is available on this host.
+    fn production_live_shell() -> Result<(tempfile::TempDir, Box<dyn Tool>), String> {
+        let tmp = tempfile::tempdir().unwrap();
+        let effective = vec!["shell".to_string()];
+        let policy = live_policy(tmp.path(), &effective);
+        match live_tool_registry(&effective, policy) {
+            Ok(mut registry) => {
+                let idx = registry
+                    .iter()
+                    .position(|t| t.name() == "shell")
+                    .expect("shell present in a shell-only allowlist");
+                Ok((tmp, registry.remove(idx)))
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// The escape Bot described: a script *inside* the workspace writing to a
+    /// path outside it. The payload lives in the script body, so no
+    /// argument-level guard can see it — only OS confinement stops this.
+    #[tokio::test]
+    async fn live_shell_in_workspace_script_cannot_write_outside_workspace() {
+        let (tmp, shell) = match production_live_shell() {
+            Ok(v) => v,
+            Err(e) => {
+                // Fail-closed path is asserted by
+                // `live_tool_registry_fails_closed_without_enforcing_sandbox`.
+                assert!(e.contains("enforcing sandbox"), "unexpected error: {e}");
+                return;
+            }
+        };
+
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("escaped.txt");
+        let script = tmp.path().join("escape.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho pwned > '{}'\n", target.display()),
+        )
+        .unwrap();
+
+        let result = shell
+            .execute(serde_json::json!({ "command": "sh escape.sh" }))
+            .await
+            .expect("tool call returns a result");
+
+        assert!(
+            !target.exists(),
+            "in-workspace script escaped the sandbox and wrote {}",
+            target.display()
+        );
+        assert!(
+            !result.success,
+            "escaping write should not report success: {result:?}"
+        );
+    }
+
+    /// The symlink variant: an in-workspace name pointing out of the workspace.
+    /// The visible argument is workspace-relative, so again only OS confinement
+    /// can refuse it.
+    #[tokio::test]
+    async fn live_shell_does_not_follow_in_workspace_symlink_out() {
+        let (tmp, shell) = match production_live_shell() {
+            Ok(v) => v,
+            Err(e) => {
+                assert!(e.contains("enforcing sandbox"), "unexpected error: {e}");
+                return;
+            }
+        };
+
+        let outside = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("out");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        #[cfg(not(unix))]
+        {
+            let _ = &link;
+            return;
+        }
+
+        let target = outside.path().join("through-symlink.txt");
+        let result = shell
+            .execute(serde_json::json!({ "command": "echo pwned > out/through-symlink.txt" }))
+            .await
+            .expect("tool call returns a result");
+
+        assert!(
+            !target.exists(),
+            "write followed an in-workspace symlink out to {}",
+            target.display()
+        );
+        assert!(
+            !result.success,
+            "symlink-escaping write should not report success: {result:?}"
+        );
+    }
+
     #[test]
     fn workspace_setup_rejects_absolute_and_parent_paths() {
         let tmp = tempfile::tempdir().unwrap();
