@@ -360,11 +360,23 @@ mod tests {
         });
 
         match observed.get() {
-            // Platform has a real backend: the registry must build, and it must
-            // have been built over the enforcing sandbox.
+            // Platform has a real backend: the registry must build over it, and
+            // the same registry must still refuse a non-enforcing one — that
+            // second half is what proves the shell is not taken from the
+            // pass-through `default_tools` path regardless of the sandbox.
             Some(true) => {
                 let registry = registry.expect("enforcing backend yields a registry");
                 assert!(registry.iter().any(|t| t.name() == "shell"));
+
+                let tmp2 = tempfile::tempdir().unwrap();
+                let policy2 = live_policy(tmp2.path(), &effective);
+                let refused = live_tool_registry_with_sandbox(&effective, policy2, |_| {
+                    Arc::new(NonEnforcingSandbox) as Arc<dyn Sandbox>
+                });
+                assert!(
+                    refused.is_err(),
+                    "shell was built without consulting the sandbox backend"
+                );
             }
             // Platform has none: the registry must refuse rather than quietly
             // hand back an unconfined shell.
