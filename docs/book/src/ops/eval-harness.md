@@ -71,9 +71,11 @@ Each live case runs inside a sandbox:
 `shell` can never be part of the live tool surface, even when a case's `tools`
 and `[eval].live_allowed_tools` both request it: `effective_live_tools`
 (`crates/zeroclaw-eval/src/live.rs`) applies a hard denylist to the allowlist
-intersection, so deny always wins. A scripted `shell` tool call in a live case
-reaches the agent's tool-dispatch path and fails there ("tool not available"),
-rather than executing.
+intersection, so deny always wins. Because `shell` is absent from the effective
+allowlist, a scripted `shell` call in a live case is stopped earlier than dispatch:
+the non-interactive approval gate denies it (it is not auto-approved and cannot be
+prompted for), and the denial is recorded in conversation history rather than the
+tool ever running.
 
 This is the ship-safe interim posture. An earlier version of this harness
 wrapped `shell`'s subprocesses in a real OS
