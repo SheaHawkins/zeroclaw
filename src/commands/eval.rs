@@ -300,7 +300,13 @@ fn build_judge_deps(config: &Config) -> Result<Option<zeroclaw_eval::grader::Jud
         &model_fallbacks,
     );
     if let Some(reason) = decision.refusal() {
-        println!("  warning: [eval].judge_gate is set but judge grades stay diagnostic: {reason}");
+        println!(
+            "{}",
+            get_required_cli_string_with_args(
+                "cli-eval-judge-gate-diagnostic",
+                &[("reason", reason)],
+            )
+        );
     }
     Ok(Some(zeroclaw_eval::grader::JudgeDeps {
         provider: std::sync::Arc::from(provider),

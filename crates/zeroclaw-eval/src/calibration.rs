@@ -9,6 +9,7 @@
 
 use std::path::Path;
 
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 /// The only schema this build accepts. A calibration produced under a different
@@ -61,12 +62,12 @@ pub fn load_gating_calibration(
         anyhow::bail!("calibration path {display} is a directory, not a calibration file");
     }
     let bytes = std::fs::read(path)
-        .map_err(|e| anyhow::anyhow!("calibration file {display} could not be read: {e}"))?;
+        .with_context(|| format!("calibration file {display} could not be read"))?;
     if bytes.iter().all(u8::is_ascii_whitespace) {
         anyhow::bail!("calibration file {display} is empty");
     }
     let cal: Calibration = serde_json::from_slice(&bytes)
-        .map_err(|e| anyhow::anyhow!("calibration file {display} is not a valid v1 record: {e}"))?;
+        .with_context(|| format!("calibration file {display} is not a valid v1 record"))?;
 
     anyhow::ensure!(
         cal.schema == CALIBRATION_SCHEMA,
@@ -146,7 +147,9 @@ pub fn decide_gate(
     }
     if !provider_fallbacks.is_empty() || !model_fallbacks.is_empty() {
         return GateDecision::Refused(format!(
-            "the judge provider for {judge_ref} has {} provider fallback(s) and {} model              fallback(s) configured, so a call can be served by an identity the calibration was              not issued for; remove them to gate on the judge",
+            "the judge provider for {judge_ref} has {} provider fallback(s) and {} model \
+             fallback(s) configured, so a call can be served by an identity the calibration was \
+             not issued for; remove them to gate on the judge",
             provider_fallbacks.len(),
             model_fallbacks.len()
         ));

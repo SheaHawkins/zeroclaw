@@ -83,7 +83,7 @@ records each case's verdict and comparability key from a prior run:
 - `--baseline <file>` compares the current run against it, per case id.
 
 Comparison is keyed by the comparability tuple `(case_hash, mode, provider_ref,
-tool_surface, judge_ref)` — the judge identity joins the key, so swapping judges
+tool_surface, judge_ref)`: the judge identity joins the key, so swapping judges
 makes cases unverifiable rather than silently compared:
 
 - A changed key reports `changed - refresh baseline` (Unverifiable) and is never
@@ -124,7 +124,7 @@ gate unless `[eval].judge_gate` is true AND a calibration artifact at
 is the model-inclusive `<type>.<alias>:<model>` with `/`, `.`, and `:` replaced
 by `_` (so calibration is model-specific, matching the comparability key).
 
-Validation is strict — the gate is never armed by the mere presence of a path.
+Validation is strict; the gate is never armed by the mere presence of a path.
 The artifact must parse as a `zeroclaw-eval/calibration/v1` record with no extra
 fields, declare a `judge_ref` exactly equal to the served judge identity, cover
 at least 50 labeled records, and report a finite `agreement` in `0.0..=1.0` that
@@ -140,7 +140,7 @@ provider/model than the one calibrated. Remove the fallbacks to gate on a judge.
 Every refusal prints a warning naming the specific reason, so a degraded gate is
 never silent.
 
-A judge reply must be the contracted object exactly —
+A judge reply must be the contracted object exactly:
 `{"score": <0.0-1.0>, "unknown": <bool>, "reason": "<text>"}`. A missing,
 mistyped, extra, non-finite, or out-of-range field makes the reply
 `UNKNOWN (diagnostic)`; out-of-range scores are **not** clamped, so
