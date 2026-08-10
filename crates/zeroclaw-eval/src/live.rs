@@ -8,10 +8,15 @@ use std::sync::Arc;
 use zeroclaw_api::tool::Tool;
 use zeroclaw_config::autonomy::AutonomyLevel;
 use zeroclaw_config::policy::SecurityPolicy;
-use zeroclaw_config::schema::{AliasedAgentConfig, MemoryConfig, RiskProfileConfig};
+use zeroclaw_config::schema::{
+    AliasedAgentConfig, MemoryConfig, RiskProfileConfig, RuntimeKind,
+};
 use zeroclaw_memory::{Memory, create_memory};
 use zeroclaw_runtime::agent::agent::{Agent, tool_dispatcher_for_provider};
 use zeroclaw_runtime::approval::ApprovalManager;
+use zeroclaw_runtime::platform::{NativeRuntime, RuntimeAdapter};
+use zeroclaw_runtime::security::{Sandbox, create_sandbox};
+use zeroclaw_runtime::tools::{PathGuardedTool, RateLimitedTool, ShellTool};
 
 use crate::case::{CaseSetup, LlmTrace, validate_workspace_rel_path};
 use crate::observer::RecordingObserver;
@@ -57,17 +62,76 @@ pub fn write_setup_files(workspace: &Path, setup: &CaseSetup) -> anyhow::Result<
 }
 
 /// Build the live tool registry. With no allowlisted tools, use the Phase 0 echo
-/// registry (a harmless deterministic tool). With an allowlist, use the runtime
-/// default tools filtered to the allowlist by name — the registry filter is the
-/// primary guard; the builder allowlist (set by the caller) is defense in depth.
-fn live_tool_registry(effective: &[String], policy: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
+/// registry (a harmless deterministic tool). With an allowlist, build the runtime
+/// tools against an **enforcing** OS sandbox and filter them to the allowlist by
+/// name.
+///
+/// `zeroclaw_runtime::tools::default_tools` constructs `ShellTool::new`, which
+/// hardcodes a pass-through sandbox. Argument-level guards (`workspace_only`,
+/// `PathGuardedTool`) only inspect visible tool arguments, so they cannot see
+/// what an in-workspace script does once it is spawned. Live mode therefore
+/// builds the shell tool with `ShellTool::new_with_sandbox` and fails closed
+/// when no enforcing backend is available on this platform.
+fn live_tool_registry(
+    effective: &[String],
+    policy: Arc<SecurityPolicy>,
+) -> anyhow::Result<Vec<Box<dyn Tool>>> {
+    live_tool_registry_with_sandbox(effective, policy, |workspace_dir| {
+        create_sandbox(
+            &RiskProfileConfig::default().sandbox_config(),
+            RuntimeKind::default().as_wire(),
+            Some(workspace_dir),
+        )
+    })
+}
+
+/// Testable core of [`live_tool_registry`], parameterised over sandbox creation
+/// so a non-enforcing backend can be injected without touching global state.
+fn live_tool_registry_with_sandbox(
+    effective: &[String],
+    policy: Arc<SecurityPolicy>,
+    make_sandbox: impl FnOnce(&Path) -> Arc<dyn Sandbox>,
+) -> anyhow::Result<Vec<Box<dyn Tool>>> {
     if effective.is_empty() {
-        crate::tools::default_tools()
-    } else {
-        let mut tools = zeroclaw_runtime::tools::default_tools(policy);
-        tools.retain(|t| effective.iter().any(|name| name == t.name()));
-        tools
+        return Ok(crate::tools::default_tools());
     }
+
+    let sandbox = make_sandbox(&policy.workspace_dir);
+    if !sandbox.is_enforcing() {
+        anyhow::bail!(
+            "live eval requires an enforcing sandbox backend for its tool registry; \
+             backend `{}` provides no OS-level filesystem confinement on this platform — \
+             rerun with an empty `live_allowed_tools`, or configure a sandbox backend",
+            sandbox.name()
+        );
+    }
+
+    let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
+    let shell = ShellTool::new_with_sandbox(policy.clone(), runtime, sandbox);
+    let mut tools: Vec<Box<dyn Tool>> = vec![Box::new(RateLimitedTool::new(
+        PathGuardedTool::new(shell, policy.clone()),
+        policy.clone(),
+    ))];
+    // Non-shell tools carry no OS-spawn surface; take them from the default
+    // registry so the allowlist keeps working for `file_read`, `file_write`, etc.
+    tools.extend(
+        zeroclaw_runtime::tools::default_tools(policy)
+            .into_iter()
+            .filter(|t| t.name() != "shell"),
+    );
+    tools.retain(|t| effective.iter().any(|name| name == t.name()));
+
+    // A name in the allowlist that no sandboxed tool provides is an error, not a
+    // silent omission — otherwise a typo quietly downgrades the case.
+    for name in effective {
+        if !tools.iter().any(|t| t.name() == name) {
+            anyhow::bail!(
+                "live eval tool `{name}` is not available in the sandboxed live registry"
+            );
+        }
+    }
+
+    Ok(tools)
 }
 
 /// Drive one live case: build a sandboxed agent, run each turn under a wall-clock
@@ -104,7 +168,7 @@ pub async fn run_live_case(
     };
     let approvals = Arc::new(ApprovalManager::for_non_interactive_backchannel(&risk));
 
-    let tools = live_tool_registry(&effective, policy.clone());
+    let tools = live_tool_registry(&effective, policy.clone())?;
     // Empty allowlist -> None so the echo registry's own tool is usable; a
     // `Some(vec![])` would deny every tool including echo. Non-empty -> the
     // allowlist backs the already-filtered registry as defense in depth.
@@ -232,7 +296,7 @@ mod tests {
     #[test]
     fn empty_allowlist_yields_echo_only_registry() {
         let policy = Arc::new(SecurityPolicy::default());
-        let registry = live_tool_registry(&[], policy);
+        let registry = live_tool_registry(&[], policy).expect("echo registry builds");
         assert_eq!(registry.len(), 1);
         assert_eq!(registry[0].name(), "echo");
     }
