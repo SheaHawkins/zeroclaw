@@ -458,6 +458,41 @@ mod tests {
         }
     }
 
+    /// A directory outside every path the sandbox policy grants writes to, used
+    /// as the escape target. Temp roots are deliberately writable inside the
+    /// sandbox, so probing one would pass vacuously. Returns `None` when no such
+    /// location can be probed on this host.
+    fn denied_outside_dir() -> Option<std::path::PathBuf> {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+        // Only usable if the harness itself can write here; otherwise a refused
+        // write proves nothing about the sandbox.
+        let probe = home.join(format!(".zc-eval-sandbox-probe-{}", std::process::id()));
+        match std::fs::write(&probe, b"probe") {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&probe);
+                Some(home)
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Remove the escape target if a regression ever lets it be created, so a
+    /// failing run does not litter the operator's home directory.
+    struct RemoveOnDrop(std::path::PathBuf);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Quote a path as a Python string literal so a Windows-style backslash or a
+    /// quote in the temp path cannot break the generated script.
+    fn python_string_literal(value: &str) -> String {
+        let escaped = value.replace('\\', "\\\\").replace('\'', "\\'");
+        format!("'{escaped}'")
+    }
+
     /// Build the live shell tool exactly as production does, or report why no
     /// enforcing backend is available on this host.
     fn production_live_shell() -> Result<(tempfile::TempDir, Box<dyn Tool>), String> {
@@ -491,20 +526,41 @@ mod tests {
             }
         };
 
-        let outside = tempfile::tempdir().unwrap();
-        let target = outside.path().join("escaped.txt");
-        let script = tmp.path().join("escape.sh");
+        let Some(outside) = denied_outside_dir() else {
+            // No location outside the sandbox's writable set is available to
+            // probe on this host; the fail-closed and enforcement assertions in
+            // the sibling tests still hold.
+            return;
+        };
+        let target = outside.join(format!("zc-eval-escape-{}.txt", std::process::id()));
+        let _cleanup = RemoveOnDrop(target.clone());
+        // `python3` is on the default command allowlist, so the argument-level
+        // guards admit this call. The escaping write lives inside the script
+        // body, where no argument inspection can reach it — only OS-level
+        // confinement can stop it.
+        let script = tmp.path().join("escape.py");
         std::fs::write(
             &script,
-            format!("#!/bin/sh\necho pwned > '{}'\n", target.display()),
+            format!(
+                "open({}, 'w').write('pwned')\n",
+                python_string_literal(&target.to_string_lossy())
+            ),
         )
         .unwrap();
 
         let result = shell
-            .execute(serde_json::json!({ "command": "sh escape.sh" }))
+            .execute(serde_json::json!({ "command": "python3 escape.py" }))
             .await
             .expect("tool call returns a result");
 
+        assert!(
+            !result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("not allowed by security policy")),
+            "argument-level policy refused the call, so this test would pass \
+             vacuously without exercising the sandbox: {result:?}"
+        );
         assert!(
             !target.exists(),
             "in-workspace script escaped the sandbox and wrote {}",
@@ -529,21 +585,43 @@ mod tests {
             }
         };
 
-        let outside = tempfile::tempdir().unwrap();
+        let Some(outside) = denied_outside_dir() else {
+            return;
+        };
         let link = tmp.path().join("out");
         #[cfg(unix)]
-        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
         #[cfg(not(unix))]
         {
             let _ = &link;
             return;
         }
 
-        let target = outside.path().join("through-symlink.txt");
+        let target = outside.join(format!("zc-eval-symlink-{}.txt", std::process::id()));
+        let _cleanup = RemoveOnDrop(target.clone());
+        let script = tmp.path().join("via_symlink.py");
+        std::fs::write(
+            &script,
+            format!(
+                "open('out/{}', 'w').write('pwned')\n",
+                target.file_name().unwrap().to_string_lossy()
+            ),
+        )
+        .unwrap();
+
         let result = shell
-            .execute(serde_json::json!({ "command": "echo pwned > out/through-symlink.txt" }))
+            .execute(serde_json::json!({ "command": "python3 via_symlink.py" }))
             .await
             .expect("tool call returns a result");
+
+        assert!(
+            !result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("not allowed by security policy")),
+            "argument-level policy refused the call, so this test would pass \
+             vacuously without exercising the sandbox: {result:?}"
+        );
 
         assert!(
             !target.exists(),
