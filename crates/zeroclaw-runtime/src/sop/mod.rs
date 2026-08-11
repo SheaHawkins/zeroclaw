@@ -317,6 +317,27 @@ pub fn run_overlay_for(
 /// Enumerate every run the engine holds (active + retained terminal),
 /// newest first, optionally scoped to one SOP. Errors only if the engine
 /// lock is poisoned. This is the Runs surface's data source.
+/// Full detail for one run — the step results, tool calls, timings, and
+/// failure output that [`SopRunSummary`] deliberately omits. Searches active
+/// runs first, then the retained terminal window.
+pub fn run_detail_for(
+    engine: &Arc<Mutex<SopEngine>>,
+    run_id: &str,
+) -> Result<crate::sop::types::SopRun> {
+    let guard = engine
+        .lock()
+        .map_err(|_| anyhow::Error::msg("SOP engine lock poisoned"))?;
+    if let Some(run) = guard.get_run(run_id) {
+        return Ok(run.clone());
+    }
+    guard
+        .finished_runs(None)
+        .into_iter()
+        .find(|r| r.run_id == run_id)
+        .cloned()
+        .ok_or_else(|| anyhow::Error::msg(format!("run '{run_id}' not found")))
+}
+
 pub fn run_summaries_for(
     engine: &Arc<Mutex<SopEngine>>,
     sop_name: Option<&str>,
@@ -1124,6 +1145,70 @@ pub fn validate_sop_strict(sop: &Sop) -> SopValidation {
 
 #[cfg(test)]
 mod tests {
+    /// `sops/runs` returns summaries by design; the detail lookup is what a UI
+    /// drills into for a selected run. Covers the active-run branch (the run a
+    /// UI is watching live) and the unknown-id refusal. The terminal-window
+    /// branch is a linear scan of `finished_runs`, exercised in production but
+    /// not separately constructed here: reaching a terminal run requires a
+    /// driven step, which needs a provider this unit test does not stand up.
+    #[test]
+    fn run_detail_finds_an_active_run_and_rejects_unknown_ids() {
+        use crate::sop::types::{
+            Sop, SopAdmissionPolicy, SopEvent, SopExecutionMode, SopPriority, SopRunAction,
+            SopStep, SopStepKind, SopTriggerSource,
+        };
+        let mut engine = SopEngine::new(crate::sop::SopConfig::default());
+        engine.set_sops_for_test(vec![Sop {
+            name: "detail-test".into(),
+            description: "run detail lookup regression".into(),
+            version: "0.1.0".into(),
+            execution_mode: SopExecutionMode::Auto,
+            priority: SopPriority::Normal,
+            triggers: vec![],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Step one".into(),
+                body: "Do step one".into(),
+                suggested_tools: vec![],
+                requires_confirmation: false,
+                kind: SopStepKind::default(),
+                schema: None,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }]);
+        let action = engine
+            .start_run(
+                "detail-test",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: "2026-01-01T00:00:00Z".into(),
+                },
+            )
+            .expect("run starts");
+        let SopRunAction::ExecuteStep { run_id, .. } = action else {
+            panic!("an auto SOP with one step starts at ExecuteStep, got {action:?}");
+        };
+        let engine = std::sync::Arc::new(std::sync::Mutex::new(engine));
+
+        let run = run_detail_for(&engine, &run_id).expect("active run is found");
+        assert_eq!(run.run_id, run_id);
+        assert_eq!(run.sop_name, "detail-test");
+        assert_eq!(run.current_step, 1);
+
+        let err =
+            run_detail_for(&engine, "run-does-not-exist").expect_err("unknown id must not resolve");
+        assert!(err.to_string().contains("not found"), "{err}");
+    }
+
     use serde_json::json;
 
     use super::*;

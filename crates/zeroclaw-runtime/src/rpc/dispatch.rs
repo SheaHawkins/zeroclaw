@@ -21,8 +21,8 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
     JSONRPC_VERSION, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    RpcOutbound, SopDecideRequest, SopRunOverlayRequest, SopRunRequest, SopRunResponse,
-    SopRunsRequest, SopSaveRequest, SopSelectRequest,
+    RpcOutbound, SopDecideRequest, SopRunDetailRequest, SopRunOverlayRequest, SopRunRequest,
+    SopRunResponse, SopRunsRequest, SopSaveRequest, SopSelectRequest,
 };
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_api::runtime_status::RuntimeConfigKind;
@@ -176,6 +176,7 @@ pub enum Method {
     SopsGraph,
     SopsRun,
     SopsRuns,
+    SopsRunDetail,
     SopsRunOverlay,
     SopsValidate,
     SopsSave,
@@ -285,6 +286,7 @@ impl Method {
         (Method::SopsGraph, "sops/graph"),
         (Method::SopsRun, "sops/run"),
         (Method::SopsRuns, "sops/runs"),
+        (Method::SopsRunDetail, "sops/run-detail"),
         (Method::SopsRunOverlay, "sops/run-overlay"),
         (Method::SopsValidate, "sops/validate"),
         (Method::SopsSave, "sops/save"),
@@ -823,6 +825,7 @@ impl RpcDispatcher {
             Method::SopsGraph => self.handle_sops_graph(&req.params),
             Method::SopsRun => self.handle_sops_run(&req.params).await,
             Method::SopsRuns => self.handle_sops_runs(&req.params),
+            Method::SopsRunDetail => self.handle_sops_run_detail(&req.params),
             Method::SopsRunOverlay => self.handle_sops_run_overlay(&req.params),
             Method::SopsValidate => self.handle_sops_validate(&req.params),
             Method::SopsSave => self.handle_sops_save(&req.params),
@@ -4237,6 +4240,28 @@ impl RpcDispatcher {
         let runs = crate::sop::run_summaries_for(engine, req.sop.as_deref())
             .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
         to_result(serde_json::json!({ "runs": runs }))
+    }
+
+    /// Full detail for one run: step results with status, timings, failure
+    /// output, and captured tool calls. `sops/runs` intentionally returns
+    /// summaries; this is the drill-down a UI uses for a selected run.
+    fn handle_sops_run_detail(&self, params: &Value) -> RpcResult {
+        let req: SopRunDetailRequest = parse_params(params)?;
+        let engine = self
+            .ctx
+            .sop_engine
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+        let run = crate::sop::run_detail_for(engine, &req.run_id).map_err(|e| {
+            let msg = e.to_string();
+            let code = if msg.contains("not found") {
+                INVALID_PARAMS
+            } else {
+                INTERNAL_ERROR
+            };
+            rpc_err(code, msg)
+        })?;
+        to_result(serde_json::json!({ "run": run }))
     }
 
     fn handle_sops_run_overlay(&self, params: &Value) -> RpcResult {
