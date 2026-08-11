@@ -177,7 +177,7 @@ pub type SopDriverHandles = std::sync::Arc<std::sync::Mutex<Vec<tokio::task::Joi
 /// and dropping its own `JoinHandle`, is exactly what this exists to prevent.
 #[derive(Clone)]
 pub struct SopDriverSink {
-    config: zeroclaw_config::schema::Config,
+    config: Arc<zeroclaw_config::schema::Config>,
     engine: Arc<Mutex<SopEngine>>,
     audit: Option<Arc<SopAuditLogger>>,
     handles: SopDriverHandles,
@@ -192,7 +192,7 @@ impl SopDriverSink {
         handles: SopDriverHandles,
     ) -> Self {
         Self {
-            config,
+            config: Arc::new(config),
             engine,
             audit,
             handles,
@@ -217,7 +217,7 @@ impl SopDriverSink {
             return;
         }
         let driver = spawn_headless_run_driver(
-            self.config.clone(),
+            self.config.as_ref().clone(),
             Arc::clone(&self.engine),
             self.audit.clone(),
             action.clone(),
