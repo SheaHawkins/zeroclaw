@@ -4265,8 +4265,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 // The shared driver supervisor for channel-started runs: built on
                 // the SAME handle set the SOP maintenance drains, so a run driven
                 // from channel ingress and one driven from a cron tick are owned
-                // by one reload/shutdown boundary (review ask on the channel half
-                // of the headless-driver gap).
+                // by one reload/shutdown boundary.
                 let sop_driver_sink = match (sop_maintenance.as_ref(), sop_engine.as_ref()) {
                     (Some(maintenance), Some(engine)) => {
                         Some(zeroclaw_runtime::sop::SopDriverSink::new(
@@ -5067,8 +5066,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 // The shared driver supervisor for channel-started runs: built on
                 // the SAME handle set the SOP maintenance drains, so a run driven
                 // from channel ingress and one driven from a cron tick are owned
-                // by one reload/shutdown boundary (review ask on the channel half
-                // of the headless-driver gap).
+                // by one reload/shutdown boundary.
                 let sop_driver_sink = match (sop_maintenance.as_ref(), sop_engine.as_ref()) {
                     (Some(maintenance), Some(engine)) => {
                         Some(zeroclaw_runtime::sop::SopDriverSink::new(
