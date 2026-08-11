@@ -35,7 +35,7 @@ the event topic and the canonical JSON body becomes its payload. Invalid JSON
 returns `400`.
 
 Send every control that is configured. With `gateway.require_pairing = true`
-*and* `gateway.webhook_secret` set — the configuration shown below — a complete
+*and* `gateway.webhook_secret` set (the configuration shown below), a complete
 request carries both:
 
 ```bash
