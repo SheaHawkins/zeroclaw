@@ -90,7 +90,7 @@ pub struct SopIngress<'a> {
     audit: Option<&'a SopAuditLogger>,
     /// When attached, every `Started` action this ingress produces is routed
     /// into the shared driver supervisor instead of being logged and dropped
-    /// by `process_headless_results` (the channel half of #9805).
+    /// by `process_headless_results` (the channel half of the headless-driver gap).
     driver_sink: Option<&'a crate::sop::executor::SopDriverSink>,
 }
 
