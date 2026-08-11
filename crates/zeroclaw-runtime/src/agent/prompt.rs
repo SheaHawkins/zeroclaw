@@ -125,7 +125,7 @@ impl PromptSection for IdentitySection {
         } else {
             personality::load_personality_files(
                 ctx.agent_workspace_dir,
-                personality::PERSONALITY_FILES_WITHOUT_MEMORY,
+                &personality::personality_files_without_memory(),
             )
         };
         prompt.push_str(&profile.render());
