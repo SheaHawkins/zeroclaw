@@ -170,7 +170,7 @@ pub type SopDriverHandles = std::sync::Arc<std::sync::Mutex<Vec<tokio::task::Joi
 ///
 /// Channel-triggered runs previously ended at `process_headless_results`,
 /// which only logs that an `ExecuteStep` is ready: nothing executed the run
-/// (the channel half of #9805). Attaching this sink to [`SopIngress`] routes
+/// (the channel half of #9805). Attaching this sink to [`SopIngress`](crate::sop::dispatch::SopIngress) routes
 /// every `Started` action from ANY caller into the same supervised handle set
 /// the daemon's SOP maintenance drains, so reload and cancellation ownership
 /// cannot diverge by trigger source — the alternative, each caller spawning
