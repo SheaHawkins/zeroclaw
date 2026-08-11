@@ -89,12 +89,6 @@ pub(crate) enum CredentialPolicy {
         feature = "channel-whatsapp-cloud"
     ))]
     Required { display: &'static str },
-    /// The adapter has no inbound credential mechanism at all, so no request
-    /// can ever be verified and ingress always refuses. This exists so a
-    /// channel awaiting removal stays declared and fail-closed instead of
-    /// silently unauthenticated; it is not a mode new adapters may choose.
-    #[cfg(feature = "channel-wati")]
-    Unconfigurable { reason: &'static str },
 }
 
 /// One message-dispatching webhook adapter's ingress contract.
@@ -124,9 +118,7 @@ pub(crate) struct WebhookAdapterSpec {
         feature = "channel-whatsapp-cloud"
     ))]
     pub(crate) signature_header: Option<&'static str>,
-    /// Session-key policy owned by this adapter contract. `None` means the
-    /// adapter can never dispatch because its credential policy is
-    /// unconfigurable.
+    /// Session-key policy owned by this adapter contract.
     #[cfg(any(
         feature = "channel-linq",
         feature = "channel-nextcloud",
@@ -181,34 +173,6 @@ pub(crate) static LINQ_WEBHOOK: WebhookAdapterSpec = WebhookAdapterSpec {
     dispatch_routes: &["/linq", "/linq/{alias}"],
 };
 
-#[cfg(feature = "channel-wati")]
-pub(crate) static WATI_WEBHOOK: WebhookAdapterSpec = WebhookAdapterSpec {
-    channel: "wati",
-    #[cfg(any(
-        feature = "channel-linq",
-        feature = "channel-nextcloud",
-        feature = "channel-whatsapp-cloud"
-    ))]
-    display_name: "WATI",
-    credential: CredentialPolicy::Unconfigurable {
-        reason: "inbound webhooks cannot be authenticated; refusing to dispatch",
-    },
-    #[cfg(any(
-        feature = "channel-linq",
-        feature = "channel-nextcloud",
-        feature = "channel-whatsapp-cloud"
-    ))]
-    signature_header: None,
-    #[cfg(any(
-        feature = "channel-linq",
-        feature = "channel-nextcloud",
-        feature = "channel-whatsapp-cloud"
-    ))]
-    session_key: None,
-    #[cfg(test)]
-    dispatch_routes: &["/wati", "/wati/{alias}"],
-};
-
 #[cfg(feature = "channel-nextcloud")]
 pub(crate) static NEXTCLOUD_TALK_WEBHOOK: WebhookAdapterSpec = WebhookAdapterSpec {
     channel: "nextcloud_talk",
@@ -238,8 +202,6 @@ pub(crate) static MESSAGE_DISPATCHING_WEBHOOKS: &[&WebhookAdapterSpec] = &[
     &WHATSAPP_WEBHOOK,
     #[cfg(feature = "channel-linq")]
     &LINQ_WEBHOOK,
-    #[cfg(feature = "channel-wati")]
-    &WATI_WEBHOOK,
     #[cfg(feature = "channel-nextcloud")]
     &NEXTCLOUD_TALK_WEBHOOK,
 ];
@@ -255,10 +217,6 @@ pub(crate) enum IngressRefusal {
         feature = "channel-whatsapp-cloud"
     ))]
     MissingCredential,
-    /// The adapter has no credential mechanism, so verification is
-    /// impossible by construction.
-    #[cfg(feature = "channel-wati")]
-    Unverifiable,
     /// A credential is configured but the request failed verification.
     #[cfg(any(
         feature = "channel-linq",
@@ -282,43 +240,12 @@ impl IngressRefusal {
                 feature = "channel-whatsapp-cloud"
             ))]
             (IngressRefusal::InvalidSignature, _) => "Invalid signature".to_string(),
-            #[cfg(feature = "channel-wati")]
-            (IngressRefusal::Unverifiable, CredentialPolicy::Unconfigurable { reason }) => {
-                format!("{}: {}", spec.channel, reason)
-            }
             #[cfg(any(
                 feature = "channel-linq",
                 feature = "channel-nextcloud",
                 feature = "channel-whatsapp-cloud"
             ))]
             (IngressRefusal::MissingCredential, CredentialPolicy::Required { display }) => {
-                format!(
-                    "{}: no {} configured; refusing to accept an unverified webhook",
-                    spec.channel, display
-                )
-            }
-            // Mixed-feature builds retain a defensive response for impossible
-            // refusal/spec pairings. Real handlers construct only the pairing
-            // declared by their registered adapter spec.
-            #[cfg(all(
-                feature = "channel-wati",
-                any(
-                    feature = "channel-linq",
-                    feature = "channel-nextcloud",
-                    feature = "channel-whatsapp-cloud"
-                )
-            ))]
-            (_, credential) => {
-                let display = match credential {
-                    #[cfg(any(
-                        feature = "channel-linq",
-                        feature = "channel-nextcloud",
-                        feature = "channel-whatsapp-cloud"
-                    ))]
-                    CredentialPolicy::Required { display } => display,
-                    #[cfg(feature = "channel-wati")]
-                    CredentialPolicy::Unconfigurable { .. } => "credential",
-                };
                 format!(
                     "{}: no {} configured; refusing to accept an unverified webhook",
                     spec.channel, display
@@ -348,8 +275,6 @@ fn log_refusal(
             feature = "channel-whatsapp-cloud"
         ))]
         IngressRefusal::MissingCredential => "missing_credential",
-        #[cfg(feature = "channel-wati")]
-        IngressRefusal::Unverifiable => "unverifiable",
         #[cfg(any(
             feature = "channel-linq",
             feature = "channel-nextcloud",
@@ -411,10 +336,9 @@ impl VerifiedWebhookIngress {
 ///
 /// Fail-closed order, enforced structurally:
 /// 1. the spec must be registered in [`MESSAGE_DISPATCHING_WEBHOOKS`];
-/// 2. an [`CredentialPolicy::Unconfigurable`] adapter refuses immediately;
-/// 3. a required credential that is missing, blank, or unresolved refuses
+/// 2. a required credential that is missing, blank, or unresolved refuses
 ///    without running the verifier;
-/// 4. only then does the adapter's `verify` closure run, with the resolved
+/// 3. only then does the adapter's `verify` closure run, with the resolved
 ///    credential and the exact body bytes the proof will carry.
 ///
 /// The closure owns the provider-specific algorithm (headers, HMAC scheme,
@@ -445,11 +369,6 @@ pub(crate) fn authenticate(
     );
 
     let display_secret = match &spec.credential {
-        #[cfg(feature = "channel-wati")]
-        CredentialPolicy::Unconfigurable { .. } => {
-            log_refusal(spec, alias, IngressRefusal::Unverifiable, None);
-            return Err(IngressRefusal::Unverifiable);
-        }
         CredentialPolicy::Required { .. } => secret.map(str::trim).filter(|s| !s.is_empty()),
     };
 
@@ -480,26 +399,6 @@ pub(crate) fn authenticate(
         alias: alias.to_string(),
         body,
     })
-}
-
-/// Refuse a request for an adapter whose credential policy is
-/// [`CredentialPolicy::Unconfigurable`]. Such an adapter can never mint a
-/// proof, so its handler refuses directly instead of carrying an
-/// unreachable dispatch path.
-#[cfg(feature = "channel-wati")]
-pub(crate) fn refuse_unverifiable(
-    spec: &'static WebhookAdapterSpec,
-    alias: &str,
-) -> (StatusCode, Json<serde_json::Value>) {
-    assert!(
-        matches!(spec.credential, CredentialPolicy::Unconfigurable { .. }),
-        "refuse_unverifiable is only for adapters without a credential \
-         mechanism; '{}' declares a required credential and must call \
-         authenticate instead",
-        spec.channel
-    );
-    log_refusal(spec, alias, IngressRefusal::Unverifiable, None);
-    IngressRefusal::Unverifiable.into_response(spec)
 }
 
 /// Whether the shared gateway-webhook helper blocks the response on dispatch.
@@ -778,27 +677,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(
-        feature = "channel-wati",
-        any(
-            feature = "channel-linq",
-            feature = "channel-nextcloud",
-            feature = "channel-whatsapp-cloud"
-        )
-    ))]
-    fn unconfigurable_adapter_refuses_even_a_lying_verifier() {
-        let result = authenticate(
-            &WATI_WEBHOOK,
-            "default",
-            Some("a-secret-nobody-can-configure"),
-            &HeaderMap::new(),
-            Bytes::from_static(b"{}"),
-            |_, _, _| true,
-        );
-        assert!(matches!(result, Err(IngressRefusal::Unverifiable)));
-    }
-
-    #[test]
     #[cfg(feature = "channel-linq")]
     fn failed_verification_refuses() {
         let result = authenticate(
@@ -862,11 +740,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(
-        feature = "channel-linq",
-        feature = "channel-nextcloud",
-        feature = "channel-wati"
-    ))]
+    #[cfg(all(feature = "channel-linq", feature = "channel-nextcloud"))]
     fn refusal_responses_are_401_and_never_echo_request_material() {
         let (status, Json(body)) =
             IngressRefusal::MissingCredential.into_response(&NEXTCLOUD_TALK_WEBHOOK);
@@ -879,13 +753,6 @@ mod tests {
         let (status, Json(body)) = IngressRefusal::InvalidSignature.into_response(&LINQ_WEBHOOK);
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["error"], "Invalid signature");
-
-        let (status, Json(body)) = IngressRefusal::Unverifiable.into_response(&WATI_WEBHOOK);
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            body["error"],
-            "wati: inbound webhooks cannot be authenticated; refusing to dispatch"
-        );
     }
 
     // ── Drift guards ──────────────────────────────────────────────────────
@@ -909,16 +776,6 @@ mod tests {
             "/whatsapp/{alias}",
             "get",
             "Meta webhook verification challenge echo; dispatches nothing",
-        ),
-        (
-            "/wati",
-            "get",
-            "Meta-style verification challenge echo; dispatches nothing",
-        ),
-        (
-            "/wati/{alias}",
-            "get",
-            "Meta-style verification challenge echo; dispatches nothing",
         ),
         (
             "/webhook/gmail",
@@ -976,7 +833,7 @@ mod tests {
         // Tripwire on the scanner itself: if parsing breaks, this count
         // collapses and the guard must fail rather than pass vacuously.
         assert!(
-            found.len() >= 13,
+            found.len() >= 9,
             "route scanner found only {} routes in optional_channel_routes; \
              the parser or the source region marker is broken",
             found.len()
