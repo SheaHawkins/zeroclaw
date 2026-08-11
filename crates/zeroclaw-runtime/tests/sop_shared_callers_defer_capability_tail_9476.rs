@@ -1,4 +1,4 @@
-//! Guard test for PR #9476 / issue #9425.
+//! Guard test for operator cancellation of running SOP jobs.
 //!
 //! Shared transports (admin HTTP, WebSocket, RPC `sops/decide`, the channel
 //! orchestrator, and the `sop_approve` tool) must resolve checkpoints through the

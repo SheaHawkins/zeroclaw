@@ -694,7 +694,7 @@ mod tests {
         );
     }
 
-    /// Regression for PR #9476 / issue #9425: a run cancelled at a step boundary
+    /// Regression guard: a run cancelled at a step boundary
     /// must be reported as a finished run, so `audit_sop_step` reaches
     /// `log_run_complete`. `advance_sop_step` previously captured `finished_run`
     /// only for `Completed` and `Failed`, leaving the in-memory audit record at
