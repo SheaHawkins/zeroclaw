@@ -7817,7 +7817,7 @@ mod tests {
         })
     }
 
-    /// #9517 localized the Telegram approval acknowledgements through the
+    /// Approval acknowledgements were previously localized through the
     /// runtime Fluent catalogue. This PR relocates the whole `callback_query`
     /// arm into `process_update`, so the move must not silently re-introduce
     /// hard-coded English ack text.
@@ -7990,7 +7990,7 @@ mod tests {
             "every arm of the ack match must resolve through the Fluent catalogue"
         );
 
-        // #9517's regression in literal form: no bare English ack word may
+        // The localization regression in literal form: no bare English ack word may
         // appear in this region (the emoji prefixes are protocol, not prose).
         for literal in [
             "\"Approved\"",
