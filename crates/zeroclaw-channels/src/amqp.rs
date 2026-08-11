@@ -17,9 +17,7 @@ use lapin::{
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::SopDispatch;
 use zeroclaw_runtime::sop::audit::SopAuditLogger;
-use zeroclaw_runtime::sop::dispatch::{
-    dispatch_untrusted_fan_in, dispatch_untrusted_fan_in_driven, results_need_redelivery,
-};
+use zeroclaw_runtime::sop::dispatch::{dispatch_untrusted_fan_in_driven, results_need_redelivery};
 use zeroclaw_runtime::sop::engine::SopEngine;
 use zeroclaw_runtime::sop::types::SopTriggerSource;
 
@@ -589,6 +587,7 @@ mod tests {
         audit: Option<Arc<SopAuditLogger>>,
     ) -> anyhow::Result<AmqpChannel> {
         AmqpChannel::new(AmqpChannelConfig {
+            driver_sink: None,
             amqp_url: "amqp://localhost:5672".into(),
             exchange: "amq.topic".into(),
             routing_keys: vec!["org.release-monitoring.prod.anitya.project.version.update".into()],
