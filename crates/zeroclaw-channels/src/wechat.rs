@@ -4085,6 +4085,7 @@ mod tests {
     /// text still delivers, and the cursor commits so the next batch can
     /// flow.
     #[tokio::test]
+    #[cfg(unix)]
     async fn listen_does_not_hold_batch_forever_on_unwritable_workspace() {
         use std::os::unix::fs::PermissionsExt;
         use wiremock::matchers::{body_partial_json, method, path};
