@@ -135,6 +135,7 @@ jobs:
           cargo_log="${RUNNER_TEMP}/cargo-clippy.log"
           SECONDS=0
           cargo clippy \
+            --locked \
             --workspace \
             --exclude zeroclaw-desktop \
             --all-targets \
