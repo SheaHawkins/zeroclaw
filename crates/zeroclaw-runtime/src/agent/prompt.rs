@@ -416,7 +416,7 @@ mod tests {
     /// false`) must not leak curated `MEMORY.md` content into the
     /// provider-visible system prompt. The picker/Help copy promises
     /// "persistent memory isolated"; this is the prompt-side half of that
-    /// guarantee. See #9047 / #9048.
+    /// guarantee.
     #[test]
     fn identity_section_omits_memory_md_when_inject_memory_false() {
         let (output, workspace) = identity_section_with_memory_sentinel(false);
