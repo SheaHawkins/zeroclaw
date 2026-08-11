@@ -4262,6 +4262,22 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     current_config.sop.maintenance_interval_secs,
                     std::mem::take(&mut carried_sop_drivers),
                 );
+                // The shared driver supervisor for channel-started runs: built on
+                // the SAME handle set the SOP maintenance drains, so a run driven
+                // from channel ingress and one driven from a cron tick are owned
+                // by one reload/shutdown boundary (review ask on the channel half
+                // of #9805).
+                let sop_driver_sink = match (sop_maintenance.as_ref(), sop_engine.as_ref()) {
+                    (Some(maintenance), Some(engine)) => {
+                        Some(zeroclaw_runtime::sop::SopDriverSink::new(
+                            current_config.clone(),
+                            std::sync::Arc::clone(engine),
+                            sop_audit.clone(),
+                            maintenance.drivers.clone(),
+                        ))
+                    }
+                    _ => None,
+                };
 
                 #[cfg(feature = "gateway")]
                 registry.register_gateway(Box::new({
@@ -4292,10 +4308,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_channels(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
+                    let sop_ds = sop_driver_sink.clone();
                     move |config, cancel| {
                         let canvas_store = canvas_store_for_channels.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
+                        let sop_driver_sink = sop_ds.clone();
                         Box::pin(async move {
                             Box::pin(zeroclaw_channels::orchestrator::start_channels(
                                 config,
@@ -4303,6 +4321,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 cancel,
                                 sop_engine,
                                 sop_audit,
+                                sop_driver_sink,
                             ))
                             .await
                         })
@@ -4313,15 +4332,18 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_mqtt(Box::new({
                     let engine = sop_engine.clone();
                     let audit = sop_audit.clone();
+                    let driver_sink = sop_driver_sink.clone();
                     move |mqtt_config| {
                         let engine = engine.clone();
                         let audit = audit.clone();
+                        let driver_sink = driver_sink.clone();
                         Box::pin(async move {
                             if let (Some(engine), Some(audit)) = (engine, audit) {
                                 zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
                                     &mqtt_config,
                                     engine,
                                     audit,
+                                    driver_sink,
                                 )
                                 .await
                             } else {
@@ -5042,8 +5064,30 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     config.sop.maintenance_interval_secs,
                     Vec::new(),
                 );
+                // The shared driver supervisor for channel-started runs: built on
+                // the SAME handle set the SOP maintenance drains, so a run driven
+                // from channel ingress and one driven from a cron tick are owned
+                // by one reload/shutdown boundary (review ask on the channel half
+                // of #9805).
+                let sop_driver_sink = match (sop_maintenance.as_ref(), sop_engine.as_ref()) {
+                    (Some(maintenance), Some(engine)) => {
+                        Some(zeroclaw_runtime::sop::SopDriverSink::new(
+                            config.clone(),
+                            std::sync::Arc::clone(engine),
+                            sop_audit.clone(),
+                            maintenance.drivers.clone(),
+                        ))
+                    }
+                    _ => None,
+                };
+
                 let result = Box::pin(channels::start_channels(
-                    config, None, cancel, sop_engine, sop_audit,
+                    config,
+                    None,
+                    cancel,
+                    sop_engine,
+                    sop_audit,
+                    sop_driver_sink,
                 ))
                 .await;
                 // `channel start` runs one configuration generation and exits,
@@ -10340,6 +10384,136 @@ mod tests {
         assert_eq!(
             step.tool_calls[0].tool, "audit_probe",
             "the recorded call must name the tool the step actually requested"
+        );
+    }
+
+    /// The channel half of the same gap: a channel-triggered auto SOP was
+    /// admitted by the shared ingress and then stranded, because no caller of
+    /// the ingress owned a driver for the run it had just started. With the
+    /// ingress carrying a `SopDriverSink`, the started run must be handed a
+    /// supervised driver and reach a retained terminal state under the SOP's
+    /// own agent.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn channel_ingress_drives_started_run_to_terminal() {
+        use zeroclaw_runtime::sop::{
+            Sop, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
+        };
+
+        let harness = cron_sop_harness(Some(CRON_SOP_AGENT)).await;
+
+        // Same machinery as the cron regressions (agent, provider mock, audit,
+        // driver set) — only the trigger source changes.
+        {
+            let mut engine = harness.engine.lock().unwrap();
+            engine.set_sops_for_test(vec![Sop {
+                name: "channel-sop".into(),
+                description: "channel ingress regression".into(),
+                version: "0.1.0".into(),
+                execution_mode: SopExecutionMode::Auto,
+                priority: SopPriority::Normal,
+                triggers: vec![SopTrigger::Channel {
+                    channel: "telegram".into(),
+                    alias: None,
+                    condition: None,
+                }],
+                steps: vec![SopStep {
+                    number: 1,
+                    title: "Step one".into(),
+                    body: "Do step one".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::default(),
+                    schema: None,
+                    ..SopStep::default()
+                }],
+                cooldown_secs: 0,
+                max_concurrent: 2,
+                location: None,
+                deterministic: false,
+                admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+                max_pending_approvals: 0,
+                agent: Some(CRON_SOP_AGENT.to_string()),
+            }]);
+        }
+
+        let sink = zeroclaw_runtime::sop::SopDriverSink::new(
+            harness.config.clone(),
+            std::sync::Arc::clone(&harness.engine),
+            Some(std::sync::Arc::clone(&harness.audit)),
+            harness.drivers.clone(),
+        );
+
+        let results = zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in_driven(
+            &harness.engine,
+            &harness.audit,
+            Some(&sink),
+            zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
+            Some("telegram.main:message"),
+            Some("review please"),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            results.len(),
+            1,
+            "exactly one SOP should match, got {results:?}"
+        );
+        assert!(
+            matches!(
+                &results[0],
+                zeroclaw_runtime::sop::dispatch::DispatchResult::Started { .. }
+            ),
+            "the channel event should start the SOP, got {:?}",
+            results[0]
+        );
+        assert_eq!(
+            harness.drivers.lock().unwrap().len(),
+            1,
+            "the ingress must register the started run's driver in the shared set"
+        );
+
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                {
+                    let engine = harness.engine.lock().unwrap();
+                    if engine.active_runs().is_empty()
+                        && let Some(run) = engine.finished_runs(Some("channel-sop")).first()
+                    {
+                        return (*run).clone();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("channel-started SOP should be driven to a retained terminal run");
+
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Completed,
+            "channel-started run should reach Completed, got {:?} ({:?})",
+            run.status,
+            run.step_results
+        );
+        let step = run
+            .step_results
+            .first()
+            .expect("the driven step should be recorded on the run");
+        assert_eq!(
+            step.status,
+            zeroclaw_runtime::sop::types::SopStepStatus::Completed
+        );
+        assert_eq!(
+            step.effective_agent.as_deref(),
+            Some(CRON_SOP_AGENT),
+            "the step must be attributed to the SOP's own agent"
+        );
+        assert!(
+            step.output.contains("step one done"),
+            "step output should carry the agent turn's result, got {:?}",
+            step.output
         );
     }
 

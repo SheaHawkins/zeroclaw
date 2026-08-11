@@ -509,6 +509,7 @@ struct ChannelRuntimeContext {
     persist_locks: Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<()>>>>>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
 }
 
 /// Acquire the per-conversation-history-key persistence lock so that
@@ -5151,10 +5152,16 @@ async fn process_channel_message_body(
             Some(alias) if !alias.is_empty() => format!("{}/{}", msg.channel, alias),
             _ => msg.channel.clone(),
         };
-        zeroclaw_runtime::sop::dispatch::SopIngress::new(
-            ctx.sop_engine.as_ref(),
-            ctx.sop_audit.as_deref(),
-        )
+        {
+            let mut ingress = zeroclaw_runtime::sop::dispatch::SopIngress::new(
+                ctx.sop_engine.as_ref(),
+                ctx.sop_audit.as_deref(),
+            );
+            if let Some(sink) = ctx.sop_driver_sink.as_ref() {
+                ingress = ingress.with_driver_sink(sink);
+            }
+            ingress
+        }
         .dispatch(
             zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
             Some(&topic),
@@ -6960,6 +6967,7 @@ struct AgentRouter {
     single_ctx: Option<Arc<ChannelRuntimeContext>>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
 }
 
 impl AgentRouter {
@@ -6971,6 +6979,7 @@ impl AgentRouter {
             single_ctx: Some(ctx),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         }
     }
 
@@ -6979,6 +6988,7 @@ impl AgentRouter {
         owner_by_channel_key: HashMap<String, String>,
         sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
         sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+        sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
     ) -> Self {
         Self {
             by_agent: Arc::new(by_agent),
@@ -6986,6 +6996,7 @@ impl AgentRouter {
             single_ctx: None,
             sop_engine,
             sop_audit,
+            sop_driver_sink,
         }
     }
 
@@ -7417,10 +7428,16 @@ async fn dispatch_channel_sop_event(
     };
 
     let target_sop = channel_sop_target(msg);
-    zeroclaw_runtime::sop::dispatch::SopIngress::new(
-        router.sop_engine.as_ref(),
-        router.sop_audit.as_deref(),
-    )
+    {
+        let mut ingress = zeroclaw_runtime::sop::dispatch::SopIngress::new(
+            router.sop_engine.as_ref(),
+            router.sop_audit.as_deref(),
+        );
+        if let Some(sink) = router.sop_driver_sink.as_ref() {
+            ingress = ingress.with_driver_sink(sink);
+        }
+        ingress
+    }
     .dispatch(
         zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
         Some(topic),
@@ -9001,7 +9018,7 @@ pub fn build_channel_map(
     config: &Config,
 ) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
     let config_arc = Arc::new(RwLock::new(config.clone()));
-    let configured = collect_configured_channels(&config_arc, "", &[], None, None);
+    let configured = collect_configured_channels(&config_arc, "", &[], None, None, None);
     configured_channel_map(&configured)
 }
 
@@ -9014,7 +9031,7 @@ pub fn register_channels_for_tools(
     escalate_handle: &Option<tools::PerToolChannelHandle>,
 ) -> Vec<String> {
     let config_arc = Arc::new(RwLock::new(config.clone()));
-    let configured = collect_configured_channels(&config_arc, "", &[], None, None);
+    let configured = collect_configured_channels(&config_arc, "", &[], None, None, None);
 
     let handles = [
         ask_user_handle.as_ref(),
@@ -9053,11 +9070,12 @@ fn collect_configured_channels(
     tool_specs: &[(String, String)],
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
 ) -> Vec<ConfiguredChannel> {
     let _ = matrix_skip_context;
     let _ = tool_specs;
     #[cfg(not(feature = "channel-amqp"))]
-    let _ = (&sop_engine, &sop_audit);
+    let _ = (&sop_engine, &sop_audit, &sop_driver_sink);
     #[allow(unused_mut)]
     let mut channels = Vec::new();
 
@@ -9886,6 +9904,7 @@ fn collect_configured_channels(
             dispatch: amqp.dispatch,
             engine: sop_engine.clone(),
             audit: sop_audit.clone(),
+            driver_sink: sop_driver_sink.clone(),
             alias: alias.clone(),
             peer_resolver,
         }) {
@@ -10676,7 +10695,8 @@ fn peer_group_dangling_warning_lines(config: &Config) -> Vec<String> {
 pub async fn doctor_channels(config: Config) -> Result<()> {
     let config_arc = Arc::new(RwLock::new(config));
     #[allow(unused_mut)]
-    let mut channels = collect_configured_channels(&config_arc, "health check", &[], None, None);
+    let mut channels =
+        collect_configured_channels(&config_arc, "health check", &[], None, None, None);
 
     #[cfg(feature = "channel-nostr")]
     {
@@ -11034,6 +11054,7 @@ pub async fn start_channels(
     cancel: tokio_util::sync::CancellationToken,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
 ) -> Result<()> {
     let config_arc = Arc::new(RwLock::new(config));
     let config: Config = config_arc.read().clone();
@@ -11411,6 +11432,7 @@ pub async fn start_channels(
                 &tool_specs,
                 sop_engine.clone(),
                 sop_audit.clone(),
+                sop_driver_sink.clone(),
             );
 
             #[cfg(feature = "channel-nostr")]
@@ -11472,6 +11494,7 @@ pub async fn start_channels(
                                 alias: alias.clone(),
                                 engine: engine.clone(),
                                 audit: audit.clone(),
+                                driver_sink: sop_driver_sink.clone(),
                             },
                         )),
                     });
@@ -11694,6 +11717,7 @@ pub async fn start_channels(
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: sop_engine.clone(),
             sop_audit: sop_audit.clone(),
+            sop_driver_sink: sop_driver_sink.clone(),
         });
 
         agent_ctxs.insert(agent_alias.clone(), runtime_ctx);
@@ -11787,7 +11811,13 @@ pub async fn start_channels(
         }
     }
 
-    let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit);
+    let router = AgentRouter::multi(
+        agent_ctxs,
+        owner_by_channel_key,
+        sop_engine,
+        sop_audit,
+        sop_driver_sink.clone(),
+    );
 
     let rx = rx_holder.expect("rx initialized by first agent's channel setup");
     let max_in_flight =
@@ -12169,6 +12199,7 @@ fn concurrent_persist_lock_serialization() {
     };
 
     let ctx = Arc::new(ChannelRuntimeContext {
+        sop_driver_sink: None,
         channels_by_name: Arc::new(HashMap::new()),
         model_provider: Arc::new(tests::DummyModelProvider),
         model_provider_ref: Arc::new("test".into()),
@@ -12901,6 +12932,7 @@ temperature = 0.3
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         })
     }
 
@@ -13039,6 +13071,7 @@ temperature = 0.3
 
         let base_ctx = (*router_test_ctx()).clone();
         let ctx = Arc::new(ChannelRuntimeContext {
+            sop_driver_sink: None,
             prompt_config: Arc::new(cfg),
             ..base_ctx
         });
@@ -13069,7 +13102,7 @@ temperature = 0.3
         let mut owners: HashMap<String, String> = HashMap::new();
         owners.insert("discord.clamps".to_string(), "clamps".to_string());
         owners.insert("discord.glados".to_string(), "glados".to_string());
-        let router = AgentRouter::multi(by_agent, owners, None, None);
+        let router = AgentRouter::multi(by_agent, owners, None, None, None);
 
         let msg_clamps = channel_message("discord", Some("clamps"));
         let msg_glados = channel_message("discord", Some("glados"));
@@ -13092,7 +13125,7 @@ temperature = 0.3
         by_agent.insert("agent_a".to_string(), Arc::clone(&agent_a_ctx));
         let mut owners: HashMap<String, String> = HashMap::new();
         owners.insert("discord.bot_a".to_string(), "agent_a".to_string());
-        let router = AgentRouter::multi(by_agent, owners, None, None);
+        let router = AgentRouter::multi(by_agent, owners, None, None, None);
 
         let cli_msg = channel_message("cli", None);
         assert!(router.resolve(&cli_msg).is_none(), "cli has no owner");
@@ -13105,7 +13138,7 @@ temperature = 0.3
         by_agent.insert("ops".to_string(), Arc::clone(&notion_agent_ctx));
         let mut owners: HashMap<String, String> = HashMap::new();
         owners.insert("notion".to_string(), "ops".to_string());
-        let router = AgentRouter::multi(by_agent, owners, None, None);
+        let router = AgentRouter::multi(by_agent, owners, None, None, None);
 
         let msg = channel_message("notion", None);
         let resolved = router.resolve(&msg).expect("notion resolves");
@@ -13131,7 +13164,7 @@ temperature = 0.3
         let legacy_ctx = router_test_ctx();
         let mut by_agent: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
         by_agent.insert("legacy".to_string(), Arc::clone(&legacy_ctx));
-        let router = AgentRouter::multi(by_agent, owners, None, None);
+        let router = AgentRouter::multi(by_agent, owners, None, None, None);
 
         let msg = channel_message("mattermost", Some("default"));
         let resolved = router.resolve(&msg).expect("fallback owner resolves");
@@ -13528,6 +13561,7 @@ temperature = 0.3
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         }
     }
 
@@ -14000,6 +14034,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -14097,6 +14132,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -14212,6 +14248,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -14331,6 +14368,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         };
 
         assert!(rollback_orphan_user_turn(
@@ -15147,6 +15185,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         })
     }
 
@@ -17345,6 +17384,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         })
     }
 
@@ -17430,6 +17470,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -17550,6 +17591,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -17668,6 +17710,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -17823,6 +17866,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -17940,6 +17984,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -18082,6 +18127,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -18210,6 +18256,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -18323,6 +18370,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -18456,6 +18504,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -18613,6 +18662,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -18792,6 +18842,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -19275,6 +19326,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -19386,6 +19438,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -19504,6 +19557,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -19869,6 +19923,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
@@ -20013,6 +20068,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -20172,6 +20228,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -20334,6 +20391,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -20486,6 +20544,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -20620,6 +20679,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -20850,6 +20910,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -20977,6 +21038,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -21108,6 +21170,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -21231,6 +21294,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -21354,6 +21418,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -21754,6 +21819,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -24060,6 +24126,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -24235,6 +24302,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         // Keep all three futures heap-backed to fit the Windows test-thread stack.
@@ -24695,6 +24763,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         })
     }
 
@@ -25181,6 +25250,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -25331,6 +25401,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -25855,7 +25926,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
 
         assert!(
             channels
@@ -25905,7 +25976,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
 
         assert!(
             channels
@@ -25941,7 +26012,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
 
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Discord"),
@@ -25972,7 +26043,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
 
         assert!(
             channels.iter().any(|entry| entry.display_name == "Discord"),
@@ -26022,7 +26093,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
 
         let discord_channels: Vec<_> = channels
             .iter()
@@ -26079,7 +26150,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config.clone()));
-        let configured = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let configured = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         let channel_map = configured_channel_map(&configured);
         assert!(
             channel_map.contains_key("discord.ops"),
@@ -26097,6 +26168,7 @@ This is an example JSON object for profile settings."#;
         let router = AgentRouter::multi(
             HashMap::from([("worker".to_string(), worker_ctx)]),
             owners,
+            None,
             None,
             None,
         );
@@ -26146,7 +26218,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let configured = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let configured = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         let channel_map = configured_channel_map(&configured);
         assert!(channel_map.contains_key("discord.ops"));
         assert!(
@@ -26310,7 +26382,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Email"),
             "email with no agent reference should not be collected"
@@ -26327,7 +26399,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             !channels
                 .iter()
@@ -26356,7 +26428,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Signal"),
             "enabled Signal without credentials must not be collected (would crashloop)"
@@ -26378,7 +26450,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             channels.iter().any(|entry| entry.display_name == "Signal"),
             "enabled Signal with credentials must be collected"
@@ -26401,7 +26473,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             channels
                 .iter()
@@ -26426,7 +26498,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             !channels
                 .iter()
@@ -27016,6 +27088,7 @@ This is an example JSON object for profile settings."#;
             Arc::new(vec![]),
         );
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            sop_driver_sink: None,
             multimodal: zeroclaw_config::schema::MultimodalConfig {
                 vision_model_provider: Some(format!("custom:{}", vision_server.uri())),
                 vision_model: Some("test-vision-model".to_string()),
@@ -27180,6 +27253,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -27300,6 +27374,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -27459,6 +27534,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
@@ -27722,6 +27798,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -27875,6 +27952,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -28020,6 +28098,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -28185,6 +28264,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -28750,6 +28830,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -30591,6 +30672,7 @@ Done."#;
             single_ctx: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         }
     }
 
@@ -30689,6 +30771,7 @@ Done."#;
         };
         let engine = Arc::new(Mutex::new(engine));
         let router = AgentRouter {
+            sop_driver_sink: None,
             by_agent: Arc::new(HashMap::new()),
             owner_by_channel_key: Arc::new(HashMap::new()),
             single_ctx: None,
@@ -31298,7 +31381,7 @@ mod omitted_feature_tests {
             },
         );
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             channels.iter().all(|c| c.display_name != "Telegram"),
             "Telegram must be absent from collect_configured_channels when \

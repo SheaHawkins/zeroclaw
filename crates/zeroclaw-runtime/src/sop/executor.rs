@@ -162,6 +162,75 @@ const MAX_HEADLESS_DRIVE_STEPS: usize = 128;
 /// reload) must keep it and drain or cancel the driver when that lifetime ends;
 /// otherwise the driver keeps running against superseded configuration. Callers
 /// with no such boundary `drop` it to detach.
+/// Shared handle set for headless run drivers, so every trigger source's
+/// drivers are owned by the same drain/reload boundary.
+pub type SopDriverHandles = std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>;
+
+/// Owned spawner for headless run drivers at an ingress boundary.
+///
+/// Channel-triggered runs previously ended at `process_headless_results`,
+/// which only logs that an `ExecuteStep` is ready: nothing executed the run
+/// (the channel half of #9805). Attaching this sink to [`SopIngress`] routes
+/// every `Started` action from ANY caller into the same supervised handle set
+/// the daemon's SOP maintenance drains, so reload and cancellation ownership
+/// cannot diverge by trigger source — the alternative, each caller spawning
+/// and dropping its own `JoinHandle`, is exactly what this exists to prevent.
+#[derive(Clone)]
+pub struct SopDriverSink {
+    config: zeroclaw_config::schema::Config,
+    engine: Arc<Mutex<SopEngine>>,
+    audit: Option<Arc<SopAuditLogger>>,
+    handles: SopDriverHandles,
+}
+
+impl SopDriverSink {
+    #[must_use]
+    pub fn new(
+        config: zeroclaw_config::schema::Config,
+        engine: Arc<Mutex<SopEngine>>,
+        audit: Option<Arc<SopAuditLogger>>,
+        handles: SopDriverHandles,
+    ) -> Self {
+        Self {
+            config,
+            engine,
+            audit,
+            handles,
+        }
+    }
+
+    /// The handle set this sink registers drivers into, for the owner that
+    /// drains them across reload and shutdown.
+    #[must_use]
+    pub fn handles(&self) -> SopDriverHandles {
+        Arc::clone(&self.handles)
+    }
+
+    /// Drive one dispatch action if it needs a headless driver. Finished
+    /// handles are pruned on the way in so a long-lived daemon does not
+    /// accumulate them.
+    pub fn drive(&self, action: &SopRunAction) {
+        if !matches!(
+            action,
+            SopRunAction::ExecuteStep { .. } | SopRunAction::DeterministicStep { .. }
+        ) {
+            return;
+        }
+        let driver = spawn_headless_run_driver(
+            self.config.clone(),
+            Arc::clone(&self.engine),
+            self.audit.clone(),
+            action.clone(),
+        );
+        let mut handles = match self.handles.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        handles.retain(|h| !h.is_finished());
+        handles.push(driver);
+    }
+}
+
 pub fn spawn_headless_run_driver(
     config: zeroclaw_config::schema::Config,
     engine: Arc<Mutex<SopEngine>>,
