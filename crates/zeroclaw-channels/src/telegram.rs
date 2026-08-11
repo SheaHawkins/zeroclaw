@@ -652,18 +652,19 @@ enum UpdateOutcome {
 /// update whose download will never succeed.
 ///
 /// Classification is deliberately conservative: only a confidently permanent
-/// vendor rejection is `Permanent`. 5xx, 429, transport errors, malformed
-/// bodies, and anything unrecognised stay `Transient`, because retrying a
-/// recoverable failure is safe while skipping a recoverable one loses a
-/// message.
+/// vendor rejection is `Permanent`. It requires structured evidence from the
+/// Bot API itself — `ok: false` *and* a terminal 4xx `error_code`. 5xx, 429,
+/// 408, transport errors, malformed bodies, body-less non-2xx responses, and
+/// anything unrecognised stay `Transient`, because retrying a recoverable
+/// failure is safe while skipping a recoverable one loses a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FileLookupFailure {
-    /// Retrying may succeed: 5xx, 429, transport failure, malformed or
-    /// unrecognised response.
+    /// Retrying may succeed: 5xx, 429, 408, transport failure, malformed,
+    /// body-less, or otherwise unrecognised response.
     Transient,
-    /// Retrying can never succeed: an explicit `ok: false` with a 4xx
-    /// `error_code` other than 429 (invalid/expired file id, file too big,
-    /// forbidden). Safe to acknowledge and move past.
+    /// Retrying can never succeed: an explicit `ok: false` carrying a 4xx
+    /// `error_code` other than the retryable 408/429 (invalid/expired file
+    /// id, file too big, forbidden). Safe to acknowledge and move past.
     Permanent,
 }
 
@@ -716,10 +717,6 @@ impl FileLookupError {
             .and_then(|b| b.get("description"))
             .and_then(serde_json::Value::as_str);
 
-        // The effective vendor code: Telegram's own `error_code` when it
-        // supplied one, otherwise the HTTP status.
-        let code = error_code.unwrap_or_else(|| i64::from(status.as_u16()));
-
         let detail = format!(
             "Telegram getFile failed (http {}, error_code {}, ok {}): {}",
             status.as_u16(),
@@ -732,11 +729,26 @@ impl FileLookupError {
             description.unwrap_or("no description"),
         );
 
-        // 429 is a rate limit: explicitly retryable despite being 4xx.
-        // Everything 4xx other than 429, when the vendor confirms failure
-        // via `ok: false` or a non-success HTTP status, is permanent.
-        let vendor_rejected = ok_flag == Some(false) || !status.is_success();
-        if vendor_rejected && (400..500).contains(&code) && code != 429 {
+        // Codes that are 4xx but explicitly retryable. 429 is a rate limit.
+        // 408 Request Timeout is retryable by RFC 9110 §15.5.9, and is a
+        // status an intermediary may produce on its own.
+        const RETRYABLE_4XX: [i64; 2] = [408, 429];
+
+        // Permanence requires *structured vendor evidence* of a terminal
+        // rejection: Telegram must both mark the call failed (`ok: false`)
+        // and name the reason (`error_code`). A bare HTTP status is not
+        // enough — a body-less or malformed 4xx can come from an
+        // intermediary rather than the Bot API, and the API documents
+        // `error_code` contents as subject to change. Guessing permanence
+        // there would acknowledge and discard the update this path exists
+        // to preserve, so anything unrecognised stays transient and is
+        // retried instead.
+        let terminal_rejection = ok_flag == Some(false)
+            && error_code
+                .map(|c| (400..500).contains(&c) && !RETRYABLE_4XX.contains(&c))
+                .unwrap_or(false);
+
+        if terminal_rejection {
             Self::permanent(detail)
         } else {
             Self::transient(detail)
@@ -8094,6 +8106,54 @@ mod tests {
             FileLookupError::classify(StatusCode::OK, None).kind,
             FileLookupFailure::Transient
         );
+
+        // A body-less 4xx carries no vendor evidence at all. It may come
+        // from an intermediary rather than the Bot API, so it must never be
+        // acknowledged as a terminal rejection.
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::REQUEST_TIMEOUT,
+        ] {
+            assert_eq!(
+                FileLookupError::classify(status, None).kind,
+                FileLookupFailure::Transient,
+                "a body-less {status} must stay transient"
+            );
+        }
+
+        // 408 is retryable per RFC 9110, even when the vendor names it.
+        let timeout = serde_json::json!({
+            "ok": false,
+            "error_code": 408,
+            "description": "Request Timeout",
+        });
+        assert_eq!(
+            FileLookupError::classify(StatusCode::REQUEST_TIMEOUT, Some(&timeout)).kind,
+            FileLookupFailure::Transient,
+            "408 must stay transient"
+        );
+
+        // A 4xx whose body is malformed gives no structured evidence.
+        let malformed_4xx = serde_json::json!({"unexpected": "shape"});
+        assert_eq!(
+            FileLookupError::classify(StatusCode::BAD_REQUEST, Some(&malformed_4xx)).kind,
+            FileLookupFailure::Transient,
+            "a malformed 4xx body must stay transient"
+        );
+
+        // `ok: false` without an `error_code` is still unstructured: the
+        // reason is unknown, so permanence cannot be inferred.
+        let no_code = serde_json::json!({
+            "ok": false,
+            "description": "Bad Request: something",
+        });
+        assert_eq!(
+            FileLookupError::classify(StatusCode::BAD_REQUEST, Some(&no_code)).kind,
+            FileLookupFailure::Transient,
+            "ok:false without an error_code must stay transient"
+        );
     }
 
     /// End-to-end proof of the liveness property: an update whose file id
@@ -8242,9 +8302,92 @@ mod tests {
         handle.abort();
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Live e2e: voice transcription via Groq Whisper + reply cache lookup
-    // ─────────────────────────────────────────────────────────────────────
+    /// The regression for the unknown-4xx loss path.
+    ///
+    /// A body-less HTTP 408 carries no vendor evidence of a terminal
+    /// rejection: RFC 9110 §15.5.9 permits retrying it, and an intermediary
+    /// can emit one without the Bot API being involved. Classifying the whole
+    /// non-429 4xx class as permanent acknowledged it, advancing the offset
+    /// and silently consuming the very update this path exists to preserve.
+    ///
+    /// Proves the update is held rather than acknowledged, and is still
+    /// delivered once the transient condition clears.
+    #[tokio::test]
+    async fn listen_bodyless_408_holds_the_offset_and_later_recovers() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        mount_telegram_startup_probe(&mock_server).await;
+
+        let uid = 8_200;
+        let doc = telegram_document_update(uid, 80, 444, "alice", "timeout999", "held.pdf");
+
+        mount_telegram_get_updates(&mock_server, 0, serde_json::json!([doc])).await;
+        mount_telegram_get_updates(&mock_server, uid + 1, serde_json::json!([])).await;
+
+        // A bare 408 with no body at all: no `ok`, no `error_code`.
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(408))
+            .up_to_n_times(2)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {"file_path": "documents/held.pdf"}
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/file/bot[^/]+/.*$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"pdf bytes".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = Arc::new(
+            TelegramChannel::new(
+                "test-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["alice".to_string()]),
+                false,
+            )
+            .with_api_base(mock_server.uri())
+            .with_workspace_dir(workspace.path().to_path_buf()),
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        // The update must survive the 408s and arrive after recovery.
+        let msg = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("timed out: a body-less 408 was acknowledged instead of retried")
+            .expect("channel closed: the update behind a 408 was silently consumed");
+        assert!(
+            msg.content.contains("held.pdf"),
+            "unexpected content: {}",
+            msg.content
+        );
+
+        // More than one poll at offset 0 proves the update was held, not
+        // acknowledged past.
+        let held_polls = telegram_main_loop_getupdates_bodies(&mock_server)
+            .await
+            .iter()
+            .filter(|b| b.get("offset").and_then(serde_json::Value::as_i64) == Some(0))
+            .count();
+        assert!(
+            held_polls >= 2,
+            "a body-less 408 must hold the offset for a retry, saw {held_polls} poll(s) at 0"
+        );
+
+        handle.abort();
+    }
 
     #[tokio::test]
     #[ignore = "requires GROQ_API_KEY environment variable"]
