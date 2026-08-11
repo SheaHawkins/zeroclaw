@@ -26,7 +26,6 @@ pub mod api_webauthn;
 #[cfg(any(
     feature = "channel-linq",
     feature = "channel-nextcloud",
-    feature = "channel-wati",
     feature = "channel-whatsapp-cloud"
 ))]
 pub mod api_webhook;
@@ -47,7 +46,6 @@ pub mod voice_duplex;
 #[cfg(any(
     feature = "channel-linq",
     feature = "channel-nextcloud",
-    feature = "channel-wati",
     feature = "channel-whatsapp-cloud"
 ))]
 mod webhook_ingress;
@@ -60,21 +58,18 @@ use anyhow::{Context, Result};
     feature = "channel-email",
     feature = "channel-linq",
     feature = "channel-nextcloud",
-    feature = "channel-wati",
     feature = "channel-whatsapp-cloud"
 ))]
 use axum::body::Bytes;
 #[cfg(any(
     feature = "channel-linq",
     feature = "channel-nextcloud",
-    feature = "channel-wati",
     feature = "channel-whatsapp-cloud"
 ))]
 use axum::extract::Path;
 #[cfg(any(
     feature = "channel-linq",
     feature = "channel-nextcloud",
-    feature = "channel-wati",
     feature = "channel-whatsapp-cloud"
 ))]
 use axum::response::Response;
@@ -133,8 +128,6 @@ use zeroclaw_channels::gmail_push::GmailPushChannel;
 use zeroclaw_channels::linq::LinqChannel;
 #[cfg(feature = "channel-nextcloud")]
 use zeroclaw_channels::nextcloud_talk::NextcloudTalkChannel;
-#[cfg(feature = "channel-wati")]
-use zeroclaw_channels::wati::WatiChannel;
 #[cfg(feature = "channel-whatsapp-cloud")]
 use zeroclaw_channels::whatsapp::WhatsAppChannel;
 use zeroclaw_config::policy::SecurityPolicy;
@@ -508,9 +501,6 @@ pub struct AppState {
     /// Nextcloud Talk webhook secrets keyed by alias for signature verification.
     #[cfg(feature = "channel-nextcloud")]
     pub nextcloud_talk_webhook_secret: HashMap<String, Arc<str>>,
-    /// WATI channel instances keyed by config alias.
-    #[cfg(feature = "channel-wati")]
-    pub wati: HashMap<String, Arc<WatiChannel>>,
     /// Gmail Pub/Sub push notification channel
     #[cfg(feature = "channel-email")]
     pub gmail_push: Option<Arc<GmailPushChannel>>,
@@ -1114,34 +1104,6 @@ pub async fn run_gateway(
         })
         .collect();
 
-    // WATI channel instances keyed by alias.
-    #[cfg(feature = "channel-wati")]
-    let wati_channel: HashMap<String, Arc<WatiChannel>> = config
-        .channels
-        .wati
-        .iter()
-        .map(|(alias, wati_cfg)| {
-            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-                let cfg_arc = config_state.clone();
-                let alias = alias.clone();
-                Arc::new(move || cfg_arc.read().channel_external_peers("wati", &alias))
-            };
-            (
-                alias.clone(),
-                Arc::new(
-                    WatiChannel::new(
-                        wati_cfg.api_token.clone(),
-                        wati_cfg.api_url.clone(),
-                        wati_cfg.tenant_id.clone(),
-                        alias.clone(),
-                        peer_resolver,
-                    )
-                    .with_transcription(config.transcription.clone()),
-                ),
-            )
-        })
-        .collect();
-
     // Nextcloud Talk channel instances keyed by alias.
     #[cfg(feature = "channel-nextcloud")]
     let nextcloud_talk_channel: HashMap<String, Arc<NextcloudTalkChannel>> = config
@@ -1454,11 +1416,6 @@ pub async fn run_gateway(
     if !linq_channels.is_empty() {
         println!("  POST {pfx}/linq[/<alias>]      — Linq message webhook (iMessage/RCS/SMS)");
     }
-    #[cfg(feature = "channel-wati")]
-    if !wati_channel.is_empty() {
-        println!("  GET  {pfx}/wati[/<alias>]      — WATI webhook verification");
-        println!("  POST {pfx}/wati[/<alias>]      — WATI message webhook");
-    }
     #[cfg(feature = "channel-nextcloud")]
     if !nextcloud_talk_channel.is_empty() {
         println!("  POST {pfx}/nextcloud-talk[/<alias>] — Nextcloud Talk bot webhook");
@@ -1604,8 +1561,6 @@ pub async fn run_gateway(
         nextcloud_talk: nextcloud_talk_channel,
         #[cfg(feature = "channel-nextcloud")]
         nextcloud_talk_webhook_secret,
-        #[cfg(feature = "channel-wati")]
-        wati: wati_channel,
         #[cfg(feature = "channel-email")]
         gmail_push: gmail_push_channel,
         observer: state_observer,
@@ -2667,12 +2622,6 @@ fn optional_channel_routes() -> Router<AppState> {
     let router = router
         .route("/linq", post(handle_linq_webhook))
         .route("/linq/{alias}", post(handle_linq_webhook_alias));
-    #[cfg(feature = "channel-wati")]
-    let router = router
-        .route("/wati", get(handle_wati_verify))
-        .route("/wati", post(handle_wati_webhook))
-        .route("/wati/{alias}", get(handle_wati_verify_alias))
-        .route("/wati/{alias}", post(handle_wati_webhook_alias));
     #[cfg(feature = "channel-nextcloud")]
     let router = router
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
@@ -3284,91 +3233,6 @@ async fn process_linq_webhook(
         },
     )
     .await
-}
-
-/// GET /wati — WATI webhook verification (bare path, deprecated fallback).
-#[cfg(feature = "channel-wati")]
-async fn handle_wati_verify(
-    State(state): State<AppState>,
-    Query(params): Query<WatiVerifyQuery>,
-) -> Response {
-    handle_wati_verify_impl(state, None, params)
-}
-
-/// GET /wati/{alias} — WATI webhook verification for a specific instance.
-#[cfg(feature = "channel-wati")]
-async fn handle_wati_verify_alias(
-    State(state): State<AppState>,
-    Path(alias): Path<String>,
-    Query(params): Query<WatiVerifyQuery>,
-) -> Response {
-    handle_wati_verify_impl(state, Some(alias), params)
-}
-
-#[cfg(feature = "channel-wati")]
-fn handle_wati_verify_impl(
-    state: AppState,
-    alias: Option<String>,
-    params: WatiVerifyQuery,
-) -> Response {
-    let resolved = api_webhook::resolve(&state.wati, alias.as_deref());
-    if resolved.entry().is_none() {
-        return api_webhook::not_found("wati");
-    }
-
-    // WATI may use Meta-style webhook verification; echo the challenge
-    let resp = if let Some(challenge) = params.challenge {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"channel": "wati"})),
-            "webhook verified successfully"
-        );
-        (StatusCode::OK, challenge).into_response()
-    } else {
-        (StatusCode::BAD_REQUEST, "Missing hub.challenge".to_string()).into_response()
-    };
-    api_webhook::tag_deprecation(resp, resolved, "wati")
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct WatiVerifyQuery {
-    #[serde(rename = "hub.challenge")]
-    pub challenge: Option<String>,
-}
-
-/// POST /wati — incoming WATI WhatsApp message webhook (bare path, deprecated).
-#[cfg(feature = "channel-wati")]
-async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> Response {
-    handle_wati_webhook_impl(state, None, body).await
-}
-
-/// POST /wati/{alias} — incoming WATI message webhook for a specific instance.
-#[cfg(feature = "channel-wati")]
-async fn handle_wati_webhook_alias(
-    State(state): State<AppState>,
-    Path(alias): Path<String>,
-    body: Bytes,
-) -> Response {
-    handle_wati_webhook_impl(state, Some(alias), body).await
-}
-
-#[cfg(feature = "channel-wati")]
-async fn handle_wati_webhook_impl(
-    state: AppState,
-    alias: Option<String>,
-    _body: Bytes,
-) -> Response {
-    let resolved = api_webhook::resolve(&state.wati, alias.as_deref());
-    let Some((alias_key, _wati)) = resolved.entry() else {
-        return api_webhook::not_found("wati");
-    };
-    // WATI has no inbound authentication mechanism (no signature scheme and
-    // no configurable webhook credential), so the authenticated-ingress
-    // contract refuses every dispatch request outright instead of parsing
-    // unverifiable content into an agent message.
-    let resp = webhook_ingress::refuse_unverifiable(&webhook_ingress::WATI_WEBHOOK, alias_key);
-    api_webhook::tag_deprecation(resp.into_response(), resolved, "wati")
 }
 
 /// POST /nextcloud-talk — incoming message webhook (bare path, deprecated).
@@ -4249,8 +4113,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -4972,8 +4834,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -5061,8 +4921,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer,
@@ -5737,8 +5595,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -5844,8 +5700,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -5966,8 +5820,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer,
@@ -6068,8 +5920,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -6189,8 +6039,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -6276,8 +6124,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -6368,8 +6214,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -6467,8 +6311,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -6562,8 +6404,6 @@ mod tests {
             linq_signing_secrets: HashMap::new(),
             nextcloud_talk: HashMap::from([(alias.to_string(), channel)]),
             nextcloud_talk_webhook_secret: HashMap::from([(alias.to_string(), Arc::from(secret))]),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -6665,8 +6505,6 @@ mod tests {
             linq_signing_secrets: HashMap::new(),
             nextcloud_talk: HashMap::from([(alias.to_string(), channel)]),
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -6819,8 +6657,6 @@ mod tests {
             )]),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -7665,8 +7501,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -7753,8 +7587,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -8186,113 +8018,6 @@ mod tests {
         );
     }
 
-    /// WATI has no inbound authentication mechanism, so the ingress
-    /// contract refuses dispatch outright: a payload shape that previously
-    /// reached the agent now gets 401 and the model is never called.
-    #[cfg(feature = "channel-wati")]
-    #[tokio::test]
-    async fn wati_webhook_refuses_inbound_dispatch_as_unverifiable() {
-        let provider_impl = Arc::new(MockModelProvider::default());
-        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
-        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
-        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
-        let wati_channel = Arc::new(WatiChannel::new(
-            "api-token".into(),
-            "https://wati.invalid".into(),
-            None,
-            "work",
-            peer_resolver,
-        ));
-
-        let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            model_provider,
-            model: "test-model".into(),
-            temperature: None,
-            mem: memory.clone(),
-            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
-                Arc::clone(&memory),
-                zeroclaw_config::schema::MemoryConfig::default(),
-                std::path::PathBuf::new(),
-            )),
-            auto_save: false,
-            webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            trust_forwarded_headers: false,
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
-            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp: HashMap::new(),
-            #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp_app_secret: HashMap::new(),
-            #[cfg(feature = "channel-linq")]
-            linq: HashMap::new(),
-            #[cfg(feature = "channel-linq")]
-            linq_signing_secrets: HashMap::new(),
-            #[cfg(feature = "channel-nextcloud")]
-            nextcloud_talk: HashMap::new(),
-            #[cfg(feature = "channel-nextcloud")]
-            nextcloud_talk_webhook_secret: HashMap::new(),
-            wati: HashMap::from([("work".to_string(), wati_channel)]),
-            #[cfg(feature = "channel-email")]
-            gmail_push: None,
-            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
-            tools_registry: Arc::new(Vec::new()),
-            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
-            cost_tracker: None,
-            event_tx: tokio::sync::broadcast::channel(16).0,
-            event_buffer: Arc::new(sse::EventBuffer::new(16)),
-            shutdown_tx: tokio::sync::watch::channel(false).0,
-            reload_tx: None,
-            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
-            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
-            path_prefix: String::new(),
-            web_dist_dir: None,
-            session_backend: None,
-            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
-                8, 30, 600,
-            )),
-            device_registry: None,
-            pending_pairings: None,
-            canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            tui_registry: None,
-            sop_engine: None,
-            sop_audit: None,
-            #[cfg(feature = "webauthn")]
-            webauthn: None,
-        };
-
-        // A well-formed WATI text payload of the shape that previously
-        // reached agent dispatch unauthenticated.
-        let body = br#"{"type":"text","text":"hello","waId":"15551234567"}"#;
-        let response = Box::pin(handle_wati_webhook_alias(
-            State(state),
-            Path("work".to_string()),
-            Bytes::from_static(body),
-        ))
-        .await;
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        let payload = response.into_body().collect().await.unwrap().to_bytes();
-        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-        assert!(
-            parsed["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("cannot be authenticated"),
-            "refusal names the missing authentication capability: {parsed}"
-        );
-        assert_eq!(
-            provider_impl.calls.load(Ordering::SeqCst),
-            0,
-            "unverifiable ingress must never reach agent dispatch"
-        );
-    }
-
     #[cfg(feature = "channel-linq")]
     #[tokio::test]
     async fn linq_webhook_alias_dispatches_to_configured_channel_agent() {
@@ -8457,8 +8182,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
