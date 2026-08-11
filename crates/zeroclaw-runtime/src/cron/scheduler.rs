@@ -104,10 +104,20 @@ impl std::fmt::Display for Abandoned {
 /// the daemon restarts. `AbortHandle::abort` does not help: it is cooperative
 /// and cannot preempt a future that is already executing synchronously.
 ///
-/// This helper moves `f` off the shared worker pool entirely. It is driven by
-/// `Handle::block_on` on a thread from the blocking pool, so however long `f`
-/// blocks, it blocks a thread that no timer depends on. The caller stays parked
-/// on a `oneshot` receiver, whose timer is polled by the ordinary worker pool.
+/// This helper moves `f` off the caller's runtime entirely. It is driven to
+/// completion by a **private current-thread runtime on a dedicated OS thread**,
+/// so however long `f` blocks, it blocks a thread that no timer depends on. The
+/// caller stays parked on a `oneshot` receiver.
+///
+/// The private runtime is load-bearing, not incidental. Driving `f` with
+/// `Handle::block_on` on a `spawn_blocking` thread looks equivalent but
+/// deadlocks under a current-thread runtime (`#[tokio::test]` without
+/// `flavor = "multi_thread"`, and any single-threaded embedding): `block_on`
+/// against a borrowed current-thread handle occupies the one thread that also
+/// has to poll this function's own `timeout`, so the deadline can never fire
+/// and the supervisor hangs exactly as hard as the code it was meant to bound.
+/// Owning a separate runtime keeps the two schedulers independent, which is the
+/// entire point of the boundary.
 ///
 /// # Cancellation semantics — abandonment, not preemption
 ///
@@ -135,16 +145,38 @@ where
     T: Send + 'static,
 {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let handle = tokio::runtime::Handle::current();
-    // `spawn_blocking` is the right pool precisely because `f` is expected to
-    // be able to block: blocking-pool threads are never used to poll timers,
-    // and the pool grows on demand, so a blocked supervised op cannot starve
-    // either this caller or a concurrent supervised op.
-    let worker = tokio::task::spawn_blocking(move || {
-        // Result ignored: an `Err` here just means the caller already hit the
-        // deadline and dropped the receiver. Nothing left to report to.
-        let _ = tx.send(handle.block_on(f));
-    });
+    // A dedicated OS thread with its own current-thread runtime. Deliberately
+    // NOT `spawn_blocking` + `Handle::block_on`: that borrows the caller's
+    // runtime and deadlocks when the caller is current-thread (see the doc
+    // comment). `std::thread::spawn` + a private runtime is independent of the
+    // caller's flavor, so the behaviour is identical under `#[tokio::test]`,
+    // `#[tokio::test(flavor = "multi_thread")]` and the production
+    // `#[tokio::main]` scheduler.
+    let worker = std::thread::Builder::new()
+        .name("cron-supervised".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                // Dropping `tx` without sending makes the caller observe
+                // `Abandoned`, which is the correct outcome: the work never ran.
+                Err(_) => return,
+            };
+            // Result ignored: an `Err` here just means the caller already hit the
+            // deadline and dropped the receiver. Nothing left to report to.
+            let _ = tx.send(rt.block_on(f));
+            // The runtime is dropped here, on this thread. If `f` left work
+            // behind, cleanup costs this thread and not the caller's.
+        });
+
+    // Thread spawn can fail under fd/thread exhaustion. Report it as
+    // abandonment rather than panicking inside the scheduler.
+    let worker = match worker {
+        Ok(worker) => worker,
+        Err(_) => return Err(Abandoned),
+    };
 
     match time::timeout(deadline, rx).await {
         Ok(Ok(value)) => Ok(value),
@@ -2963,6 +2995,70 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(0)
         }
+    }
+
+    /// `supervise_wall_clock` must honour its deadline on a **current-thread**
+    /// runtime, not just a multi-thread one.
+    ///
+    /// This pins the regression that an earlier implementation shipped: driving
+    /// the supervised future with `Handle::current().block_on(f)` from a
+    /// `spawn_blocking` thread borrows the *caller's* runtime. Under
+    /// `#[tokio::test]` (current-thread) that occupies the single thread which
+    /// also has to poll this function's own `timeout`, so the deadline never
+    /// fires and the supervisor hangs as hard as the work it bounds. Every
+    /// blocker regression for this PR is `flavor = "multi_thread"`, so none of
+    /// them can catch it — but two pre-existing tests in this file are bare
+    /// `#[tokio::test]` and hung indefinitely.
+    ///
+    /// Deliberately a direct unit test of the helper: it fails in seconds
+    /// instead of wedging the suite, and names the property rather than a
+    /// downstream symptom.
+    #[tokio::test]
+    async fn supervise_wall_clock_honours_deadline_on_current_thread_runtime() {
+        let started = std::time::Instant::now();
+
+        // Blocks its thread outright — no await, so nothing can preempt it
+        // cooperatively. This is the shape the helper exists to bound.
+        let outcome = supervise_wall_clock(
+            Duration::from_millis(200),
+            Box::pin(async {
+                std::thread::sleep(Duration::from_secs(30));
+                "must not be observed"
+            }),
+        )
+        .await;
+
+        let elapsed = started.elapsed();
+        assert!(
+            outcome.is_err(),
+            "a 30s synchronous block must not resolve within a 200ms deadline"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "supervise_wall_clock did not honour its deadline on a current-thread \
+             runtime ({elapsed:?}); it must not depend on the caller's runtime flavor"
+        );
+    }
+
+    /// The happy path on a current-thread runtime: a supervised future that
+    /// finishes inside its deadline still returns its value. Without this, the
+    /// test above could pass against a helper that simply always abandons.
+    #[tokio::test]
+    async fn supervise_wall_clock_returns_value_on_current_thread_runtime() {
+        let outcome = supervise_wall_clock(
+            Duration::from_secs(30),
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                "supervised value"
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.expect("work completing inside its deadline must return Ok"),
+            "supervised value",
+            "the supervised future's value must be propagated to the caller"
+        );
     }
 
     // One worker on purpose. This is the case the existing two-worker
