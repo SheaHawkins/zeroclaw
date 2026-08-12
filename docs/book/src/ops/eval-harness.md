@@ -128,7 +128,7 @@ fixtures use placeholder identities only.
 ### Every case must assert something
 
 The loader fails closed on fixtures that cannot produce a grade, because a case
-that asserts nothing still reports green — the gate would signal success in
+that asserts nothing still reports green: the gate would signal success in
 exactly the situation it exists to catch. Three rules enforce this:
 
 1. **Unknown keys are load errors.** Every case struct is
@@ -136,8 +136,8 @@ exactly the situation it exists to catch. Three rules enforce this:
    parse failure naming the offending key, not an ignored key that silently
    empties the expectation block.
 2. **A no-op expectation block is a load error.** If every list in `expects` is
-   empty and every optional bound is unset — including when `expects` is omitted
-   entirely — `LlmTrace::from_file` rejects the fixture. A case that genuinely
+   empty and every optional bound is unset, including when `expects` is omitted
+   entirely, `LlmTrace::from_file` rejects the fixture. A case that genuinely
    asserts nothing must say so with `"allow_no_expectations": true`, so the
    smoke-case contract is declared rather than stumbled into. One bad fixture
    fails the whole suite load; suites never silently skip a case.
@@ -150,7 +150,7 @@ exactly the situation it exists to catch. Three rules enforce this:
 ### Grader catalog
 
 Graders implement the async `Grader` trait and are run by the runner while the
-case workspace is still on disk — that ordering is the whole reason the trait is
+case workspace is still on disk, that ordering is the whole reason the trait is
 async. `run_case` delegates to `run_case_with_graders(trace, deps, graders)`
 (and `live::run_live_case` to `live::run_live_case_with_graders`), passing
 `grader::default_graders`. The seam exists so the grade-before-teardown contract
