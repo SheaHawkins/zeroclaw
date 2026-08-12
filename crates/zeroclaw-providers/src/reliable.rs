@@ -49,6 +49,12 @@ impl CredentialId {
 struct SelectedCredential {
     key: String,
     build: CredentialProviderFactory,
+    /// True when the deduplicated pool held more than one credential at
+    /// selection time. The rate-limit gates consult this instead of the live
+    /// pool so an attempt drawn from a multi-credential pool still stops
+    /// cleanly when the pool shrinks mid-flight, while genuinely single-key
+    /// profiles keep the pre-rotation retry contract.
+    had_alternates: bool,
 }
 
 struct BoundProvider {
@@ -121,6 +127,7 @@ impl CredentialRotation {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         cooldowns.retain(|_, deadline| now < *deadline);
 
+        let had_alternates = pool.len() > 1;
         let first = start_after.map_or(0, |slot| (slot + 1) % pool.len());
         (0..pool.len()).find_map(|offset| {
             let slot_index = (first + offset) % pool.len();
@@ -128,6 +135,7 @@ impl CredentialRotation {
             (!cooldowns.contains_key(&CredentialId::of(&attempt.key))).then(|| SelectedCredential {
                 key: attempt.key.clone(),
                 build: Arc::clone(&attempt.build),
+                had_alternates,
             })
         })
     }
@@ -150,9 +158,12 @@ impl CredentialRotation {
         let current_slot = pool
             .iter()
             .position(|attempt| attempt.key == credential.key);
-        if current_slot.is_some() {
-            cooldowns.insert(CredentialId::of(&credential.key), Instant::now() + cooldown);
-        }
+        // The cooldown is keyed by digest and must be recorded even when the
+        // live pool no longer contains the key: the key may be restored later,
+        // and sibling routes share this cooldown map. The slot is only a
+        // round-robin fairness hint for the next selection; skip-correctness
+        // comes from the digest check in `select`.
+        cooldowns.insert(CredentialId::of(&credential.key), Instant::now() + cooldown);
         (cooldown, current_slot)
     }
 
@@ -1585,10 +1596,16 @@ impl ModelProvider for ReliableModelProvider {
                             }
 
                             if rate_limited && !rotated {
-                                // Only stop retrying when an alternate credential
-                                // actually exists. A single-key profile keeps the
-                                // pre-rotation `provider_retries` contract.
-                                if entry.can_rotate_credentials() {
+                                // Stop retrying when this attempt was dispatched
+                                // from a multi-credential pool, even if the pool
+                                // has since shrunk, or when the live pool still
+                                // holds an alternate. A genuinely single-key
+                                // profile keeps the pre-rotation
+                                // `provider_retries` contract.
+                                let selected_with_alternates = bound
+                                    .as_ref()
+                                    .is_some_and(|binding| binding.credential.had_alternates);
+                                if selected_with_alternates || entry.can_rotate_credentials() {
                                     break;
                                 }
                                 if self.model_providers.len() > 1 {
@@ -1830,10 +1847,16 @@ impl ModelProvider for ReliableModelProvider {
                             }
 
                             if rate_limited && !rotated {
-                                // Only stop retrying when an alternate credential
-                                // actually exists. A single-key profile keeps the
-                                // pre-rotation `provider_retries` contract.
-                                if entry.can_rotate_credentials() {
+                                // Stop retrying when this attempt was dispatched
+                                // from a multi-credential pool, even if the pool
+                                // has since shrunk, or when the live pool still
+                                // holds an alternate. A genuinely single-key
+                                // profile keeps the pre-rotation
+                                // `provider_retries` contract.
+                                let selected_with_alternates = bound
+                                    .as_ref()
+                                    .is_some_and(|binding| binding.credential.had_alternates);
+                                if selected_with_alternates || entry.can_rotate_credentials() {
                                     break;
                                 }
                                 if self.model_providers.len() > 1 {
@@ -2116,10 +2139,16 @@ impl ModelProvider for ReliableModelProvider {
                             }
 
                             if rate_limited && !rotated {
-                                // Only stop retrying when an alternate credential
-                                // actually exists. A single-key profile keeps the
-                                // pre-rotation `provider_retries` contract.
-                                if entry.can_rotate_credentials() {
+                                // Stop retrying when this attempt was dispatched
+                                // from a multi-credential pool, even if the pool
+                                // has since shrunk, or when the live pool still
+                                // holds an alternate. A genuinely single-key
+                                // profile keeps the pre-rotation
+                                // `provider_retries` contract.
+                                let selected_with_alternates = bound
+                                    .as_ref()
+                                    .is_some_and(|binding| binding.credential.had_alternates);
+                                if selected_with_alternates || entry.can_rotate_credentials() {
                                     break;
                                 }
                                 if self.model_providers.len() > 1 {
@@ -2363,10 +2392,16 @@ impl ModelProvider for ReliableModelProvider {
                             }
 
                             if rate_limited && !rotated {
-                                // Only stop retrying when an alternate credential
-                                // actually exists. A single-key profile keeps the
-                                // pre-rotation `provider_retries` contract.
-                                if entry.can_rotate_credentials() {
+                                // Stop retrying when this attempt was dispatched
+                                // from a multi-credential pool, even if the pool
+                                // has since shrunk, or when the live pool still
+                                // holds an alternate. A genuinely single-key
+                                // profile keeps the pre-rotation
+                                // `provider_retries` contract.
+                                let selected_with_alternates = bound
+                                    .as_ref()
+                                    .is_some_and(|binding| binding.credential.had_alternates);
+                                if selected_with_alternates || entry.can_rotate_credentials() {
                                     break;
                                 }
                                 if self.model_providers.len() > 1 {
@@ -2885,6 +2920,7 @@ mod tests {
         key: String,
         seen: Arc<parking_lot::Mutex<Vec<String>>>,
         rate_limit_barrier: Option<Arc<tokio::sync::Barrier>>,
+        on_rate_limit: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
     #[async_trait]
@@ -2900,6 +2936,9 @@ mod tests {
             if self.key.contains("bad") {
                 if let Some(barrier) = &self.rate_limit_barrier {
                     barrier.wait().await;
+                }
+                if let Some(on_rate_limit) = &self.on_rate_limit {
+                    on_rate_limit();
                 }
                 if self.key.contains("retry-after") {
                     anyhow::bail!("429 Too Many Requests Retry-After: 60");
@@ -2981,6 +3020,7 @@ mod tests {
             key: "original-unused".to_string(),
             seen: Arc::clone(&seen),
             rate_limit_barrier: barrier.clone(),
+            on_rate_limit: None,
         });
         let resolve_seen = Arc::clone(&seen);
         let resolve: CredentialResolver = Arc::new(move || {
@@ -2994,6 +3034,48 @@ mod tests {
                             key: build_key.to_string(),
                             seen: Arc::clone(&build_seen),
                             rate_limit_barrier: build_barrier.clone(),
+                            on_rate_limit: None,
+                        }))
+                    });
+                    CredentialAttempt::new(attempt_key, build)
+                })
+                .collect()
+        });
+        ReliableModelProvider::new("test", vec![("primary".into(), original)], max_retries, 1)
+            .with_credential_rotation(CredentialRotation::new(resolve))
+    }
+
+    /// Like `keyed_reliable`, but the resolver reads a live, externally
+    /// mutable key pool on every call instead of a fixed snapshot, and each
+    /// mock carries an `on_rate_limit` hook so a test can mutate the pool
+    /// from inside the rate-limited response path (simulating a credential
+    /// disappearing or appearing mid-flight).
+    fn live_keyed_reliable(
+        keys: Arc<parking_lot::Mutex<Vec<String>>>,
+        max_retries: u32,
+        seen: Arc<parking_lot::Mutex<Vec<String>>>,
+        on_rate_limit: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> ReliableModelProvider {
+        let original = Box::new(KeyedMock {
+            key: "original-unused".to_string(),
+            seen: Arc::clone(&seen),
+            rate_limit_barrier: None,
+            on_rate_limit: on_rate_limit.clone(),
+        });
+        let resolve_seen = Arc::clone(&seen);
+        let resolve: CredentialResolver = Arc::new(move || {
+            keys.lock()
+                .iter()
+                .map(|key| {
+                    let attempt_key = key.clone();
+                    let build_seen = Arc::clone(&resolve_seen);
+                    let build_on_rate_limit = on_rate_limit.clone();
+                    let build: CredentialProviderFactory = Arc::new(move |build_key| {
+                        Ok(Box::new(KeyedMock {
+                            key: build_key.to_string(),
+                            seen: Arc::clone(&build_seen),
+                            rate_limit_barrier: None,
+                            on_rate_limit: build_on_rate_limit.clone(),
                         }))
                     });
                     CredentialAttempt::new(attempt_key, build)
@@ -4062,6 +4144,76 @@ mod tests {
         assert_eq!(selected.key, "c");
     }
 
+    #[test]
+    fn cooldown_recorded_for_credential_removed_from_live_pool() {
+        let keys = Arc::new(parking_lot::Mutex::new(vec![
+            "a".to_string(),
+            "b".to_string(),
+        ]));
+        let resolve_keys = Arc::clone(&keys);
+        let rotation = CredentialRotation::new(Arc::new(move || {
+            resolve_keys
+                .lock()
+                .iter()
+                .map(|key| unbound_attempt(key))
+                .collect()
+        }));
+
+        let a = rotation.select(None).expect("credential a");
+        assert_eq!(a.key, "a");
+
+        *keys.lock() = vec!["b".to_string()];
+        rotation.cool_down(&a, &anyhow::Error::msg("429 Too Many Requests rate limit"));
+
+        *keys.lock() = vec!["a".to_string(), "b".to_string()];
+        let selected = rotation.select(None).expect("credential b");
+
+        assert_eq!(
+            selected.key, "b",
+            "the removed-then-restored credential must keep its cooldown \
+             recorded while it was absent from the live pool"
+        );
+    }
+
+    #[test]
+    fn sibling_rotations_sharing_cooldowns_observe_removal_time_cooldown() {
+        let cooldowns = Arc::new(CredentialCooldowns::default());
+
+        let keys1 = Arc::new(parking_lot::Mutex::new(vec![
+            "a".to_string(),
+            "b".to_string(),
+        ]));
+        let resolve_keys1 = Arc::clone(&keys1);
+        let rotation1 = CredentialRotation::with_cooldowns(
+            Arc::new(move || {
+                resolve_keys1
+                    .lock()
+                    .iter()
+                    .map(|key| unbound_attempt(key))
+                    .collect()
+            }),
+            Arc::clone(&cooldowns),
+        );
+        let rotation2 = CredentialRotation::with_cooldowns(
+            Arc::new(|| ["a", "b"].into_iter().map(unbound_attempt).collect()),
+            Arc::clone(&cooldowns),
+        );
+
+        let a = rotation1.select(None).expect("credential a");
+        assert_eq!(a.key, "a");
+
+        *keys1.lock() = Vec::new();
+        rotation1.cool_down(&a, &anyhow::Error::msg("429 Too Many Requests rate limit"));
+
+        let selected = rotation2.select(None).expect("credential b");
+        assert_eq!(
+            selected.key, "b",
+            "a sibling rotation sharing the cooldown map must observe the \
+             cooldown even though it was recorded while rotation1's pool was \
+             empty"
+        );
+    }
+
     #[tokio::test]
     async fn concurrent_rate_limits_cool_only_the_bound_credential() {
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -4153,6 +4305,71 @@ mod tests {
             &*seen.lock(),
             &["bad-first", "healthy"],
             "a rate-limited key with an alternate must rotate on the first retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn alternate_removed_between_dispatch_and_rate_limit_stops_reusing_cooled_key() {
+        // The attempt is dispatched from a two-key pool, but the alternate
+        // disappears (e.g. hot-reloaded config) before the rate limit is
+        // observed. `had_alternates` is fixed at selection time, so the gate
+        // must still stop retrying instead of burning the cooled key again.
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let keys = Arc::new(parking_lot::Mutex::new(vec![
+            "bad-primary".to_string(),
+            "healthy".to_string(),
+        ]));
+        let remove_keys = Arc::clone(&keys);
+        let on_rate_limit: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            remove_keys.lock().retain(|key| key != "healthy");
+        });
+        let provider =
+            live_keyed_reliable(Arc::clone(&keys), 3, Arc::clone(&seen), Some(on_rate_limit));
+
+        provider
+            .simple_chat("hello", "test", None)
+            .await
+            .expect_err("no healthy alternate remains once the pool shrinks mid-flight");
+
+        let actual = seen.lock().clone();
+        assert_eq!(
+            actual,
+            vec!["bad-primary".to_string()],
+            "actual attempts: {actual:?}; the cooled key must not be retried \
+             once it was dispatched from a multi-credential pool, even though \
+             the pool has since shrunk to one"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_growth_mid_flight_rotates_to_new_credential() {
+        // A single-key pool gains a second credential while the first attempt
+        // is in flight. Rotation must pick up the newly available credential
+        // instead of treating the profile as single-key for the rest of the
+        // request.
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let keys = Arc::new(parking_lot::Mutex::new(vec!["bad-primary".to_string()]));
+        let grow_keys = Arc::clone(&keys);
+        let on_rate_limit: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let mut guard = grow_keys.lock();
+            if !guard.iter().any(|key| key == "healthy") {
+                guard.push("healthy".to_string());
+            }
+        });
+        let provider =
+            live_keyed_reliable(Arc::clone(&keys), 3, Arc::clone(&seen), Some(on_rate_limit));
+
+        let result = provider
+            .simple_chat("hello", "test", None)
+            .await
+            .expect("a credential added mid-flight must be rotated to");
+
+        assert_eq!(result, "ok");
+        let actual = seen.lock().clone();
+        assert_eq!(
+            actual,
+            vec!["bad-primary".to_string(), "healthy".to_string()],
+            "actual attempts: {actual:?}"
         );
     }
 
