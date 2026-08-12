@@ -94,7 +94,9 @@ pub fn stage_run_dir(root: &Path) -> Result<PathBuf> {
         builder.mode(DIR_MODE);
         match builder.create(&candidate) {
             Ok(()) => return Ok(candidate),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Collision on this candidate; try the next one.
+            }
             Err(e) => {
                 return Err(e)
                     .with_context(|| format!("staging eval run dir at {}", candidate.display()));
@@ -265,7 +267,9 @@ fn create_new_dump_file(dir: &Path, case_id: &str) -> Result<(std::fs::File, Pat
         opts.mode(FILE_MODE);
         match opts.open(&path) {
             Ok(f) => return Ok((f, path)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Collision on this candidate; try the next one.
+            }
             Err(e) => {
                 return Err(e)
                     .with_context(|| format!("creating eval transcript dump {}", path.display()));
