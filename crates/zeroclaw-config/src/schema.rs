@@ -5105,8 +5105,7 @@ impl Default for McpConfig {
 pub const VERIFIABLE_INTENT_WITHHELD_CODE: &str = "verifiable_intent_verify_tool_withheld";
 
 /// Operator-facing text for [`VERIFIABLE_INTENT_WITHHELD_CODE`].
-pub const VERIFIABLE_INTENT_WITHHELD_MESSAGE: &str =
-    "verifiable_intent.enabled = true, but vi_verify is not registered as a model-callable tool \
+pub const VERIFIABLE_INTENT_WITHHELD_MESSAGE: &str = "verifiable_intent.enabled = true, but vi_verify is not registered as a model-callable tool \
      because no credential chain verifier exists yet (see #9328); enabling this section does not \
      currently enable verification of a credential";
 
@@ -37306,6 +37305,67 @@ allowed_users = []
         assert_eq!(
             w.path,
             "runtime_profiles.default.context_compression.enabled"
+        );
+    }
+
+    // Regression coverage: the withheld-capability notice must reach the
+    // operator under EVERY `observability.log_persistence` policy, including
+    // `"none"` where no trace sink exists and the runtime trace copy emitted by
+    // `warn_verifiable_intent_withheld` is delivered nowhere.
+    //
+    // `collect_warnings()` is the policy-independent channel (config validate,
+    // doctor, gateway config editor), so it must not vary with the persistence
+    // setting. Asserting across all four policies is the point of the test:
+    // a future change that gates this warning on a trace sink would pass a
+    // single-policy test and still reintroduce the gap.
+    #[::core::prelude::v1::test]
+    fn collect_warnings_flags_verifiable_intent_withheld_under_every_persistence_policy() {
+        for policy in ["none", "rolling", "full", "rotating"] {
+            let toml = format!(
+                r#"
+                    [observability]
+                    log_persistence = "{policy}"
+
+                    [verifiable_intent]
+                    enabled = true
+                "#
+            );
+            let cfg: Config = toml::from_str(&toml).unwrap();
+            let warnings = cfg.collect_warnings();
+            let w = warnings
+                .iter()
+                .find(|w| w.code == VERIFIABLE_INTENT_WITHHELD_CODE)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "expected {VERIFIABLE_INTENT_WITHHELD_CODE} warning under \
+                         log_persistence = \"{policy}\"; got codes {:?}",
+                        warnings.iter().map(|w| &w.code).collect::<Vec<_>>()
+                    )
+                });
+            assert_eq!(w.path, "verifiable_intent.enabled");
+            assert!(
+                w.message.contains("vi_verify"),
+                "message names the withheld capability: {}",
+                w.message
+            );
+        }
+    }
+
+    // The notice is a consequence of opting into the section, so a config that
+    // never enables `[verifiable_intent]` must stay silent — otherwise every
+    // default install would carry a permanent warning it cannot act on.
+    #[::core::prelude::v1::test]
+    fn collect_warnings_silent_for_verifiable_intent_disabled() {
+        let toml = r#"
+            [observability]
+            log_persistence = "none"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(
+            !cfg.collect_warnings()
+                .iter()
+                .any(|w| w.code == VERIFIABLE_INTENT_WITHHELD_CODE),
+            "default config must not raise the withheld-capability notice"
         );
     }
 
