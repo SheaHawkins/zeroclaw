@@ -190,13 +190,13 @@ impl TraceExpects {
                 }
             }
         }
-        if let Some(budget) = &self.budget {
-            if budget.is_vacuous() {
-                anyhow::bail!(
-                    "expects.budget is present but declares no bounds; \
-                     remove the block or set at least one max_* field"
-                );
-            }
+        if let Some(budget) = &self.budget
+            && budget.is_vacuous()
+        {
+            anyhow::bail!(
+                "expects.budget is present but declares no bounds; \
+                 remove the block or set at least one max_* field"
+            );
         }
         if self.is_vacuous() {
             anyhow::bail!(
