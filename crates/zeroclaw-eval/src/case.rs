@@ -432,10 +432,9 @@ mod tests {
         assert!(expects.response_contains.is_empty());
         assert!(expects.max_tool_calls.is_none());
 
-        let trace: LlmTrace = serde_json::from_str(
-            r#"{"model_name":"smoke","turns":[],"expects":{}}"#,
-        )
-        .expect("a trace with an empty expects block must parse");
+        let trace: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"smoke","turns":[],"expects":{}}"#)
+                .expect("a trace with an empty expects block must parse");
         assert!(trace.expects.tools_used.is_empty());
     }
 
@@ -443,8 +442,11 @@ mod tests {
     fn load_suite_fails_on_malformed_expectation_fixture() {
         // The suite aborts rather than quietly running a reduced set.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a_good.json"), r#"{"model_name":"good","turns":[]}"#)
-            .unwrap();
+        std::fs::write(
+            dir.path().join("a_good.json"),
+            r#"{"model_name":"good","turns":[]}"#,
+        )
+        .unwrap();
         std::fs::write(dir.path().join("b_typo.json"), TYPO_FIXTURE).unwrap();
         let err = load_suite(dir.path())
             .expect_err("one malformed fixture must fail the whole suite load");
