@@ -58,7 +58,7 @@ harness stores each seed as an unscoped Core memory entry before the first turn.
 Memory keys are restricted to `[A-Za-z0-9._/-]+` on top of the workspace
 expectation-path rules (non-empty, relative, no `..`). The narrower grammar exists
 because only a memory *value* passes through the content scanner, while the raw
-*key* is rendered into provider-visible prompt context — so whitespace, newlines,
+*key* is rendered into provider-visible prompt context, so whitespace, newlines,
 and control characters in a key would be an unscanned channel into the model's
 context. An unsafe key fails the case before the live provider is constructed.
 
@@ -205,7 +205,7 @@ names `--mode live` in the error.
 A grader that emits zero grades reports as passing, because "every grade passed"
 is vacuously true over an empty list. To close that false-green path, `workspace`
 and `memory` blocks are validated when the fixture is loaded, and a fixture that
-fails validation becomes a named failed case in the report — it can never render
+fails validation becomes a named failed case in the report; it can never render
 green. Rejected shapes:
 
 - **Unknown fields.** Both blocks are `deny_unknown_fields`, so a typo such as
