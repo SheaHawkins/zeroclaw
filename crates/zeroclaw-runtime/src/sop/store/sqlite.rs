@@ -794,6 +794,7 @@ mod tests {
             total_steps: 1,
             started_at: last_progress.to_string(),
             completed_at: None,
+            failure_reason: None,
             step_results: vec![],
             waiting_since: None,
             llm_calls_saved: 0,

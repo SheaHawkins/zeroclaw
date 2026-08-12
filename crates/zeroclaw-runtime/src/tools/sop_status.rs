@@ -110,6 +110,9 @@ impl Tool for SopStatusTool {
                     if let Some(ref completed) = run.completed_at {
                         let _ = writeln!(output, "Completed: {completed}");
                     }
+                    if let Some(ref failure_reason) = run.failure_reason {
+                        let _ = writeln!(output, "Failure reason: {failure_reason}");
+                    }
                     if !run.step_results.is_empty() {
                         let _ = writeln!(output, "\nStep results:");
                         for step in &run.step_results {
@@ -384,6 +387,7 @@ mod tests {
             total_steps: 1,
             started_at: "2026-02-19T12:00:00Z".into(),
             completed_at: Some("2026-02-19T12:05:00Z".into()),
+            failure_reason: None,
             step_results: vec![SopStepResult {
                 effective_agent: None,
                 step_number: 1,
@@ -425,6 +429,7 @@ mod tests {
             total_steps: 2,
             started_at: "2026-02-19T12:00:00Z".into(),
             completed_at: Some("2026-02-19T12:05:00Z".into()),
+            failure_reason: None,
             step_results: vec![SopStepResult {
                 effective_agent: None,
                 step_number: 1,
