@@ -315,7 +315,7 @@ impl AnthropicModelProvider {
         }
     }
 
-    fn is_setup_token(token: &str) -> bool {
+    pub(crate) fn is_setup_token(token: &str) -> bool {
         token.starts_with("sk-ant-oat01-")
     }
 

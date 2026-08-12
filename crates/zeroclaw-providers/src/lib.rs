@@ -1394,7 +1394,31 @@ fn credential_rotation_for_bare_provider(
         .map(str::trim)
         .filter(|key| !key.is_empty())?
         .to_string();
-    let extras = reliability.api_keys.clone();
+    // Bare providers dispatch on family defaults, so eligibility is judged the
+    // same way: the selected key must be the credential the factory sends.
+    if !factory::rotation_credential_eligible(
+        None,
+        provider_name,
+        "default",
+        Some(primary_key.as_str()),
+        options,
+    ) {
+        return None;
+    }
+    let extras: Vec<String> = reliability
+        .api_keys
+        .iter()
+        .filter(|key| {
+            factory::rotation_credential_eligible(
+                None,
+                provider_name,
+                "default",
+                Some(key.as_str()),
+                options,
+            )
+        })
+        .cloned()
+        .collect();
     let provider_name = provider_name.to_string();
     let api_url = api_url.map(ToString::to_string);
     let options = options.clone();
@@ -1542,11 +1566,6 @@ fn credential_attempt_for_alias(
     key: String,
 ) -> CredentialAttempt {
     let build: CredentialProviderFactory = Arc::new(move |attempt_key| {
-        if !alias_uses_api_key_auth(&config, &family, &alias) {
-            anyhow::bail!(
-                "model_provider `{family}.{alias}` no longer uses API-key authentication"
-            );
-        }
         let entry = config
             .providers
             .models
@@ -1557,6 +1576,17 @@ fn credential_attempt_for_alias(
                 ))
             })?;
         let options = provider_runtime_options_for_alias(&config, &family, &alias);
+        if !factory::rotation_credential_eligible(
+            Some(&config),
+            &family,
+            &alias,
+            Some(attempt_key),
+            &options,
+        ) {
+            anyhow::bail!(
+                "model_provider `{family}.{alias}` no longer uses API-key authentication for credential rotation"
+            );
+        }
         create_model_provider_inner(
             Some(&config),
             &family,
@@ -1576,9 +1606,10 @@ fn credential_attempts_for_alias(
     source: &PrimaryCredentialSource,
     include_additional_keys: bool,
 ) -> Vec<CredentialAttempt> {
-    if !alias_uses_api_key_auth(&config, family, alias) {
+    if config.providers.models.find(family, alias).is_none() {
         return Vec::new();
     }
+    let options = provider_runtime_options_for_alias(&config, family, alias);
     let primary = match source {
         PrimaryCredentialSource::Route(identity) => {
             let Some(route) = identity.resolve(&config) else {
@@ -1602,10 +1633,24 @@ fn credential_attempts_for_alias(
     } else {
         Vec::new()
     };
-    let config = Arc::new(config);
-    primary
+    // Filter per key rather than per alias so a mixed pool keeps rotating over
+    // the keys the factory would actually send and drops the rest, for example
+    // a plain-key Anthropic profile configured with a setup-token extra.
+    let keys: Vec<String> = primary
         .into_iter()
         .chain(extras)
+        .filter(|key| {
+            factory::rotation_credential_eligible(
+                Some(&config),
+                family,
+                alias,
+                Some(key.as_str()),
+                &options,
+            )
+        })
+        .collect();
+    let config = Arc::new(config);
+    keys.into_iter()
         .map(|key| {
             credential_attempt_for_alias(
                 Arc::clone(&config),
@@ -1617,51 +1662,6 @@ fn credential_attempts_for_alias(
         .collect()
 }
 
-fn alias_uses_api_key_auth(
-    config: &zeroclaw_config::schema::Config,
-    family: &str,
-    alias: &str,
-) -> bool {
-    use zeroclaw_config::schema::AuthMode;
-
-    let Some(entry) = config.providers.models.find(family, alias) else {
-        return false;
-    };
-    if entry.requires_openai_auth {
-        return false;
-    }
-    match family {
-        "gemini" => !matches!(
-            config
-                .providers
-                .models
-                .gemini
-                .get(alias)
-                .and_then(|entry| entry.auth_mode),
-            Some(AuthMode::OAuth)
-        ),
-        "qwen" => !matches!(
-            config
-                .providers
-                .models
-                .qwen
-                .get(alias)
-                .and_then(|entry| entry.auth_mode),
-            Some(AuthMode::OAuth)
-        ),
-        "minimax" => !matches!(
-            config
-                .providers
-                .models
-                .minimax
-                .get(alias)
-                .and_then(|entry| entry.auth_mode),
-            Some(AuthMode::OAuth)
-        ),
-        _ => true,
-    }
-}
-
 fn credential_rotation_for_alias(
     config: &zeroclaw_config::schema::Config,
     family: &str,
@@ -1671,9 +1671,6 @@ fn credential_rotation_for_alias(
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
     credential_scope: &CredentialRotationScope,
 ) -> Option<Arc<CredentialRotation>> {
-    if !alias_uses_api_key_auth(config, family, alias) {
-        return None;
-    }
     let primary_key = primary_key
         .or_else(|| {
             config
@@ -1685,6 +1682,16 @@ fn credential_rotation_for_alias(
         .map(str::trim)
         .filter(|key| !key.is_empty())?
         .to_string();
+    let options = provider_runtime_options_for_alias(config, family, alias);
+    if !factory::rotation_credential_eligible(
+        Some(config),
+        family,
+        alias,
+        Some(primary_key.as_str()),
+        &options,
+    ) {
+        return None;
+    }
     let source = if let Some(route_identity) = credential_scope.route_identity.clone() {
         PrimaryCredentialSource::Route(route_identity)
     } else if alias_primary_key(config, family, alias).is_some_and(|key| key == primary_key) {
@@ -6046,6 +6053,400 @@ mod tests {
         assert!(
             result.is_ok(),
             "a deep acyclic chain must be depth-capped, never overflow or abort the build"
+        );
+    }
+
+    // ── Credential rotation eligibility gating ──
+
+    #[test]
+    fn qwen_refresh_token_without_auth_mode_is_not_rotation_eligible() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig, QwenModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.qwen.insert(
+            "primary".to_string(),
+            QwenModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("sk-qwen-primary".to_string()),
+                    ..Default::default()
+                },
+                oauth_refresh_token: Some("refresh-token".to_string()),
+                auth_mode: None,
+                ..Default::default()
+            },
+        );
+        config.reliability.api_keys = vec!["sk-qwen-extra".to_string()];
+
+        let attempts = credential_attempts_for_alias(
+            config.clone(),
+            "qwen",
+            "primary",
+            &PrimaryCredentialSource::Alias,
+            true,
+        );
+        assert!(
+            attempts.is_empty(),
+            "a qwen profile with a live refresh token must not offer key rotation attempts"
+        );
+
+        let rotation = credential_rotation_for_alias(
+            &config,
+            "qwen",
+            "primary",
+            None,
+            &config.reliability.clone(),
+            None,
+            &CredentialRotationScope::primary(),
+        );
+        assert!(
+            rotation.is_none(),
+            "a qwen profile with a live refresh token must not build a credential rotation"
+        );
+    }
+
+    #[test]
+    fn minimax_refresh_token_without_auth_mode_is_not_rotation_eligible() {
+        use zeroclaw_config::schema::{Config, MinimaxModelProviderConfig, ModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.minimax.insert(
+            "primary".to_string(),
+            MinimaxModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("sk-minimax-primary".to_string()),
+                    ..Default::default()
+                },
+                oauth_refresh_token: Some("refresh-token".to_string()),
+                auth_mode: None,
+                ..Default::default()
+            },
+        );
+        config.reliability.api_keys = vec!["sk-minimax-extra".to_string()];
+
+        let attempts = credential_attempts_for_alias(
+            config.clone(),
+            "minimax",
+            "primary",
+            &PrimaryCredentialSource::Alias,
+            true,
+        );
+        assert!(
+            attempts.is_empty(),
+            "a minimax profile with a live refresh token must not offer key rotation attempts"
+        );
+
+        let rotation = credential_rotation_for_alias(
+            &config,
+            "minimax",
+            "primary",
+            None,
+            &config.reliability.clone(),
+            None,
+            &CredentialRotationScope::primary(),
+        );
+        assert!(
+            rotation.is_none(),
+            "a minimax profile with a live refresh token must not build a credential rotation"
+        );
+    }
+
+    #[tokio::test]
+    async fn qwen_api_key_profile_without_oauth_still_rotates() {
+        use axum::{
+            Json, Router,
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            routing::post,
+        };
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{Config, ModelProviderConfig, QwenModelProviderConfig};
+
+        type Capture = Arc<Mutex<Vec<String>>>;
+
+        async fn capture_chat_request(
+            State(capture): State<Capture>,
+            headers: HeaderMap,
+        ) -> (StatusCode, Json<Value>) {
+            let auth = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            capture.lock().expect("capture lock poisoned").push(auth);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "choices": [{"message": {"content": "ok"}}]
+                })),
+            )
+        }
+
+        let capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_chat_request))
+            .with_state(capture.clone());
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let mut config = Config::default();
+        config.providers.models.qwen.insert(
+            "primary".to_string(),
+            QwenModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("qwen-max".to_string()),
+                    api_key: Some("sk-qwen-primary".to_string()),
+                    uri: Some(format!("http://{addr}/v1")),
+                    ..Default::default()
+                },
+                auth_mode: None,
+                ..Default::default()
+            },
+        );
+        config.reliability.api_keys = vec!["sk-qwen-extra".to_string()];
+
+        let attempts = credential_attempts_for_alias(
+            config.clone(),
+            "qwen",
+            "primary",
+            &PrimaryCredentialSource::Alias,
+            true,
+        );
+        assert_eq!(
+            attempts.len(),
+            2,
+            "a plain qwen api-key profile must rotate through the alias key and the extra pool key"
+        );
+
+        for attempt in &attempts {
+            let provider = attempt
+                .build_for_test()
+                .expect("an eligible qwen attempt must build a provider");
+            provider
+                .simple_chat("hello", "qwen-max", None)
+                .await
+                .expect("capture server should answer");
+        }
+
+        server.abort();
+
+        assert_eq!(
+            &*capture.lock().expect("capture lock poisoned"),
+            &[
+                "Bearer sk-qwen-primary".to_string(),
+                "Bearer sk-qwen-extra".to_string(),
+            ],
+            "attempts must rotate the primary alias key before the extra pool key"
+        );
+    }
+
+    #[test]
+    fn anthropic_setup_token_profile_is_not_rotation_eligible() {
+        use zeroclaw_config::schema::{AnthropicModelProviderConfig, Config, ModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "primary".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("sk-ant-oat01-abc".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.reliability.api_keys = vec!["sk-ant-api03-extra".to_string()];
+
+        // Per-key filtering means a legitimate extra key in the reliability
+        // pool would otherwise survive on its own; excluding additional keys
+        // here isolates the alias-only view so it reflects the primary
+        // being the profile's sole credential. The extra stays configured
+        // to prove `credential_rotation_for_alias` below never reaches it:
+        // its primary-key gate rejects the alias before extras ever matter.
+        let attempts = credential_attempts_for_alias(
+            config.clone(),
+            "anthropic",
+            "primary",
+            &PrimaryCredentialSource::Alias,
+            false,
+        );
+        assert!(
+            attempts.is_empty(),
+            "a setup-token anthropic profile must not offer key rotation attempts"
+        );
+
+        let rotation = credential_rotation_for_alias(
+            &config,
+            "anthropic",
+            "primary",
+            None,
+            &config.reliability.clone(),
+            None,
+            &CredentialRotationScope::primary(),
+        );
+        assert!(
+            rotation.is_none(),
+            "a setup-token anthropic profile must not build a credential rotation"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_plain_key_profile_drops_setup_token_extras() {
+        use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{AnthropicModelProviderConfig, Config, ModelProviderConfig};
+
+        type Capture = Arc<Mutex<Vec<String>>>;
+
+        async fn capture_messages_request(
+            State(capture): State<Capture>,
+            headers: HeaderMap,
+        ) -> Json<Value> {
+            let key = headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            capture.lock().expect("capture lock poisoned").push(key);
+            Json(json!({
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ok"}],
+                "model": "claude-test",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }))
+        }
+
+        let capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route("/v1/messages", post(capture_messages_request))
+            .with_state(capture.clone());
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "primary".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-test".to_string()),
+                    api_key: Some("sk-ant-api03-primary".to_string()),
+                    uri: Some(format!("http://{addr}")),
+                    ..Default::default()
+                },
+            },
+        );
+        config.reliability.api_keys = vec![
+            "sk-ant-oat01-extra".to_string(),
+            "sk-ant-api03-extra".to_string(),
+        ];
+
+        let attempts = credential_attempts_for_alias(
+            config.clone(),
+            "anthropic",
+            "primary",
+            &PrimaryCredentialSource::Alias,
+            true,
+        );
+        assert_eq!(
+            attempts.len(),
+            2,
+            "the setup-token extra must be dropped without rejecting the whole pool"
+        );
+
+        for attempt in &attempts {
+            let provider = attempt
+                .build_for_test()
+                .expect("an eligible anthropic attempt must build a provider");
+            provider
+                .simple_chat("hello", "claude-test", None)
+                .await
+                .expect("capture server should answer");
+        }
+
+        server.abort();
+
+        assert_eq!(
+            &*capture.lock().expect("capture lock poisoned"),
+            &[
+                "sk-ant-api03-primary".to_string(),
+                "sk-ant-api03-extra".to_string(),
+            ],
+            "attempts must rotate the primary key then the plain-key extra, dropping the setup token"
+        );
+    }
+
+    #[test]
+    fn qwen_oauth_placeholder_key_is_not_rotation_eligible() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig, QwenModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.qwen.insert(
+            "primary".to_string(),
+            QwenModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("qwen-oauth".to_string()),
+                    ..Default::default()
+                },
+                oauth_refresh_token: None,
+                auth_mode: None,
+                ..Default::default()
+            },
+        );
+
+        let attempts = credential_attempts_for_alias(
+            config,
+            "qwen",
+            "primary",
+            &PrimaryCredentialSource::Alias,
+            false,
+        );
+        assert!(
+            attempts.is_empty(),
+            "the qwen-oauth placeholder key must never be offered as a rotation credential"
+        );
+    }
+
+    #[test]
+    fn key_ignoring_family_gets_no_credential_rotation() {
+        use zeroclaw_config::schema::{Config, GeminiCliModelProviderConfig, ModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.gemini_cli.insert(
+            "primary".to_string(),
+            GeminiCliModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("sk-gemini-cli".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let rotation = credential_rotation_for_alias(
+            &config,
+            "gemini_cli",
+            "primary",
+            None,
+            &config.reliability.clone(),
+            None,
+            &CredentialRotationScope::primary(),
+        );
+        assert!(
+            rotation.is_none(),
+            "a family whose factory ignores the api_key must never build a credential rotation"
         );
     }
 }
