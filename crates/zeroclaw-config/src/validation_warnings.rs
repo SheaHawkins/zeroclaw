@@ -36,6 +36,12 @@ use serde::{Deserialize, Serialize};
 ///   has no runtime consumer — the context compressor was removed —
 ///   so it currently has no effect. One warning per non-default field (see
 ///   `collect_context_compression_ignored_warnings` in `schema.rs`).
+/// - `verifiable_intent_verify_tool_withheld`: `verifiable_intent.enabled` is
+///   true, but the `vi_verify` tool is withheld from the model-visible registry
+///   because no credential chain verifier exists yet, so the section does not
+///   currently enable verification of a credential. Reported here (rather than
+///   only on the runtime trace) so the notice survives
+///   `observability.log_persistence = "none"`, where no trace sink exists.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {

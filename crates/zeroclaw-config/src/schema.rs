@@ -5097,6 +5097,19 @@ impl Default for McpConfig {
     }
 }
 
+/// Stable warning code for the withheld `vi_verify` capability notice.
+///
+/// Shared by the config-warning surface (`Config::collect_warnings`) and the
+/// runtime trace emission in `src/main.rs`, so both channels report the same
+/// code and the operator sees one fact rather than two lookalike notices.
+pub const VERIFIABLE_INTENT_WITHHELD_CODE: &str = "verifiable_intent_verify_tool_withheld";
+
+/// Operator-facing text for [`VERIFIABLE_INTENT_WITHHELD_CODE`].
+pub const VERIFIABLE_INTENT_WITHHELD_MESSAGE: &str =
+    "verifiable_intent.enabled = true, but vi_verify is not registered as a model-callable tool \
+     because no credential chain verifier exists yet (see #9328); enabling this section does not \
+     currently enable verification of a credential";
+
 /// Verifiable Intent (VI) credential issuance and constraint checking
 /// (`[verifiable_intent]` section).
 ///
@@ -5111,9 +5124,14 @@ pub struct VerifiableIntentConfig {
     /// Opt in to the VI section (default: false).
     ///
     /// While the tool is withheld this does not enable credential verification
-    /// on commerce tool calls. It currently causes a warning naming that gap,
-    /// emitted once per config application: at process startup, and again when
-    /// a daemon reload re-reads config from disk.
+    /// on commerce tool calls. It currently raises the
+    /// `verifiable_intent_verify_tool_withheld` warning naming that gap. The
+    /// warning is reported by `Config::collect_warnings()`, so it reaches
+    /// `config validate`, `zeroclaw doctor` and the gateway config editor under
+    /// every `observability.log_persistence` policy including `"none"`. The
+    /// same fact is additionally recorded to the runtime trace once per config
+    /// application — at process startup, and again when a daemon reload
+    /// re-reads config from disk — wherever a trace sink exists.
     #[serde(default)]
     pub enabled: bool,
 
@@ -19218,6 +19236,7 @@ impl Config {
         self.collect_cross_provider_summary_model_warnings(&mut warnings);
         self.collect_a2a_exposed_skills_warnings(&mut warnings);
         self.collect_memory_semantic_search_warnings(&mut warnings);
+        self.collect_verifiable_intent_warnings(&mut warnings);
         self.collect_peer_groups_warnings(&mut warnings);
         // Must run after `collect_cross_provider_summary_model_warnings`: it
         // scans `warnings` to suppress its generic inert `summary_model`
@@ -19247,6 +19266,36 @@ impl Config {
             }
         }
         warnings
+    }
+
+    /// Surface the withheld `vi_verify` capability as a structured config
+    /// warning so the notice survives `observability.log_persistence = "none"`.
+    ///
+    /// The runtime emits the same fact to the trace at process config load and
+    /// after a daemon reload (`warn_verifiable_intent_withheld` in
+    /// `src/main.rs`), but under `log_persistence = "none"` there is no sink,
+    /// so that copy is delivered nowhere. `collect_warnings()` is the second
+    /// channel: it is independent of the observability policy and is what
+    /// `zeroclaw doctor`, `config validate` and the gateway config editor read,
+    /// so an operator can always find out why an enabled security capability is
+    /// absent from the model-visible registry.
+    ///
+    /// Deliberately not an unconditional `eprintln!`: that would fire on every
+    /// CLI invocation in every install with the section enabled, including
+    /// scripted and piped ones, which is how a warning gets filtered out and
+    /// ignored.
+    fn collect_verifiable_intent_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        if !self.verifiable_intent.enabled {
+            return;
+        }
+        warnings.push(crate::validation_warnings::ValidationWarning::new(
+            VERIFIABLE_INTENT_WITHHELD_CODE,
+            VERIFIABLE_INTENT_WITHHELD_MESSAGE,
+            "verifiable_intent.enabled",
+        ));
     }
 
     /// Surface sqlite semantic/hybrid search with no effective embedder. The

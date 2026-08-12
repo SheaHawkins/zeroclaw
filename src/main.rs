@@ -7699,6 +7699,20 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 /// wrong home for it, because that runs on ordinary gateway requests and on
 /// nested SOP and delegation rebuilds. Each call site must sit after its
 /// `runtime_trace::init_from_config`, or the record has no sink.
+///
+/// This is the *startup and reload* copy of the notice, and it is the one that
+/// disappears under `observability.log_persistence = "none"`, where there is no
+/// trace sink at all. The durable channel is
+/// `Config::collect_warnings()`, which reports the same
+/// `verifiable_intent_verify_tool_withheld` code independently of the
+/// observability policy; see `collect_verifiable_intent_warnings` in
+/// `crates/zeroclaw-config/src/schema.rs`. Both channels share the message
+/// constant so an operator who sees both does not read them as two findings.
+///
+/// Categorised as `System` rather than defaulting to `Internal`: this is an
+/// operator-facing posture notice, and the web Logs view hides internal events
+/// by default, which would have kept it out of the dashboard history even under
+/// `rolling` and `full`.
 #[cfg(feature = "agent-runtime")]
 fn warn_verifiable_intent_withheld(config: &Config) {
     if !config.verifiable_intent.enabled {
@@ -7707,8 +7721,13 @@ fn warn_verifiable_intent_withheld(config: &Config) {
     ::zeroclaw_log::record!(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-        "verifiable_intent: vi_verify is not registered as a model-callable tool because no credential chain verifier exists yet (see #9328)"
+            .with_category(::zeroclaw_log::EventCategory::System)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "code": ::zeroclaw::config::schema::VERIFIABLE_INTENT_WITHHELD_CODE,
+                "path": "verifiable_intent.enabled",
+            })),
+        ::zeroclaw::config::schema::VERIFIABLE_INTENT_WITHHELD_MESSAGE
     );
 }
 
