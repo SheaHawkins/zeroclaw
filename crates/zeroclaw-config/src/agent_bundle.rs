@@ -1,0 +1,1338 @@
+//! Agent bundle export planning.
+//!
+//! An *agent bundle* is a portable directory describing one agent:
+//!
+//! ```text
+//! <bundle>/
+//!   zeroclaw-agent.toml   — manifest (format version, root alias, provenance,
+//!                            required secrets, dropped refs, risk flags)
+//!   config.toml           — the config closure this agent needs
+//!   workspace/            — the agent's workspace tree
+//! ```
+//!
+//! This module owns the *planning* half: given a live [`Config`] and an agent
+//! alias, it computes the transitive config closure, strips credentials and
+//! host-specific state, and reports what an operator on the receiving end
+//! would be accepting. It performs no I/O — materializing the plan onto disk
+//! is the caller's job — which keeps the security-relevant logic unit-testable
+//! without a filesystem.
+//!
+//! The closure is deliberately narrow. An agent entry references providers,
+//! profiles, bundles, MCP servers, channels, cron jobs and sibling agents; only
+//! the subset that can be meaningfully reconstituted on a different install is
+//! carried, and everything omitted is reported in [`ExportPlan::dropped`]
+//! rather than silently disappearing.
+
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+
+use serde::Serialize;
+
+use crate::multi_agent::AccessMode;
+use crate::schema::{
+    AliasedAgentConfig, Config, KnowledgeBundleConfig, McpBundleConfig, McpServerConfig,
+    McpTransport, RiskProfileConfig, RuntimeProfileConfig, SkillBundleConfig,
+};
+use crate::traits::{MaskSecrets, is_masked_secret};
+
+/// Bundle format version written to (and expected in) the manifest.
+pub const BUNDLE_FORMAT_VERSION: u32 = 1;
+
+/// Manifest filename inside a bundle directory.
+pub const MANIFEST_FILE: &str = "zeroclaw-agent.toml";
+
+/// Config-fragment filename inside a bundle directory.
+pub const CONFIG_FILE: &str = "config.toml";
+
+/// Workspace directory name inside a bundle directory.
+pub const WORKSPACE_DIR: &str = "workspace";
+
+/// Workspace subdirectory holding the agent's private memory store. Excluded
+/// from the bundle unless [`ExportOptions::include_memory`] is set.
+pub const WORKSPACE_MEMORY_DIR: &str = "memory";
+
+/// Config-value prefixes produced by [`crate::secrets::SecretStore`]. A value
+/// carrying one of these has escaped scrubbing and must never reach a bundle.
+const CIPHERTEXT_PREFIXES: &[&str] = &["enc:", "enc2:"];
+
+/// Options controlling what an export carries.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExportOptions {
+    /// Copy `workspace/memory/` into the bundle. Off by default: the memory
+    /// store is the agent's accumulated private history, not portable
+    /// configuration, and it is usually the largest thing in a workspace.
+    pub include_memory: bool,
+}
+
+/// Why a piece of the agent's configuration was left out of the bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropReason {
+    /// Names accounts, addresses, or paths that only exist on the source host.
+    HostSpecific,
+    /// Names other agents or groups that will not exist on the target install.
+    Relational,
+    /// An outward-facing surface that must be re-enabled deliberately on the
+    /// target rather than arriving switched on.
+    DefaultClosed,
+    /// The agent's private data, excluded unless explicitly requested.
+    PrivateData,
+    /// Not carried by this bundle format version yet.
+    NotYetPortable,
+}
+
+impl DropReason {
+    /// Stable wire string used in the manifest.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::HostSpecific => "host_specific",
+            Self::Relational => "relational",
+            Self::DefaultClosed => "default_closed",
+            Self::PrivateData => "private_data",
+            Self::NotYetPortable => "not_yet_portable",
+        }
+    }
+}
+
+/// One omitted piece of configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedRef {
+    /// Dotted config path that was dropped, relative to the whole config.
+    pub path: String,
+    pub reason: DropReason,
+    /// Operator-facing explanation.
+    pub detail: String,
+}
+
+/// A capability in the bundle that widens the target install's trust boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiskKind {
+    /// Risk profile runs at `level = "full"` — no per-operation approval gate.
+    FullAutonomy,
+    /// The agent may read or write outside its workspace.
+    FilesystemEscape,
+    /// Sandboxing is explicitly disabled for this profile.
+    SandboxDisabled,
+    /// Approval gates that normally catch risky operations are switched off.
+    ApprovalBypass,
+    /// Host environment variables are forwarded into shell subprocesses.
+    EnvPassthrough,
+    /// Extra filesystem roots are granted beyond the workspace.
+    ExtraFilesystemRoots,
+    /// The agent may initiate delegation to other agents.
+    DelegationEnabled,
+    /// A stdio MCP server spawns a local process on the target host.
+    ProcessSpawn,
+    /// Server-controlled text is injected into the system prompt at startup.
+    UntrustedStartupContext,
+}
+
+impl RiskKind {
+    /// Stable wire string used in the manifest.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::FullAutonomy => "full_autonomy",
+            Self::FilesystemEscape => "filesystem_escape",
+            Self::SandboxDisabled => "sandbox_disabled",
+            Self::ApprovalBypass => "approval_bypass",
+            Self::EnvPassthrough => "env_passthrough",
+            Self::ExtraFilesystemRoots => "extra_filesystem_roots",
+            Self::DelegationEnabled => "delegation_enabled",
+            Self::ProcessSpawn => "process_spawn",
+            Self::UntrustedStartupContext => "untrusted_startup_context",
+        }
+    }
+}
+
+/// One flagged capability, bound to the config path that grants it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RiskFlag {
+    pub kind: RiskKind,
+    /// Dotted config path within the bundle that carries the capability.
+    pub path: String,
+    /// Operator-facing explanation of what accepting this grants.
+    pub detail: String,
+}
+
+/// Provenance recorded in the manifest. Supplied by the caller so the planner
+/// stays a pure function of the config.
+#[derive(Debug, Clone)]
+pub struct Provenance {
+    /// Version of the ZeroClaw binary that produced the bundle.
+    pub zeroclaw_version: String,
+    /// RFC 3339 timestamp of the export.
+    pub exported_at: String,
+}
+
+/// A computed export, ready to be written to disk.
+#[derive(Debug, Clone)]
+pub struct ExportPlan {
+    /// Alias of the agent this bundle describes.
+    pub root_alias: String,
+    /// The config closure, as a TOML table rooted at the config root.
+    pub config: toml::Table,
+    /// Dotted paths whose values were scrubbed and must be supplied on import.
+    pub required_secrets: Vec<String>,
+    /// Configuration deliberately left out, with reasons.
+    pub dropped: Vec<DroppedRef>,
+    /// Capabilities the receiving operator is being asked to grant.
+    pub risk_flags: Vec<RiskFlag>,
+    /// Source workspace directory to copy into the bundle.
+    pub workspace_source: PathBuf,
+    /// Whether `workspace/memory/` should be copied.
+    pub include_memory: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ExportError {
+    #[error(
+        "agent '{0}' is not configured; run `zeroclaw agents list` to see the configured aliases"
+    )]
+    UnknownAgent(String),
+
+    #[error("failed to serialize configuration for export: {0}")]
+    Serialize(String),
+
+    #[error(
+        "refusing to write the bundle: encrypted config ciphertext survived scrubbing at `{path}`. \
+         This is a bug in the export scrubber — please report it rather than working around it."
+    )]
+    UnscrubbedSecret { path: String },
+}
+
+/// Compute the export closure for `alias`.
+///
+/// Fails only on an unknown alias or a serialization fault; a source config
+/// with dangling references still exports (the unresolvable entries are simply
+/// absent from the closure, and the import-side `Config::validate()` is the
+/// gate that catches them).
+pub fn plan_export(
+    config: &Config,
+    alias: &str,
+    options: ExportOptions,
+) -> Result<ExportPlan, ExportError> {
+    let agent = config
+        .agents
+        .get(alias)
+        .ok_or_else(|| ExportError::UnknownAgent(alias.to_string()))?;
+
+    // Mask before selecting: `mask_secrets` is the schema's own definition of
+    // which leaves are credentials (including dynamically-keyed maps like an
+    // MCP server's `env`), so the selection below can never pick up a secret
+    // the schema knows about.
+    let mut masked = config.clone();
+    masked.mask_secrets();
+    let masked_root = to_table(&masked)?;
+
+    let mut out = toml::Table::new();
+    let mut dropped = Vec::new();
+
+    // ── the agent entry itself ───────────────────────────────────────────
+    let agent_table = sanitize_agent(&to_table(agent)?, alias, agent, &mut dropped);
+    let agent_table = prune(agent_table, &to_table(&AliasedAgentConfig::default())?);
+    insert_at(
+        &mut out,
+        &["agents", alias],
+        toml::Value::Table(agent_table),
+    );
+
+    // ── profiles ─────────────────────────────────────────────────────────
+    let risk_alias = agent.risk_profile.trim();
+    if !risk_alias.is_empty() {
+        carry(
+            &mut out,
+            &masked_root,
+            &["risk_profiles", risk_alias],
+            &to_table(&RiskProfileConfig::default())?,
+        );
+    }
+    let runtime_alias = agent.runtime_profile.trim();
+    if !runtime_alias.is_empty() {
+        carry(
+            &mut out,
+            &masked_root,
+            &["runtime_profiles", runtime_alias],
+            &to_table(&RuntimeProfileConfig::default())?,
+        );
+    }
+
+    // ── bundles ──────────────────────────────────────────────────────────
+    let skill_default = to_table(&SkillBundleConfig::default())?;
+    for bundle in dedup(&agent.skill_bundles) {
+        carry(
+            &mut out,
+            &masked_root,
+            &["skill_bundles", &bundle],
+            &skill_default,
+        );
+    }
+    let knowledge_default = to_table(&KnowledgeBundleConfig::default())?;
+    for bundle in dedup(&agent.knowledge_bundles) {
+        carry(
+            &mut out,
+            &masked_root,
+            &["knowledge_bundles", &bundle],
+            &knowledge_default,
+        );
+    }
+    let mcp_bundle_default = to_table(&McpBundleConfig::default())?;
+    for bundle in dedup(&agent.mcp_bundles) {
+        carry(
+            &mut out,
+            &masked_root,
+            &["mcp_bundles", &bundle],
+            &mcp_bundle_default,
+        );
+    }
+
+    // ── MCP servers the bundles actually grant ───────────────────────────
+    //
+    // Resolution goes through `mcp_servers_for_bundles` rather than a manual
+    // union so `exclude` keeps winning here exactly as it does at runtime: the
+    // bundle carries the servers this agent can really reach, no more.
+    let granted = config.mcp_servers_for_bundles(&agent.mcp_bundles);
+    if !granted.is_empty() {
+        let server_default = to_table(&McpServerConfig::default())?;
+        let mut servers = Vec::with_capacity(granted.len());
+        for server in &granted {
+            let table = masked_server_table(&masked_root, &server.name, server)?;
+            let mut pruned = prune(table, &server_default);
+            // `name` is the natural key every other surface addresses the
+            // server by, so it stays even when pruning would drop it.
+            pruned.insert("name".to_string(), toml::Value::String(server.name.clone()));
+            servers.push(toml::Value::Table(pruned));
+        }
+        insert_at(&mut out, &["mcp", "servers"], toml::Value::Array(servers));
+    }
+
+    // ── provider entries, carried keyless ────────────────────────────────
+    //
+    // Every provider reference the agent names is carried, not just
+    // `model_provider`: `Config::validate()` fails loud on any dangling
+    // provider ref, so a bundle that carried only some of them would not
+    // import. Credentials are scrubbed below, leaving keyless entries for the
+    // operator to fill in.
+    let provider_refs: [(&str, &str); 5] = [
+        ("providers.models", agent.model_provider.trim()),
+        ("providers.models", agent.classifier_provider.trim()),
+        ("providers.models", agent.summary_provider.trim()),
+        ("providers.tts", agent.tts_provider.trim()),
+        (
+            "providers.transcription",
+            agent.transcription_provider.trim(),
+        ),
+    ];
+    let mut carried_providers: BTreeSet<String> = BTreeSet::new();
+    for (section, reference) in provider_refs {
+        let Some((family, entry)) = split_provider_ref(reference) else {
+            continue;
+        };
+        let path = format!("{section}.{family}.{entry}");
+        if !carried_providers.insert(path) {
+            continue;
+        }
+        let mut segments: Vec<&str> = section.split('.').collect();
+        segments.push(family);
+        segments.push(entry);
+        // Provider entries are pruned against an empty default: the typed
+        // default varies per family, and an over-pruned provider entry is
+        // worse than a verbose one (a dropped `api_url` silently re-points
+        // the agent at the family's built-in endpoint).
+        carry(&mut out, &masked_root, &segments, &toml::Table::new());
+    }
+
+    // ── scrub, then verify the scrub ─────────────────────────────────────
+    let mut required_secrets = Vec::new();
+    let mut root = toml::Value::Table(out);
+    visit_strings_mut(&mut root, "", &mut |path, value| {
+        if is_masked_secret(value) {
+            required_secrets.push(path.to_string());
+            value.clear();
+        }
+    });
+    if let Some(path) = find_ciphertext(&root) {
+        return Err(ExportError::UnscrubbedSecret { path });
+    }
+    let toml::Value::Table(config_table) = root else {
+        return Err(ExportError::Serialize(
+            "export closure is not a TOML table".to_string(),
+        ));
+    };
+    required_secrets.sort();
+    required_secrets.dedup();
+
+    if !options.include_memory {
+        dropped.push(DroppedRef {
+            path: format!("{WORKSPACE_DIR}/{WORKSPACE_MEMORY_DIR}"),
+            reason: DropReason::PrivateData,
+            detail: "the agent's memory store is private accumulated history; \
+                     re-run with --include-memory to carry it"
+                .to_string(),
+        });
+    }
+
+    let risk_flags = collect_risk_flags(config, alias, agent, &granted);
+
+    Ok(ExportPlan {
+        root_alias: alias.to_string(),
+        config: config_table,
+        required_secrets,
+        dropped,
+        risk_flags,
+        workspace_source: config.agent_workspace_dir(alias),
+        include_memory: options.include_memory,
+    })
+}
+
+/// Remove the parts of an agent entry that cannot travel, recording each.
+///
+/// Only fields that actually carry a value are reported, so the operator's
+/// drop list describes this agent rather than the schema.
+fn sanitize_agent(
+    table: &toml::Table,
+    alias: &str,
+    agent: &AliasedAgentConfig,
+    dropped: &mut Vec<DroppedRef>,
+) -> toml::Table {
+    let mut table = table.clone();
+
+    let mut drop_key =
+        |table: &mut toml::Table, key: &str, occupied: bool, reason, detail: &str| {
+            table.remove(key);
+            if occupied {
+                dropped.push(DroppedRef {
+                    path: format!("agents.{alias}.{key}"),
+                    reason,
+                    detail: detail.to_string(),
+                });
+            }
+        };
+
+    drop_key(
+        &mut table,
+        "channels",
+        !agent.channels.is_empty(),
+        DropReason::HostSpecific,
+        "channel bindings name accounts and credentials that exist only on the source install; \
+         bind the imported agent to a local channel instead",
+    );
+    drop_key(
+        &mut table,
+        "delegates",
+        !agent.delegates.is_empty(),
+        DropReason::Relational,
+        "the delegate roster names sibling agents that will not exist on the target install",
+    );
+    drop_key(
+        &mut table,
+        "cron_jobs",
+        !agent.cron_jobs.is_empty(),
+        DropReason::NotYetPortable,
+        "scheduled jobs are not carried by bundle format 1; re-create them on the target",
+    );
+    drop_key(
+        &mut table,
+        "a2a",
+        agent.a2a.published || !agent.a2a.exposed_skills.is_empty(),
+        DropReason::DefaultClosed,
+        "A2A publication is an outward-facing surface; the imported agent arrives unpublished \
+         and must be published deliberately",
+    );
+
+    // The workspace block travels, but three of its fields cannot.
+    if let Some(toml::Value::Table(workspace)) = table.get_mut("workspace") {
+        workspace.remove("path");
+        if agent.workspace.path.is_some() {
+            dropped.push(DroppedRef {
+                path: format!("agents.{alias}.workspace.path"),
+                reason: DropReason::HostSpecific,
+                detail: "the workspace override is a source-host absolute path; the imported \
+                         agent uses the target's default workspace location"
+                    .to_string(),
+            });
+        }
+        workspace.remove("access");
+        if !agent.workspace.access.is_empty() {
+            dropped.push(DroppedRef {
+                path: format!("agents.{alias}.workspace.access"),
+                reason: DropReason::Relational,
+                detail: "cross-agent filesystem grants name sibling agents that will not exist \
+                         on the target install"
+                    .to_string(),
+            });
+        }
+        workspace.remove("read_memory_from");
+        if !agent.workspace.read_memory_from.is_empty() {
+            dropped.push(DroppedRef {
+                path: format!("agents.{alias}.workspace.read_memory_from"),
+                reason: DropReason::Relational,
+                detail: "cross-agent memory grants name sibling agents that will not exist on \
+                         the target install"
+                    .to_string(),
+            });
+        }
+    }
+
+    table
+}
+
+/// Capabilities in this closure that widen the target install's trust boundary.
+fn collect_risk_flags(
+    config: &Config,
+    alias: &str,
+    agent: &AliasedAgentConfig,
+    servers: &[McpServerConfig],
+) -> Vec<RiskFlag> {
+    let mut flags = Vec::new();
+
+    let risk_alias = agent.risk_profile.trim();
+    if let Some(profile) = config.risk_profiles.get(risk_alias) {
+        let at = |leaf: &str| format!("risk_profiles.{risk_alias}.{leaf}");
+
+        if matches!(profile.level, crate::autonomy::AutonomyLevel::Full) {
+            flags.push(RiskFlag {
+                kind: RiskKind::FullAutonomy,
+                path: at("level"),
+                detail: "the agent acts autonomously within policy bounds — no per-operation \
+                         approval prompt"
+                    .to_string(),
+            });
+        }
+        if !profile.workspace_only {
+            flags.push(RiskFlag {
+                kind: RiskKind::FilesystemEscape,
+                path: at("workspace_only"),
+                detail: "filesystem access is not confined to the workspace".to_string(),
+            });
+        }
+        if profile.sandbox_enabled == Some(false) {
+            flags.push(RiskFlag {
+                kind: RiskKind::SandboxDisabled,
+                path: at("sandbox_enabled"),
+                detail: "shell execution runs unsandboxed on the host".to_string(),
+            });
+        }
+        if !profile.block_high_risk_commands {
+            flags.push(RiskFlag {
+                kind: RiskKind::ApprovalBypass,
+                path: at("block_high_risk_commands"),
+                detail: "high-risk shell commands are not blocked".to_string(),
+            });
+        }
+        if !profile.require_approval_for_medium_risk {
+            flags.push(RiskFlag {
+                kind: RiskKind::ApprovalBypass,
+                path: at("require_approval_for_medium_risk"),
+                detail: "medium-risk operations run without an approval prompt".to_string(),
+            });
+        }
+        if !profile.shell_env_passthrough.is_empty() {
+            flags.push(RiskFlag {
+                kind: RiskKind::EnvPassthrough,
+                path: at("shell_env_passthrough"),
+                detail: format!(
+                    "host environment variables are forwarded into shell subprocesses: {}",
+                    profile.shell_env_passthrough.join(", ")
+                ),
+            });
+        }
+        if !profile.allowed_roots.is_empty() {
+            flags.push(RiskFlag {
+                kind: RiskKind::ExtraFilesystemRoots,
+                path: at("allowed_roots"),
+                detail: format!(
+                    "extra filesystem roots are granted beyond the workspace: {}",
+                    profile.allowed_roots.join(", ")
+                ),
+            });
+        }
+        if profile.delegation_policy.permits() {
+            flags.push(RiskFlag {
+                kind: RiskKind::DelegationEnabled,
+                path: at("delegation_policy.mode"),
+                detail: "the agent may initiate delegation to other agents on the target install"
+                    .to_string(),
+            });
+        }
+    }
+
+    if agent.workspace.unrestricted_filesystem {
+        flags.push(RiskFlag {
+            kind: RiskKind::FilesystemEscape,
+            path: format!("agents.{alias}.workspace.unrestricted_filesystem"),
+            detail: "the agent can read and write anywhere the host filesystem permits".to_string(),
+        });
+    }
+
+    for server in servers {
+        if matches!(server.transport, McpTransport::Stdio) {
+            flags.push(RiskFlag {
+                kind: RiskKind::ProcessSpawn,
+                path: format!("mcp.servers.{}.command", server.name),
+                detail: format!(
+                    "starts a local process on the target host: {}",
+                    shell_preview(server)
+                ),
+            });
+        }
+        if !server.pinned_resources.is_empty() {
+            flags.push(RiskFlag {
+                kind: RiskKind::UntrustedStartupContext,
+                path: format!("mcp.servers.{}.pinned_resources", server.name),
+                detail: format!(
+                    "server-controlled text is read into the system prompt at startup: {}",
+                    server.pinned_resources.join(", ")
+                ),
+            });
+        }
+    }
+
+    flags
+}
+
+/// Command line an stdio MCP server would run, for the risk report.
+fn shell_preview(server: &McpServerConfig) -> String {
+    if server.args.is_empty() {
+        server.command.clone()
+    } else {
+        format!("{} {}", server.command, server.args.join(" "))
+    }
+}
+
+/// Copy `path` out of the masked config into `out`, pruned against `defaults`.
+/// A path that does not resolve is skipped: an unresolvable reference grants
+/// nothing, and the import-side validation is what reports it.
+fn carry(out: &mut toml::Table, masked_root: &toml::Table, path: &[&str], defaults: &toml::Table) {
+    let Some(toml::Value::Table(entry)) = lookup(masked_root, path) else {
+        return;
+    };
+    let pruned = prune(entry.clone(), defaults);
+    insert_at(out, path, toml::Value::Table(pruned));
+}
+
+/// The masked table for one MCP server, matched by natural key.
+///
+/// Falls back to serializing the resolved entry when the masked array has no
+/// element with this name — which cannot happen for a config that round-trips,
+/// but must not panic if it does.
+fn masked_server_table(
+    masked_root: &toml::Table,
+    name: &str,
+    fallback: &McpServerConfig,
+) -> Result<toml::Table, ExportError> {
+    let found = lookup(masked_root, &["mcp", "servers"])
+        .and_then(toml::Value::as_array)
+        .and_then(|servers| {
+            servers.iter().find_map(|server| {
+                let table = server.as_table()?;
+                let matches = table.get("name").and_then(toml::Value::as_str) == Some(name);
+                matches.then(|| table.clone())
+            })
+        });
+    match found {
+        Some(table) => Ok(table),
+        None => {
+            let mut masked = fallback.clone();
+            masked.mask_secrets();
+            to_table(&masked)
+        }
+    }
+}
+
+// ── TOML helpers ─────────────────────────────────────────────────────────
+
+fn to_table<T: Serialize>(value: &T) -> Result<toml::Table, ExportError> {
+    match toml::Value::try_from(value) {
+        Ok(toml::Value::Table(table)) => Ok(table),
+        Ok(_) => Err(ExportError::Serialize("expected a TOML table".to_string())),
+        Err(err) => Err(ExportError::Serialize(err.to_string())),
+    }
+}
+
+fn lookup<'a>(root: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
+    let (last, prefix) = path.split_last()?;
+    let mut cursor = root;
+    for segment in prefix {
+        cursor = cursor.get(*segment)?.as_table()?;
+    }
+    cursor.get(*last)
+}
+
+/// Build the nested table `{a: {b: {c: value}}}` for path `[a, b, c]`.
+fn nested(path: &[&str], value: toml::Value) -> toml::Table {
+    let mut table = toml::Table::new();
+    match path.split_first() {
+        None => {}
+        Some((head, [])) => {
+            table.insert((*head).to_string(), value);
+        }
+        Some((head, rest)) => {
+            table.insert((*head).to_string(), toml::Value::Table(nested(rest, value)));
+        }
+    }
+    table
+}
+
+fn merge_into(dest: &mut toml::Table, src: toml::Table) {
+    for (key, value) in src {
+        match (dest.get_mut(&key), value) {
+            (Some(toml::Value::Table(existing)), toml::Value::Table(incoming)) => {
+                merge_into(existing, incoming);
+            }
+            (_, value) => {
+                dest.insert(key, value);
+            }
+        }
+    }
+}
+
+fn insert_at(root: &mut toml::Table, path: &[&str], value: toml::Value) {
+    merge_into(root, nested(path, value));
+}
+
+/// Drop every key whose value equals the schema default, so a bundle carries
+/// the operator's actual choices instead of hundreds of lines of defaults.
+fn prune(mut table: toml::Table, defaults: &toml::Table) -> toml::Table {
+    crate::schema::prune_default_values(&mut table, defaults);
+    table
+}
+
+fn dedup(values: &[String]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .filter(|value| seen.insert((*value).to_string()))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Split a dotted `<family>.<alias>` provider reference. Returns `None` for an
+/// empty or malformed reference — `Config::validate()` owns reporting those.
+fn split_provider_ref(reference: &str) -> Option<(&str, &str)> {
+    let (family, entry) = reference.split_once('.')?;
+    (!family.is_empty() && !entry.is_empty()).then_some((family, entry))
+}
+
+/// Walk every string leaf, passing the dotted path and a mutable handle.
+///
+/// Array elements carrying a `name` are addressed by that natural key
+/// (`mcp.servers.github.env.TOKEN`) so reported paths match the ones
+/// `zeroclaw config set` accepts.
+fn visit_strings_mut(
+    value: &mut toml::Value,
+    path: &str,
+    visit: &mut impl FnMut(&str, &mut String),
+) {
+    match value {
+        toml::Value::String(text) => visit(path, text),
+        toml::Value::Table(table) => {
+            for (key, child) in table.iter_mut() {
+                visit_strings_mut(child, &join(path, key), visit);
+            }
+        }
+        toml::Value::Array(items) => {
+            for (index, child) in items.iter_mut().enumerate() {
+                let segment = child
+                    .as_table()
+                    .and_then(|table| table.get("name"))
+                    .and_then(toml::Value::as_str)
+                    .map_or_else(|| index.to_string(), str::to_string);
+                visit_strings_mut(child, &join(path, &segment), visit);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn join(prefix: &str, segment: &str) -> String {
+    if prefix.is_empty() {
+        segment.to_string()
+    } else {
+        format!("{prefix}.{segment}")
+    }
+}
+
+/// First path holding config ciphertext, if any survived scrubbing.
+fn find_ciphertext(root: &toml::Value) -> Option<String> {
+    let mut found: Option<String> = None;
+    let mut probe = root.clone();
+    visit_strings_mut(&mut probe, "", &mut |path, value| {
+        if found.is_none() && CIPHERTEXT_PREFIXES.iter().any(|p| value.starts_with(p)) {
+            found = Some(path.to_string());
+        }
+    });
+    found
+}
+
+// ── rendering ────────────────────────────────────────────────────────────
+
+const CONFIG_HEADER: &str = "\
+# ZeroClaw agent bundle — config closure.
+#
+# This is a FRAGMENT, not a complete config.toml. `zeroclaw agents import`
+# merges it into the target install; it never replaces the target's config.
+# Empty-string values are credentials that were scrubbed on export and must be
+# supplied on the target — see `required_secrets` in zeroclaw-agent.toml.
+";
+
+/// Render the closure as the bundle's `config.toml`.
+pub fn render_config_toml(plan: &ExportPlan) -> Result<String, ExportError> {
+    let body = toml::to_string_pretty(&plan.config)
+        .map_err(|err| ExportError::Serialize(err.to_string()))?;
+    Ok(format!(
+        "{CONFIG_HEADER}{}",
+        crate::schema::ensure_blank_line_before_sections(&body)
+    ))
+}
+
+/// Build the bundle manifest table.
+pub fn render_manifest(plan: &ExportPlan, provenance: &Provenance) -> toml::Table {
+    let mut manifest = toml::Table::new();
+    manifest.insert(
+        "format_version".to_string(),
+        toml::Value::Integer(i64::from(BUNDLE_FORMAT_VERSION)),
+    );
+    manifest.insert(
+        "root_agent".to_string(),
+        toml::Value::String(plan.root_alias.clone()),
+    );
+    manifest.insert(
+        "includes_memory".to_string(),
+        toml::Value::Boolean(plan.include_memory),
+    );
+    manifest.insert(
+        "required_secrets".to_string(),
+        toml::Value::Array(
+            plan.required_secrets
+                .iter()
+                .map(|path| toml::Value::String(path.clone()))
+                .collect(),
+        ),
+    );
+
+    let mut provenance_table = toml::Table::new();
+    provenance_table.insert(
+        "zeroclaw_version".to_string(),
+        toml::Value::String(provenance.zeroclaw_version.clone()),
+    );
+    provenance_table.insert(
+        "exported_at".to_string(),
+        toml::Value::String(provenance.exported_at.clone()),
+    );
+    manifest.insert(
+        "provenance".to_string(),
+        toml::Value::Table(provenance_table),
+    );
+
+    manifest.insert(
+        "dropped".to_string(),
+        toml::Value::Array(
+            plan.dropped
+                .iter()
+                .map(|entry| {
+                    let mut table = toml::Table::new();
+                    table.insert("path".to_string(), toml::Value::String(entry.path.clone()));
+                    table.insert(
+                        "reason".to_string(),
+                        toml::Value::String(entry.reason.as_wire().to_string()),
+                    );
+                    table.insert(
+                        "detail".to_string(),
+                        toml::Value::String(entry.detail.clone()),
+                    );
+                    toml::Value::Table(table)
+                })
+                .collect(),
+        ),
+    );
+
+    manifest.insert(
+        "risk_flags".to_string(),
+        toml::Value::Array(
+            plan.risk_flags
+                .iter()
+                .map(|flag| {
+                    let mut table = toml::Table::new();
+                    table.insert(
+                        "kind".to_string(),
+                        toml::Value::String(flag.kind.as_wire().to_string()),
+                    );
+                    table.insert("path".to_string(), toml::Value::String(flag.path.clone()));
+                    table.insert(
+                        "detail".to_string(),
+                        toml::Value::String(flag.detail.clone()),
+                    );
+                    toml::Value::Table(table)
+                })
+                .collect(),
+        ),
+    );
+
+    manifest
+}
+
+const MANIFEST_HEADER: &str = "\
+# ZeroClaw agent bundle manifest.
+#
+# `required_secrets` lists config paths whose credentials were scrubbed on
+# export. `risk_flags` lists capabilities the importing operator is being asked
+# to grant. `dropped` lists configuration that could not travel.
+";
+
+/// Render the manifest as the bundle's `zeroclaw-agent.toml`.
+pub fn render_manifest_toml(
+    plan: &ExportPlan,
+    provenance: &Provenance,
+) -> Result<String, ExportError> {
+    let manifest = render_manifest(plan, provenance);
+    let body =
+        toml::to_string_pretty(&manifest).map_err(|err| ExportError::Serialize(err.to_string()))?;
+    Ok(format!(
+        "{MANIFEST_HEADER}{}",
+        crate::schema::ensure_blank_line_before_sections(&body)
+    ))
+}
+
+/// Whether a workspace-relative path should be copied into the bundle.
+#[must_use]
+pub fn workspace_entry_included(relative: &std::path::Path, include_memory: bool) -> bool {
+    if include_memory {
+        return true;
+    }
+    relative
+        .components()
+        .next()
+        .is_none_or(|first| first.as_os_str() != WORKSPACE_MEMORY_DIR)
+}
+
+/// Cross-agent access modes present in a bundle, for the import-side report.
+/// Exposed so the importer can describe grants without re-deriving them.
+#[must_use]
+pub fn access_mode_label(mode: AccessMode) -> &'static str {
+    match mode {
+        AccessMode::Read => "read",
+        AccessMode::Write => "write",
+        AccessMode::ReadWrite => "read+write",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::autonomy::{AutonomyLevel, DelegationMode};
+    use crate::multi_agent::AgentWorkspaceConfig;
+    use std::collections::HashMap;
+
+    fn options() -> ExportOptions {
+        ExportOptions::default()
+    }
+
+    /// Config with one agent wired to a risk profile, an MCP bundle granting
+    /// two of three servers, and an Anthropic model provider carrying a key.
+    fn fixture() -> Config {
+        let mut config = Config::default();
+
+        config
+            .risk_profiles
+            .insert("guarded".to_string(), RiskProfileConfig::default());
+
+        config.mcp_bundles.insert(
+            "research".to_string(),
+            McpBundleConfig {
+                servers: vec!["github".to_string(), "search".to_string()],
+                exclude: vec!["search".to_string()],
+            },
+        );
+
+        config.mcp.servers = vec![
+            McpServerConfig {
+                name: "github".to_string(),
+                transport: McpTransport::Stdio,
+                command: "npx".to_string(),
+                args: vec![
+                    "-y".to_string(),
+                    "@modelcontextprotocol/server-github".to_string(),
+                ],
+                env: HashMap::from([(
+                    "GITHUB_TOKEN".to_string(),
+                    "ghp_realsecretvalue".to_string(),
+                )]),
+                ..Default::default()
+            },
+            McpServerConfig {
+                name: "search".to_string(),
+                transport: McpTransport::Http,
+                url: Some("https://search.example.com/mcp".to_string()),
+                ..Default::default()
+            },
+            McpServerConfig {
+                name: "unrelated".to_string(),
+                transport: McpTransport::Stdio,
+                command: "other".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        config.providers.models.anthropic.insert(
+            "main".to_string(),
+            crate::schema::AnthropicModelProviderConfig {
+                base: crate::schema::ModelProviderConfig {
+                    api_key: Some("sk-ant-realkey".to_string()),
+                    model: Some("claude-opus-5".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        config.agents.insert(
+            "researcher".to_string(),
+            AliasedAgentConfig {
+                model_provider: "anthropic.main".into(),
+                risk_profile: "guarded".into(),
+                mcp_bundles: vec!["research".to_string()],
+                channels: vec!["telegram.work".into()],
+                ..Default::default()
+            },
+        );
+
+        config
+    }
+
+    #[test]
+    fn unknown_alias_is_an_error() {
+        let config = Config::default();
+        let err = plan_export(&config, "nobody", options()).unwrap_err();
+        assert!(matches!(err, ExportError::UnknownAgent(alias) if alias == "nobody"));
+    }
+
+    #[test]
+    fn closure_carries_only_the_servers_the_bundles_grant() {
+        let plan = plan_export(&fixture(), "researcher", options()).unwrap();
+        let servers = lookup(&plan.config, &["mcp", "servers"])
+            .and_then(toml::Value::as_array)
+            .expect("closure carries mcp.servers");
+        let names: Vec<&str> = servers
+            .iter()
+            .filter_map(|s| s.get("name").and_then(toml::Value::as_str))
+            .collect();
+        // `search` is excluded by the bundle and `unrelated` is not referenced.
+        assert_eq!(names, vec!["github"]);
+    }
+
+    #[test]
+    fn exclude_still_wins_inside_the_closure() {
+        let mut config = fixture();
+        // A second bundle that grants `search` outright — the first bundle's
+        // `exclude` must still remove it, matching runtime resolution.
+        config.mcp_bundles.insert(
+            "extra".to_string(),
+            McpBundleConfig {
+                servers: vec!["search".to_string()],
+                exclude: Vec::new(),
+            },
+        );
+        if let Some(agent) = config.agents.get_mut("researcher") {
+            agent.mcp_bundles.push("extra".to_string());
+        }
+
+        let plan = plan_export(&config, "researcher", options()).unwrap();
+        let rendered = render_config_toml(&plan).unwrap();
+        assert!(!rendered.contains("search.example.com"), "{rendered}");
+    }
+
+    #[test]
+    fn no_credential_survives_into_the_rendered_bundle() {
+        let plan = plan_export(&fixture(), "researcher", options()).unwrap();
+        let rendered = render_config_toml(&plan).unwrap();
+        assert!(!rendered.contains("ghp_realsecretvalue"), "{rendered}");
+        assert!(!rendered.contains("sk-ant-realkey"), "{rendered}");
+        assert!(!rendered.contains("***MASKED***"), "{rendered}");
+    }
+
+    #[test]
+    fn required_secrets_name_every_scrubbed_leaf_by_config_path() {
+        let plan = plan_export(&fixture(), "researcher", options()).unwrap();
+        assert!(
+            plan.required_secrets
+                .contains(&"mcp.servers.github.env.GITHUB_TOKEN".to_string()),
+            "{:?}",
+            plan.required_secrets
+        );
+        assert!(
+            plan.required_secrets
+                .contains(&"providers.models.anthropic.main.api_key".to_string()),
+            "{:?}",
+            plan.required_secrets
+        );
+    }
+
+    #[test]
+    fn scrubbed_leaves_are_emitted_empty_not_masked() {
+        let plan = plan_export(&fixture(), "researcher", options()).unwrap();
+        let key = lookup(
+            &plan.config,
+            &["providers", "models", "anthropic", "main", "api_key"],
+        )
+        .and_then(toml::Value::as_str);
+        assert_eq!(key, Some(""));
+    }
+
+    #[test]
+    fn host_specific_and_relational_fields_are_dropped_and_reported() {
+        let mut config = fixture();
+        if let Some(agent) = config.agents.get_mut("researcher") {
+            agent.workspace = AgentWorkspaceConfig {
+                path: Some(PathBuf::from("/srv/custom")),
+                access: [("beta".to_string().into(), AccessMode::Read)]
+                    .into_iter()
+                    .collect(),
+                read_memory_from: vec!["beta".to_string().into()],
+                unrestricted_filesystem: false,
+            };
+        }
+        let plan = plan_export(&config, "researcher", options()).unwrap();
+
+        let agent = lookup(&plan.config, &["agents", "researcher"])
+            .and_then(toml::Value::as_table)
+            .expect("agent entry present");
+        assert!(!agent.contains_key("channels"));
+        let workspace = agent.get("workspace").and_then(toml::Value::as_table);
+        if let Some(workspace) = workspace {
+            assert!(!workspace.contains_key("path"));
+            assert!(!workspace.contains_key("access"));
+            assert!(!workspace.contains_key("read_memory_from"));
+        }
+
+        let paths: Vec<&str> = plan.dropped.iter().map(|d| d.path.as_str()).collect();
+        for expected in [
+            "agents.researcher.channels",
+            "agents.researcher.workspace.path",
+            "agents.researcher.workspace.access",
+            "agents.researcher.workspace.read_memory_from",
+        ] {
+            assert!(paths.contains(&expected), "{paths:?} missing {expected}");
+        }
+    }
+
+    #[test]
+    fn drop_report_describes_this_agent_not_the_schema() {
+        // The fixture agent has no delegates, cron jobs, or A2A publication,
+        // so those must not appear in the report.
+        let plan = plan_export(&fixture(), "researcher", options()).unwrap();
+        let paths: Vec<&str> = plan.dropped.iter().map(|d| d.path.as_str()).collect();
+        assert!(!paths.contains(&"agents.researcher.delegates"), "{paths:?}");
+        assert!(!paths.contains(&"agents.researcher.cron_jobs"), "{paths:?}");
+        assert!(!paths.contains(&"agents.researcher.a2a"), "{paths:?}");
+    }
+
+    #[test]
+    fn memory_is_excluded_by_default_and_reported() {
+        let plan = plan_export(&fixture(), "researcher", options()).unwrap();
+        assert!(!plan.include_memory);
+        assert!(
+            plan.dropped
+                .iter()
+                .any(|d| d.reason == DropReason::PrivateData)
+        );
+
+        let with_memory = plan_export(
+            &fixture(),
+            "researcher",
+            ExportOptions {
+                include_memory: true,
+            },
+        )
+        .unwrap();
+        assert!(with_memory.include_memory);
+        assert!(
+            !with_memory
+                .dropped
+                .iter()
+                .any(|d| d.reason == DropReason::PrivateData)
+        );
+    }
+
+    #[test]
+    fn memory_directory_is_filtered_out_of_the_workspace_copy() {
+        use std::path::Path;
+        assert!(!workspace_entry_included(
+            Path::new("memory/brain.db"),
+            false
+        ));
+        assert!(workspace_entry_included(Path::new("memory/brain.db"), true));
+        assert!(workspace_entry_included(Path::new("IDENTITY.md"), false));
+        assert!(workspace_entry_included(
+            Path::new("notes/memory/scratch.md"),
+            false
+        ));
+    }
+
+    #[test]
+    fn stdio_servers_are_flagged_as_process_spawn() {
+        let plan = plan_export(&fixture(), "researcher", options()).unwrap();
+        let flag = plan
+            .risk_flags
+            .iter()
+            .find(|f| f.kind == RiskKind::ProcessSpawn)
+            .expect("stdio server flagged");
+        assert_eq!(flag.path, "mcp.servers.github.command");
+        assert!(flag.detail.contains("npx"), "{}", flag.detail);
+    }
+
+    #[test]
+    fn permissive_risk_profile_raises_every_matching_flag() {
+        let mut config = fixture();
+        config.risk_profiles.insert(
+            "guarded".to_string(),
+            RiskProfileConfig {
+                level: AutonomyLevel::Full,
+                workspace_only: false,
+                sandbox_enabled: Some(false),
+                block_high_risk_commands: false,
+                require_approval_for_medium_risk: false,
+                shell_env_passthrough: vec!["AWS_SECRET_ACCESS_KEY".to_string()],
+                allowed_roots: vec!["/".to_string()],
+                delegation_policy: crate::autonomy::DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..Default::default()
+            },
+        );
+        if let Some(agent) = config.agents.get_mut("researcher") {
+            agent.workspace.unrestricted_filesystem = true;
+        }
+
+        let plan = plan_export(&config, "researcher", options()).unwrap();
+        let kinds: BTreeSet<&'static str> = plan
+            .risk_flags
+            .iter()
+            .map(|flag| flag.kind.as_wire())
+            .collect();
+        for expected in [
+            "full_autonomy",
+            "filesystem_escape",
+            "sandbox_disabled",
+            "approval_bypass",
+            "env_passthrough",
+            "extra_filesystem_roots",
+            "delegation_enabled",
+        ] {
+            assert!(kinds.contains(expected), "{kinds:?} missing {expected}");
+        }
+    }
+
+    #[test]
+    fn default_profile_raises_no_flags_beyond_transport() {
+        let plan = plan_export(&fixture(), "researcher", options()).unwrap();
+        let policy_flags: Vec<&str> = plan
+            .risk_flags
+            .iter()
+            .filter(|flag| flag.kind != RiskKind::ProcessSpawn)
+            .map(|flag| flag.kind.as_wire())
+            .collect();
+        assert!(policy_flags.is_empty(), "{policy_flags:?}");
+    }
+
+    #[test]
+    fn pinned_resources_are_flagged_as_untrusted_startup_context() {
+        let mut config = fixture();
+        if let Some(server) = config.mcp.servers.iter_mut().find(|s| s.name == "github") {
+            server.pinned_resources = vec!["repo://readme".to_string()];
+        }
+        let plan = plan_export(&config, "researcher", options()).unwrap();
+        assert!(
+            plan.risk_flags
+                .iter()
+                .any(|f| f.kind == RiskKind::UntrustedStartupContext)
+        );
+    }
+
+    #[test]
+    fn every_provider_reference_the_agent_names_is_carried() {
+        let mut config = fixture();
+        config.providers.tts.openai.insert(
+            "voice".to_string(),
+            crate::schema::OpenAITtsProviderConfig::default(),
+        );
+        if let Some(agent) = config.agents.get_mut("researcher") {
+            agent.tts_provider = "openai.voice".into();
+        }
+        let plan = plan_export(&config, "researcher", options()).unwrap();
+        assert!(
+            lookup(&plan.config, &["providers", "tts", "openai", "voice"]).is_some(),
+            "tts provider carried"
+        );
+        assert!(
+            lookup(&plan.config, &["providers", "models", "anthropic", "main"]).is_some(),
+            "model provider carried"
+        );
+    }
+
+    #[test]
+    fn rendered_bundle_round_trips_as_toml() {
+        let plan = plan_export(&fixture(), "researcher", options()).unwrap();
+        let config_text = render_config_toml(&plan).unwrap();
+        let parsed: toml::Table = config_text.parse().expect("config fragment re-parses");
+        assert!(parsed.contains_key("agents"));
+
+        let provenance = Provenance {
+            zeroclaw_version: "0.0.0-test".to_string(),
+            exported_at: "2026-08-12T00:00:00Z".to_string(),
+        };
+        let manifest_text = render_manifest_toml(&plan, &provenance).unwrap();
+        let manifest: toml::Table = manifest_text.parse().expect("manifest re-parses");
+        assert_eq!(
+            manifest.get("root_agent").and_then(toml::Value::as_str),
+            Some("researcher")
+        );
+        assert_eq!(
+            manifest
+                .get("format_version")
+                .and_then(toml::Value::as_integer),
+            Some(i64::from(BUNDLE_FORMAT_VERSION))
+        );
+    }
+
+    #[test]
+    fn closure_parses_back_into_a_config_that_names_the_agent() {
+        let plan = plan_export(&fixture(), "researcher", options()).unwrap();
+        let text = render_config_toml(&plan).unwrap();
+        let reparsed: Config = toml::from_str(&text).expect("closure deserializes as a Config");
+        let agent = reparsed.agents.get("researcher").expect("agent present");
+        assert_eq!(agent.model_provider.as_str(), "anthropic.main");
+        assert_eq!(agent.risk_profile.as_str(), "guarded");
+        assert!(agent.channels.is_empty(), "channels were dropped");
+        assert!(reparsed.risk_profiles.contains_key("guarded"));
+        assert!(reparsed.mcp_bundles.contains_key("research"));
+    }
+
+    #[test]
+    fn ciphertext_that_escapes_scrubbing_aborts_the_export() {
+        let mut root = toml::Value::Table(toml::Table::new());
+        if let toml::Value::Table(table) = &mut root {
+            let mut inner = toml::Table::new();
+            inner.insert(
+                "api_key".to_string(),
+                toml::Value::String("enc2:deadbeef".to_string()),
+            );
+            table.insert("providers".to_string(), toml::Value::Table(inner));
+        }
+        assert_eq!(find_ciphertext(&root).as_deref(), Some("providers.api_key"));
+    }
+
+    #[test]
+    fn bundle_aliases_are_deduplicated() {
+        assert_eq!(
+            dedup(&[
+                "a".to_string(),
+                " a ".to_string(),
+                String::new(),
+                "b".to_string()
+            ]),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+}

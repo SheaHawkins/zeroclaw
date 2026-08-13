@@ -1040,6 +1040,19 @@ cli-alias-owned-state-unavailable = note: config references were updated, but th
 cli-bundle-not-configured = skill bundle '{$alias}' is not configured
 cli-bundle-rename-failed = rename failed: {$error}
 
+# ── Agent bundle export — zeroclaw agents export ──
+cli-agent-export-dest-not-a-dir = destination {$path} exists and is not a directory
+cli-agent-export-dest-not-empty = destination {$path} is not empty — pass --force to write into it anyway
+cli-agent-export-written = exported agent `{$alias}` to {$path} ({$files} workspace file(s), {$kib} KiB)
+cli-agent-export-symlinks-skipped = {"  "}{$count} symlink(s) skipped — links are not followed into a bundle
+cli-agent-export-risk-header = ⚠️  {$count} capability grant(s) an importing operator must accept:
+cli-agent-export-risk-entry = {"  "}[{$kind}] {$path} — {$detail}
+cli-agent-export-secrets-header = 🔑 {$count} credential(s) were scrubbed and must be supplied on import:
+cli-agent-export-secrets-entry = {"  "}{$path}
+cli-agent-export-dropped-header = ℹ️  {$count} item(s) could not travel and were left behind:
+cli-agent-export-dropped-entry = {"  "}{$path} ({$reason}) — {$detail}
+cli-agent-export-review-hint = Review config.toml and zeroclaw-agent.toml before sharing the bundle.
+
 # ── Skill-bundle CLI — zeroclaw skills bundle {add,remove,rename} (#7468 / #7175) ──
 cli-bundle-exists = skill bundle '{$alias}' already exists (no change)
 cli-bundle-created = created skill_bundles.{$alias} (dir: {$dir})

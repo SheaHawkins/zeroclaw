@@ -352,6 +352,20 @@ pub enum AgentsCommands {
         /// New agent alias (lowercase alphanumeric + single underscore)
         alias: String,
     },
+    /// Export an agent and the config closure it needs to a portable bundle
+    Export {
+        /// Agent alias to export
+        alias: String,
+        /// Destination bundle directory (created if it does not exist)
+        #[arg(long, short)]
+        out: std::path::PathBuf,
+        /// Carry the agent's private memory store into the bundle
+        #[arg(long)]
+        include_memory: bool,
+        /// Write into a destination directory that already has contents
+        #[arg(long)]
+        force: bool,
+    },
     /// Rename an agent alias, rewriting every reference to it
     Rename {
         /// Current alias
