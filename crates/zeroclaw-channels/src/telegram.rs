@@ -653,18 +653,21 @@ enum UpdateOutcome {
 ///
 /// Classification is deliberately conservative: only a confidently permanent
 /// vendor rejection is `Permanent`. It requires structured evidence from the
-/// Bot API itself — `ok: false` *and* a terminal 4xx `error_code`. 5xx, 429,
-/// 408, transport errors, malformed bodies, body-less non-2xx responses, and
-/// anything unrecognised stay `Transient`, because retrying a recoverable
-/// failure is safe while skipping a recoverable one loses a message.
+/// Bot API itself — `ok: false` *and* an `error_code` on an explicit
+/// allowlist of terminal conditions this implementation can substantiate.
+/// Every other response — 5xx, 429, 408, state-dependent or unrecognised 4xx
+/// codes, transport errors, malformed bodies, body-less non-2xx responses —
+/// stays `Transient`, because retrying a recoverable failure is safe while
+/// skipping a recoverable one loses a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FileLookupFailure {
-    /// Retrying may succeed: 5xx, 429, 408, transport failure, malformed,
-    /// body-less, or otherwise unrecognised response.
+    /// Retrying may succeed: 5xx, 429, 408, any 4xx outside the terminal
+    /// allowlist, transport failure, malformed, body-less, or otherwise
+    /// unrecognised response.
     Transient,
-    /// Retrying can never succeed: an explicit `ok: false` carrying a 4xx
-    /// `error_code` other than the retryable 408/429 (invalid/expired file
-    /// id, file too big, forbidden). Safe to acknowledge and move past.
+    /// Retrying can never succeed: an explicit `ok: false` carrying an
+    /// `error_code` on the terminal allowlist (invalid/expired file id, file
+    /// too big, forbidden). Safe to acknowledge and move past.
     Permanent,
 }
 
@@ -706,6 +709,11 @@ impl FileLookupError {
     /// `status` is the HTTP status; `body` is the parsed JSON envelope when
     /// one could be parsed. Telegram returns errors both as non-2xx statuses
     /// and as `200 OK` with `ok: false`, so both shapes are inspected.
+    ///
+    /// Only `error_code` values on an explicit allowlist of substantiated
+    /// terminal conditions are `Permanent`; every other structured code is
+    /// left `Transient` so an uncommon or future recoverable rejection can
+    /// never silently consume the update.
     pub(crate) fn classify(status: reqwest::StatusCode, body: Option<&serde_json::Value>) -> Self {
         let ok_flag = body
             .and_then(|b| b.get("ok"))
@@ -729,23 +737,36 @@ impl FileLookupError {
             description.unwrap_or("no description"),
         );
 
-        // Codes that are 4xx but explicitly retryable. 429 is a rate limit.
-        // 408 Request Timeout is retryable by RFC 9110 §15.5.9, and is a
-        // status an intermediary may produce on its own.
-        const RETRYABLE_4XX: [i64; 2] = [408, 429];
+        // The only `error_code` values this implementation can substantiate
+        // as terminal for `getFile`:
+        //
+        // * 400 Bad Request — invalid, expired, or malformed `file_id`, and
+        //   "file is too big". The same `file_id` can never resolve later.
+        // * 403 Forbidden — the bot lost access to the file's chat. Retrying
+        //   the lookup with the same credentials cannot regain it.
+        //
+        // Everything else stays transient *by construction*. A 4xx status
+        // does not prove permanence: HTTP defines state-dependent and
+        // explicitly retryable 4xx conditions (409 Conflict, 425 Too Early),
+        // Telegram documents `error_code` contents as subject to change, and
+        // a future or uncommon code could well be recoverable. Codes that are
+        // global rather than per-update — 401 (bad token), 404 (unknown
+        // method) — are also left transient: they resolve when an operator
+        // fixes the deployment, and acknowledging updates in the meantime
+        // would discard them permanently.
+        const TERMINAL_ERROR_CODES: [i64; 2] = [400, 403];
 
         // Permanence requires *structured vendor evidence* of a terminal
         // rejection: Telegram must both mark the call failed (`ok: false`)
-        // and name the reason (`error_code`). A bare HTTP status is not
+        // and name a reason on the allowlist above. A bare HTTP status is not
         // enough — a body-less or malformed 4xx can come from an
-        // intermediary rather than the Bot API, and the API documents
-        // `error_code` contents as subject to change. Guessing permanence
-        // there would acknowledge and discard the update this path exists
-        // to preserve, so anything unrecognised stays transient and is
-        // retried instead.
+        // intermediary rather than the Bot API. Guessing permanence there
+        // would acknowledge and discard the update this path exists to
+        // preserve, so anything unrecognised stays transient and is retried
+        // instead.
         let terminal_rejection = ok_flag == Some(false)
             && error_code
-                .map(|c| (400..500).contains(&c) && !RETRYABLE_4XX.contains(&c))
+                .map(|c| TERMINAL_ERROR_CODES.contains(&c))
                 .unwrap_or(false);
 
         if terminal_rejection {
@@ -8154,6 +8175,44 @@ mod tests {
             FileLookupFailure::Transient,
             "ok:false without an error_code must stay transient"
         );
+
+        // State-dependent 4xx codes are recoverable by definition: the same
+        // request can succeed once the conflicting state clears (409) or the
+        // early request is replayed (425). Acknowledging them would discard
+        // an update whose download could still succeed.
+        for (code, description) in [
+            (409, "Conflict: terminated by other getUpdates request"),
+            (425, "Too Early: retry the request"),
+        ] {
+            let state_dependent = serde_json::json!({
+                "ok": false,
+                "error_code": code,
+                "description": description,
+            });
+            assert_eq!(
+                FileLookupError::classify(StatusCode::OK, Some(&state_dependent)).kind,
+                FileLookupFailure::Transient,
+                "a state-dependent {code} must stay retryable"
+            );
+        }
+
+        // Codes outside the substantiated terminal allowlist — including
+        // deployment-wide failures and codes Telegram may introduce later —
+        // stay transient. The Bot API documents `error_code` contents as
+        // subject to change, so an unrecognised structured code is not proof
+        // that the lookup can never succeed.
+        for code in [401, 402, 404, 405, 410, 418, 422, 451, 499] {
+            let unrecognised = serde_json::json!({
+                "ok": false,
+                "error_code": code,
+                "description": "Unrecognised structured rejection",
+            });
+            assert_eq!(
+                FileLookupError::classify(StatusCode::OK, Some(&unrecognised)).kind,
+                FileLookupFailure::Transient,
+                "an unrecognised structured {code} must stay retryable"
+            );
+        }
     }
 
     /// End-to-end proof of the liveness property: an update whose file id
