@@ -7,6 +7,7 @@ import { getToken } from '@/lib/auth';
 import { formatRelative } from '@/lib/format';
 import { t } from '@/lib/i18n';
 import { Badge, Card, PageHeader } from '@/components/ui';
+import { confirmsCancellation, runsStreamEffect } from './runs.logic';
 
 type RunsFrame =
   | { type: 'snapshot'; runs: SopRunSummary[] }
@@ -61,20 +62,44 @@ export default function Runs() {
         } catch {
           return;
         }
-        if (frame.type === 'snapshot') {
+        const effect = runsStreamEffect(frame.type);
+        if (effect === 'replace' && frame.type === 'snapshot') {
           const next = new Map<string, SopRunSummary>();
           for (const r of frame.runs) next.set(r.run_id, r);
           setRuns(next);
+          setCancelErrors((prev) => {
+            const nextErrors = new Map(prev);
+            for (const run of frame.runs) {
+              if (confirmsCancellation(run.status, isTerminalRunStatus(run.status))) {
+                nextErrors.delete(run.run_id);
+              }
+            }
+            return nextErrors;
+          });
           setReady(true);
-        } else if (frame.type === 'run') {
+        } else if (effect === 'upsert' && frame.type === 'run') {
           setRuns((prev) => {
             const next = new Map(prev);
             next.set(frame.run.run_id, frame.run);
             return next;
           });
-        } else if (frame.type === 'disabled') {
+          if (
+            confirmsCancellation(frame.run.status, isTerminalRunStatus(frame.run.status))
+          ) {
+            setCancelErrors((prev) => {
+              const next = new Map(prev);
+              next.delete(frame.run.run_id);
+              return next;
+            });
+          }
+        } else if (effect === 'disable') {
           setDisabled(true);
           setReady(true);
+        } else if (effect === 'resync') {
+          // The missed frame may be the only terminal transition for a row.
+          // Reconnect so the server sends a fresh authoritative snapshot.
+          setReady(false);
+          ws.close();
         }
       };
     };

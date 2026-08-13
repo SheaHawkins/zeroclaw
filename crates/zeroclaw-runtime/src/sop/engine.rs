@@ -95,6 +95,11 @@ pub struct SopEngine {
     /// one whose driver exited at a safe boundary, so maintenance may retry a
     /// failed terminal write without cancelling work mid-step.
     cancellation_finalization_ready: std::collections::HashSet<String>,
+    /// Process-local proof that a headless driver exhausted its bounded action
+    /// budget and exited. The durable run remains `Running` with its claim held
+    /// until maintenance can persist the terminal `Failed` transition. This set
+    /// creates the safe-boundary fact; it does not duplicate durable run state.
+    step_budget_finalization_ready: std::collections::HashSet<String>,
 }
 
 /// Cap on the in-memory per-message dispatch-dedup window (`SopEngine::dispatch_dedup`).
@@ -121,6 +126,8 @@ pub struct MaintenanceSummary {
     /// Requested cancellations terminalized after an earlier boundary write
     /// failed and the store recovered.
     pub finalized_cancellations: usize,
+    /// Step-budget failures terminalized after an earlier store failure.
+    pub finalized_step_budget_failures: usize,
     /// Timeout actions produced. Mostly self-applied (`Escalate` re-stamps,
     /// `Cancel` finalizes); an opt-in `AutoApprove` yields a resumed `ExecuteStep`
     /// the caller logs until EPIC A2's live executor exists.
@@ -134,6 +141,7 @@ impl MaintenanceSummary {
             && self.reaped_claims == 0
             && self.pruned_runs == 0
             && self.finalized_cancellations == 0
+            && self.finalized_step_budget_failures == 0
     }
 }
 
@@ -328,6 +336,7 @@ impl SopEngine {
             dispatch_dedup: std::collections::VecDeque::new(),
             claims_retained_after_terminal_rollback: std::collections::HashSet::new(),
             cancellation_finalization_ready: std::collections::HashSet::new(),
+            step_budget_finalization_ready: std::collections::HashSet::new(),
         }
     }
 
@@ -4093,11 +4102,17 @@ impl SopEngine {
     /// The engine owns the durable terminal transition so the active run and
     /// its concurrency claim are released together.
     pub(crate) fn fail_headless_step_budget(&mut self, run_id: &str) -> Result<SopRunAction> {
-        self.finish_run(
+        self.step_budget_finalization_ready
+            .insert(run_id.to_string());
+        let result = self.finish_run(
             run_id,
             SopRunStatus::Failed,
             Some("SOP headless driver step budget exhausted".to_string()),
-        )
+        );
+        if result.is_ok() {
+            self.step_budget_finalization_ready.remove(run_id);
+        }
+        result
     }
 
     /// Advance a deterministic run with the output of the current step.
@@ -5064,6 +5079,7 @@ impl SopEngine {
         let timeout_actions = self.check_approval_timeouts();
         self.retry_pending_park_persists();
         self.retry_capacity_blocked_gated_pends();
+        let finalized_step_budget_failures = self.retry_ready_step_budget_finalizations();
         let finalized_cancellations = self.retry_ready_cancellation_finalizations();
         self.heartbeat_active_claims();
         let reaped_claims = self.reap_expired_claims();
@@ -5073,8 +5089,51 @@ impl SopEngine {
             reaped_claims,
             pruned_runs,
             finalized_cancellations,
+            finalized_step_budget_failures,
             timeout_actions,
         }
+    }
+
+    fn retry_ready_step_budget_finalizations(&mut self) -> usize {
+        let ready: Vec<String> = self
+            .step_budget_finalization_ready
+            .iter()
+            .cloned()
+            .collect();
+        let mut finalized = 0;
+        for run_id in ready {
+            match self.active_runs.get(&run_id).map(|run| run.status) {
+                Some(SopRunStatus::Running) => match self.fail_headless_step_budget(&run_id) {
+                    Ok(_) => finalized += 1,
+                    Err(error) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "error": error.to_string(),
+                            })),
+                            "SOP maintenance: step-budget finalization retry failed"
+                        );
+                    }
+                },
+                Some(SopRunStatus::CancelRequested) => {
+                    // A durable operator request supersedes the pending failure.
+                    // The same driver-exited proof now makes cancellation safe
+                    // to finalize during this maintenance pass.
+                    self.step_budget_finalization_ready.remove(&run_id);
+                    self.cancellation_finalization_ready.insert(run_id);
+                }
+                Some(_) | None => {
+                    self.step_budget_finalization_ready.remove(&run_id);
+                }
+            }
+        }
+        finalized
     }
 
     fn retry_ready_cancellation_finalizations(&mut self) -> usize {
@@ -5245,6 +5304,7 @@ impl SopEngine {
         self.claims_pending_persist.remove(run_id);
         self.claims_retained_after_terminal_rollback.remove(run_id);
         self.cancellation_finalization_ready.remove(run_id);
+        self.step_budget_finalization_ready.remove(run_id);
         self.active_runs.remove(run_id);
         self.metrics.record_run_complete(&run);
         // The park snapshot is purely a rehydration artifact: a terminal run must
@@ -5296,6 +5356,8 @@ impl SopEngine {
         self.persist_terminal_with_gate_event(&run, event)?;
         self.claims_pending_persist.remove(run_id);
         self.claims_retained_after_terminal_rollback.remove(run_id);
+        self.cancellation_finalization_ready.remove(run_id);
+        self.step_budget_finalization_ready.remove(run_id);
         self.active_runs.remove(run_id);
         self.metrics.record_run_complete(&run);
         self.remove_deterministic_state_file(&run);
@@ -7825,6 +7887,51 @@ mod tests {
             (0, 0),
             "eventual finalization must release the retained admission claim"
         );
+    }
+
+    #[test]
+    fn step_budget_terminal_persist_failure_retries_in_maintenance() {
+        let store = std::sync::Arc::new(FailingAppendStore {
+            inner: InMemoryRunStore::new(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            fail_save: std::sync::atomic::AtomicBool::new(false),
+            fail_finish: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Deterministic,
+            SopPriority::Normal,
+        )])
+        .with_store(store.clone());
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        store
+            .fail_finish
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = engine
+            .fail_headless_step_budget(&run_id)
+            .expect_err("the exhausted driver must retain a failed terminal write");
+        assert!(err_is_terminal_persistence_retained(&error));
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::Running,
+            "the durable active state remains authoritative until terminal persistence succeeds"
+        );
+        assert_eq!(store.claim_counts("s1").unwrap(), (1, 1));
+
+        store
+            .fail_finish
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let summary = engine.run_maintenance_tick();
+        assert_eq!(summary.finalized_step_budget_failures, 1);
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::Failed
+        );
+        assert!(!engine.active_runs().contains_key(&run_id));
+        assert_eq!(store.claim_counts("s1").unwrap(), (0, 0));
+        assert!(engine.run_maintenance_tick().is_empty());
     }
 
     #[test]

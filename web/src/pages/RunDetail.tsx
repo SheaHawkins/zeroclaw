@@ -37,6 +37,15 @@ export default function RunDetail() {
   const { overlay, error: overlayError, setOverlay } = useRunOverlay(sop, runId);
 
   useEffect(() => {
+    if (
+      overlay &&
+      (overlay.status === 'cancel_requested' || isTerminalRunStatus(overlay.status))
+    ) {
+      setCancelError(null);
+    }
+  }, [overlay]);
+
+  useEffect(() => {
     if (!sop) return;
     let active = true;
     Promise.all([getSopGraph(sop), getSop(sop)])
