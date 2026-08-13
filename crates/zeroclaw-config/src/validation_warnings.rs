@@ -26,8 +26,6 @@ use serde::{Deserialize, Serialize};
 /// - `security_audit_enabled_has_no_effect`: `security.audit.enabled` is set
 ///   to `true`, but command audit logging has no production writer yet, so
 ///   the setting currently has no effect.
-/// - `skills_prompt_injection_mode_full_deprecated`: explicit global full skill
-///   injection remains supported but is deprecated before Schema V4.
 /// - `peer_group_channel_dangling`: a `peer_groups.<name>.channel` dotted
 ///   alias (`<type>.<alias>`) does not resolve to any configured
 ///   `[channels.<type>.<alias>]` block — typically a typo that silently

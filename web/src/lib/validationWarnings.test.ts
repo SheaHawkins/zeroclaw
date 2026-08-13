@@ -13,15 +13,6 @@ async function loadValidationWarningMessage() {
 
 test('known config warnings resolve through the dashboard catalog', async () => {
   const validationWarningMessage = await loadValidationWarningMessage();
-  const deprecationMessage = validationWarningMessage({
-    code: 'skills_prompt_injection_mode_full_deprecated',
-    message: 'unlocalized fallback',
-    path: 'skills.prompt_injection_mode',
-  });
-
-  assert.match(deprecationMessage, /full.*deprecated/i);
-  assert.doesNotMatch(deprecationMessage, /unlocalized fallback/);
-
   const auditMessage = validationWarningMessage({
     code: 'security_audit_enabled_has_no_effect',
     message: 'unlocalized audit fallback',
