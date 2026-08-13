@@ -2574,6 +2574,18 @@ impl Channel for WeChatChannel {
                 /// An authorized message, fully prepared and ready to
                 /// publish downstream.
                 Deliver(Box<ChannelMessage>),
+                /// A fully prepared message that follows a syntactically
+                /// valid `/bind` from the same sender in this batch. The
+                /// bind has deliberately not run yet: preparation must
+                /// finish for the whole batch before any pairing or reply
+                /// side effect occurs. At publish time authorization is
+                /// resolved again from the canonical Config-backed peer
+                /// resolver, after the earlier staged bind has had a chance
+                /// to persist it.
+                DeliverIfAuthorized {
+                    message: Box<ChannelMessage>,
+                    unauthorized_text: String,
+                },
                 /// A message from an unauthorized sender. Handling it has
                 /// side effects (pairing attempts, outbound replies), so
                 /// it is deferred the same way as delivery: a held batch
@@ -2597,6 +2609,13 @@ impl Channel for WeChatChannel {
                 Unauthorized { from_user_id: String, text: String },
             }
             let mut staged: Vec<StagedInbound> = Vec::new();
+            // Ephemeral materialized view of possible authorization
+            // transitions inside this one batch. It is not authorization
+            // state: the publish phase always re-resolves the canonical
+            // Config-backed peer list before delivery. Its sole purpose is
+            // to make us fully prepare later messages (including CDN
+            // attachments) before executing a preceding `/bind`.
+            let mut staged_bind_senders = std::collections::HashSet::new();
 
             for msg in &msgs {
                 let from_user_id = msg
@@ -2628,10 +2647,17 @@ impl Channel for WeChatChannel {
 
                 let text = extract_text_from_items(&items);
 
-                // Check authorization. The unauthorized handler sends
-                // replies (side effects), so it is staged like a delivery
-                // rather than run mid-preparation — see `StagedInbound`.
-                if !self.is_user_allowed(from_user_id) {
+                // Resolve current authorization from the canonical peer
+                // configuration. A prior `/bind` from this sender in the
+                // same batch is only a possible transition: prepare this
+                // message now, but re-check the canonical source at publish
+                // time after that bind actually runs.
+                let currently_authorized = self.is_user_allowed(from_user_id);
+                let may_be_authorized_by_staged_bind = staged_bind_senders.contains(from_user_id);
+                if !currently_authorized && !may_be_authorized_by_staged_bind {
+                    if Self::extract_bind_code(&text).is_some() {
+                        staged_bind_senders.insert(from_user_id.to_string());
+                    }
                     staged.push(StagedInbound::Unauthorized {
                         from_user_id: from_user_id.to_string(),
                         text,
@@ -2658,6 +2684,7 @@ impl Channel for WeChatChannel {
                             break;
                         }
                     };
+                let unauthorized_text = (!currently_authorized).then(|| text.clone());
                 let content = match (attachment_content, text.is_empty()) {
                     (Some(marker), true) => marker,
                     (Some(marker), false) => format!("{marker}\n\n{text}"),
@@ -2687,7 +2714,14 @@ impl Channel for WeChatChannel {
                     ..Default::default()
                 };
 
-                staged.push(StagedInbound::Deliver(Box::new(channel_msg)));
+                if let Some(unauthorized_text) = unauthorized_text {
+                    staged.push(StagedInbound::DeliverIfAuthorized {
+                        message: Box::new(channel_msg),
+                        unauthorized_text,
+                    });
+                } else {
+                    staged.push(StagedInbound::Deliver(Box::new(channel_msg)));
+                }
             }
 
             // Publish only after the WHOLE batch prepared cleanly. A
@@ -2713,6 +2747,37 @@ impl Channel for WeChatChannel {
                                 // restart `listen()` reloads it and re-polls this
                                 // batch.
                                 return Ok(());
+                            }
+                        }
+                        StagedInbound::DeliverIfAuthorized {
+                            message,
+                            unauthorized_text,
+                        } => {
+                            if self.is_user_allowed(&message.sender) {
+                                if tx.send(*message).await.is_err() {
+                                    ::zeroclaw_log::record!(
+                                        INFO,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        ),
+                                        "channel receiver dropped, stopping"
+                                    );
+                                    // As for `Deliver`, retain the old cursor
+                                    // when this batch was not fully enqueued.
+                                    return Ok(());
+                                }
+                            } else {
+                                // The preceding bind was invalid or could
+                                // not make this sender canonical. Fail
+                                // closed through the ordinary unauthorized
+                                // handler rather than delivering based on
+                                // the staging hint.
+                                self.handle_unauthorized_message(
+                                    &message.sender,
+                                    &unauthorized_text,
+                                )
+                                .await;
                             }
                         }
                         StagedInbound::Unauthorized { from_user_id, text } => {
@@ -3780,6 +3845,280 @@ mod tests {
         let mut ch = wechat_channel_for_mock(state_dir, mock_base_url.clone());
         ch.cdn_base_url = mock_base_url;
         ch.with_workspace_dir(workspace_dir)
+    }
+
+    /// Build the production pairing shape: the resolver and persistence
+    /// writer share one canonical Config handle, initially with no peers.
+    /// The returned code is the one-time `/bind` code generated by
+    /// `WeChatChannel::new` for that empty allowlist.
+    fn pairing_wechat_channel_for_mock(
+        root: &Path,
+        mock_base_url: String,
+    ) -> (WeChatChannel, Arc<parking_lot::RwLock<Config>>, String) {
+        let alias = "wechat_test_alias";
+        let mut config = Config {
+            config_path: root.join("config.toml"),
+            data_dir: root.join("data"),
+            ..Default::default()
+        };
+        config.channels.wechat.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::WeChatConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let config = Arc::new(parking_lot::RwLock::new(config));
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let config = config.clone();
+            let alias = alias.to_string();
+            Arc::new(move || config.read().channel_external_peers("wechat", &alias))
+        };
+
+        let mut channel =
+            WeChatChannel::new(alias, peer_resolver, None, None, Some(root.join("state")))
+                .unwrap()
+                .with_persistence(config.clone())
+                .with_workspace_dir(root.join("workspace"));
+        let pairing_code = channel
+            .pairing
+            .as_ref()
+            .and_then(PairingGuard::pairing_code)
+            .expect("empty canonical peer list must generate a pairing code");
+        channel.api_base_url = mock_base_url.clone();
+        channel.cdn_base_url = mock_base_url;
+        *channel.bot_token.write().unwrap() = Some("test-token".to_string());
+        (channel, config, pairing_code)
+    }
+
+    /// A `/bind` changes authorization for the messages after it in the
+    /// same server batch. Staging must not freeze the pre-bind decision:
+    /// once the bind is persisted, the following message is delivered in
+    /// order before the cursor commits.
+    #[tokio::test]
+    async fn listen_applies_bind_before_following_same_sender_message() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("workspace")).unwrap();
+        let mock_server = MockServer::start().await;
+        let (channel, config, pairing_code) =
+            pairing_wechat_channel_for_mock(temp.path(), mock_server.uri());
+
+        let batch = getupdates_batch(
+            "cursor_after_batch",
+            serde_json::json!([
+                {
+                    "from_user_id": "new_user",
+                    "message_id": 1,
+                    "create_time_ms": 1_700_000_000_000u64,
+                    "item_list": [{
+                        "type": 1,
+                        "text_item": {"text": format!("/bind {pairing_code}")}
+                    }]
+                },
+                {
+                    "from_user_id": "new_user",
+                    "message_id": 2,
+                    "create_time_ms": 1_700_000_001_000u64,
+                    "item_list": [{
+                        "type": 1,
+                        "text_item": {"text": "hello after bind"}
+                    }]
+                }
+            ]),
+        );
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "original_cursor"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(batch))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "cursor_after_batch"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([]),
+            )))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ret": 0})))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        *channel.cursor.lock() = "original_cursor".to_string();
+        channel.save_sync_data();
+        let channel = Arc::new(channel);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let listen_channel = channel.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_channel.listen(tx).await });
+
+        let delivered = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("timed out waiting for the post-bind message")
+            .expect("listener closed before the post-bind message");
+        assert_eq!(delivered.sender, "new_user");
+        assert_eq!(delivered.content, "hello after bind");
+        assert_eq!(
+            config
+                .read()
+                .channel_external_peers("wechat", "wechat_test_alias"),
+            vec!["new_user".to_string()],
+            "bind must update the canonical peer source before delivery"
+        );
+
+        let duplicate = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(duplicate.is_err(), "post-bind message must deliver once");
+        assert_eq!(*channel.cursor.lock(), "cursor_after_batch");
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    /// A later retryable attachment failure keeps the entire batch
+    /// side-effect-free. The `/bind` must not consume its one-time code or
+    /// send a success reply until a replay can prepare the attachment; on
+    /// recovery the bind and message each happen exactly once.
+    #[tokio::test]
+    async fn listen_defers_bind_until_following_attachment_recovers() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("workspace")).unwrap();
+        let mock_server = MockServer::start().await;
+        let (channel, config, pairing_code) =
+            pairing_wechat_channel_for_mock(temp.path(), mock_server.uri());
+
+        let batch = getupdates_batch(
+            "cursor_after_batch",
+            serde_json::json!([
+                {
+                    "from_user_id": "new_user",
+                    "message_id": 1,
+                    "create_time_ms": 1_700_000_000_000u64,
+                    "item_list": [{
+                        "type": 1,
+                        "text_item": {"text": format!("/bind {pairing_code}")}
+                    }]
+                },
+                {
+                    "from_user_id": "new_user",
+                    "message_id": 2,
+                    "create_time_ms": 1_700_000_001_000u64,
+                    "item_list": [
+                        {"type": 1, "text_item": {"text": "caption after bind"}},
+                        {
+                            "type": 2,
+                            "image_item": {
+                                "media": {"encrypt_query_param": "enc_param_1"}
+                            }
+                        }
+                    ]
+                }
+            ]),
+        );
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "original_cursor"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(batch))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "cursor_after_batch"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([]),
+            )))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-image-bytes".to_vec()))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ret": 0})))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        *channel.cursor.lock() = "original_cursor".to_string();
+        channel.save_sync_data();
+        let channel = Arc::new(channel);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let listen_channel = channel.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_channel.listen(tx).await });
+
+        let held = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await;
+        assert!(held.is_err(), "held batch must publish no message");
+        assert!(
+            config
+                .read()
+                .channel_external_peers("wechat", "wechat_test_alias")
+                .is_empty(),
+            "held batch must not execute the staged bind"
+        );
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/ilink/bot/sendmessage")
+                .count(),
+            0,
+            "held batch must not send a premature pairing reply"
+        );
+
+        let delivered = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+            .await
+            .expect("timed out waiting for attachment recovery")
+            .expect("listener closed before attachment recovery");
+        assert_eq!(delivered.sender, "new_user");
+        assert!(delivered.content.contains("[IMAGE:"), "{delivered:?}");
+        assert!(delivered.content.contains("caption after bind"));
+        assert_eq!(
+            config
+                .read()
+                .channel_external_peers("wechat", "wechat_test_alias"),
+            vec!["new_user".to_string()]
+        );
+
+        let duplicate = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(duplicate.is_err(), "recovered message must deliver once");
+        assert_eq!(*channel.cursor.lock(), "cursor_after_batch");
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/ilink/bot/sendmessage")
+                .count(),
+            1,
+            "replayed bind must reply exactly once"
+        );
+
+        handle.abort();
+        let _ = handle.await;
     }
 
     /// Regression test for lost inbound batches: if the very first
