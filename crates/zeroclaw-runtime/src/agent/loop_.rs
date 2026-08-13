@@ -1069,6 +1069,17 @@ pub struct AgentRunOverrides {
     pub mcp_registry: Option<Arc<crate::tools::McpRegistry>>,
 }
 
+tokio::task_local! {
+    static AGENT_RUN_CANCELLATION: CancellationToken;
+}
+
+pub(crate) async fn scope_run_cancellation<F>(token: CancellationToken, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    AGENT_RUN_CANCELLATION.scope(token, future).await
+}
+
 fn agent_provider_composite(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
@@ -1184,6 +1195,7 @@ pub async fn run(
     );
     let __zc_body = async move {
         let agent_alias: &str = __zc_alias.as_str();
+        let run_cancellation = AGENT_RUN_CANCELLATION.try_with(Clone::clone).ok();
         // ── Effective per-agent runtime tunables ──────────────────────
         // Profile values (when set) override the agent's inline fields.
         // See `Config::resolved_agent_config` for precedence rules.
@@ -1242,6 +1254,17 @@ pub async fn run(
                 }
             }
         };
+        if run_cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            // A caller supervising this run owns the terminal timeout
+            // classification. Yield so its biased cancellation branch can
+            // drop this future before the error is mistaken for an ordinary
+            // retryable agent failure.
+            tokio::task::yield_now().await;
+            return Err(anyhow::Error::new(crate::agent::turn::ToolLoopCancelled));
+        }
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
@@ -1914,7 +1937,7 @@ pub async fn run(
                                 history: &mut history,
                                 channel_name,
                                 channel_reply_target: None,
-                                cancellation_token: None,
+                                cancellation_token: run_cancellation.clone(),
                                 on_delta: None,
                                 shared_budget: None,
                                 channel: None,
@@ -2106,7 +2129,7 @@ pub async fn run(
                             &config.pacing,
                             agent.resolved.max_tool_result_chars,
                             agent.resolved.max_context_tokens,
-                            None, // cancellation_token — no parent token in single-shot run
+                            run_cancellation.as_ref(),
                             Some(agent_alias),
                         ),
                     )
