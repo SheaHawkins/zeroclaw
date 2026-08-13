@@ -21972,6 +21972,26 @@ async fn write_config_atomically_with_sync(
                 backup_path.display()
             )
         })?;
+        // The post-rename uncertainty path retains this copy as recovery
+        // material, so make that promise durable before the replacement can
+        // become visible. `copy` alone only establishes an immediately
+        // readable file; syncing both its contents and the parent directory
+        // pins the backup data and directory entry across a crash. Any failure
+        // here is still pre-commit and therefore returns with `config.toml`
+        // unchanged.
+        let backup_file = File::open(&backup_path).await.with_context(|| {
+            format!(
+                "Failed to open config backup for fsync: {}",
+                backup_path.display()
+            )
+        })?;
+        backup_file
+            .sync_all()
+            .await
+            .with_context(|| format!("Failed to fsync config backup: {}", backup_path.display()))?;
+        sync_directory(parent_dir)
+            .await
+            .context("Failed to fsync config backup directory entry before atomic replace")?;
     }
 
     if let Err(e) = fs::rename(&temp_path, config_path).await {
@@ -22482,15 +22502,19 @@ fn apply_dirty_map_key_path(
         // Same dash-aware segment resolution `apply_dirty_natural_key_path`
         // uses for its inner suffix, rooted at the matched key's own
         // serialized table so kebab inner segments (`tool-timeout-secs`)
-        // resolve to the snake struct field on disk.
+        // resolve to the snake struct field on disk. Consult the matching
+        // on-disk table too: when a dotted dynamic-map key is being deleted,
+        // it is absent from memory by definition but still needs to resolve
+        // as one opaque segment in the document.
         let key_table = mem_table
             .and_then(|t| t.get(key))
             .and_then(|v| v.as_table());
+        let doc_key_table = doc_table
+            .and_then(|t| t.get(key))
+            .and_then(|item| item.as_table_like());
         let inner_raw: Vec<&str> = inner.split('.').collect();
-        let inner_segments: Vec<String> = match key_table {
-            Some(t) => resolve_dirty_segments(t, &inner_raw),
-            None => inner_raw.iter().map(|s| (*s).to_string()).collect(),
-        };
+        let inner_segments =
+            resolve_dirty_segments_from_sources(key_table, doc_key_table, &inner_raw);
         segments.extend(inner_segments);
     }
 
@@ -22805,28 +22829,61 @@ fn prune_empty_leaves(value: &mut toml::Value) {
 }
 
 fn resolve_dirty_segments(root: &toml::Table, raw: &[&str]) -> Vec<String> {
+    resolve_dirty_segments_from_sources(Some(root), None, raw)
+}
+
+/// Resolve a dotted dirty-path suffix against the canonical serialized
+/// in-memory table and, when supplied, its on-disk counterpart.
+///
+/// Struct fields consume one segment (with the existing kebab-to-snake
+/// fallback). Map keys are different: the serialized table owns their exact
+/// spelling, and a key may itself contain dots. Longest-match the remaining
+/// suffix against keys present in either source so `X-Foo.bar` remains one
+/// segment for both writes (present in memory) and deletes (present only on
+/// disk). No parallel key registry is introduced; both views are derived from
+/// the two states `save_dirty` is already reconciling.
+fn resolve_dirty_segments_from_sources(
+    mut memory_table: Option<&toml::Table>,
+    mut document_table: Option<&dyn toml_edit::TableLike>,
+    raw: &[&str],
+) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(raw.len());
-    let mut current: Option<&toml::Value> = None;
-    for seg in raw {
-        let table_opt: Option<&toml::Table> = if out.is_empty() {
-            Some(root)
-        } else {
-            current.and_then(|v| v.as_table())
-        };
-        let resolved = match table_opt {
-            Some(t) if t.contains_key(*seg) => (*seg).to_string(),
-            Some(t) => {
-                let snake = seg.replace('-', "_");
-                if t.contains_key(&snake) {
+    let mut index = 0;
+    while index < raw.len() {
+        // Prefer the longest exact key from the remaining suffix. This is
+        // load-bearing for opaque HashMap keys containing dots; an ordinary
+        // struct table has no such key, so it naturally falls through to the
+        // one-segment field lookup below.
+        let exact = (index + 1..=raw.len()).rev().find_map(|end| {
+            let candidate = raw[index..end].join(".");
+            let exists_in_memory = memory_table.is_some_and(|t| t.contains_key(&candidate));
+            let exists_on_disk = document_table.is_some_and(|t| t.contains_key(&candidate));
+            (exists_in_memory || exists_on_disk).then_some((candidate, end - index))
+        });
+
+        let (resolved, consumed) = exact.unwrap_or_else(|| {
+            let segment = raw[index];
+            let snake = segment.replace('-', "_");
+            let snake_exists = memory_table.is_some_and(|t| t.contains_key(&snake))
+                || document_table.is_some_and(|t| t.contains_key(&snake));
+            (
+                if snake_exists {
                     snake
                 } else {
-                    (*seg).to_string()
-                }
-            }
-            None => (*seg).to_string(),
-        };
-        current = table_opt.and_then(|t| t.get(&resolved));
+                    segment.to_string()
+                },
+                1,
+            )
+        });
+
+        memory_table = memory_table
+            .and_then(|t| t.get(&resolved))
+            .and_then(|v| v.as_table());
+        document_table = document_table
+            .and_then(|t| t.get(&resolved))
+            .and_then(|item| item.as_table_like());
         out.push(resolved);
+        index += consumed;
     }
     out
 }
@@ -31333,6 +31390,121 @@ group_policy = "disabled"
         assert!(
             msg.contains("cost.rates.providers.models.openai.ghost-model.input_per_mtok"),
             "error must name the offending dirty path; got: {msg}"
+        );
+    }
+
+    /// A dynamic secret map (`#[secret] HashMap<String, String>`, e.g.
+    /// `extra_headers`) treats its whole non-empty suffix as ONE opaque
+    /// key — `set_prop` stores the literal `"X-Foo.bar"`. The dirty
+    /// writer must not re-split that key at dots into `X-Foo` → `bar`,
+    /// or `write_or_delete_leaf` finds nothing, takes the delete branch,
+    /// and `save_dirty` returns `Ok(())` having written nothing: the
+    /// operator sees success and the value is gone at next reload.
+    #[test]
+    async fn save_dirty_writes_dotted_dynamic_secret_map_key_as_one_segment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [providers.models.openai.fresh]\n\
+             model = \"gpt-4o\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.secrets.encrypt = false;
+        config
+            .create_map_key("providers.models.openai", "fresh")
+            .expect("seed the alias");
+
+        let path = "providers.models.openai.fresh.extra_headers.X-Foo.bar";
+        config
+            .set_prop_persistent(path, "header-value")
+            .expect("a dotted dynamic secret-map key must be insertable");
+        assert_eq!(
+            config
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .and_then(|p| p.base.extra_headers.get("X-Foo.bar"))
+                .map(String::as_str),
+            Some("header-value"),
+            "precondition: set_prop stores ONE literal HashMap key"
+        );
+
+        config.save_dirty().await.expect("save_dirty must succeed");
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded: Config = toml::from_str(&written)
+            .unwrap_or_else(|e| panic!("rewritten config must reparse: {e}\n---\n{written}"));
+        assert_eq!(
+            reloaded
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .and_then(|p| p.base.extra_headers.get("X-Foo.bar"))
+                .map(String::as_str),
+            Some("header-value"),
+            "a dotted dynamic secret-map key must round-trip through disk as the \
+             literal key `set_prop` stored, not be split at dots and dropped; got:\n{written}"
+        );
+    }
+
+    /// Unset half of the same contract: clearing a dotted dynamic
+    /// secret-map key must remove the literal on-disk entry rather than
+    /// hunting for a nested `bar` table that never existed.
+    #[test]
+    async fn save_dirty_removes_dotted_dynamic_secret_map_key_as_one_segment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [providers.models.openai.fresh]\n\
+             model = \"gpt-4o\"\n\n\
+             [providers.models.openai.fresh.extra_headers]\n\
+             \"X-Foo.bar\" = \"header-value\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config: Config = toml::from_str(&seed).unwrap();
+        config.config_path = config_path.clone();
+        config.secrets.encrypt = false;
+        assert!(
+            config
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .is_some_and(|p| p.base.extra_headers.contains_key("X-Foo.bar")),
+            "precondition: seeded dotted header key must load"
+        );
+
+        config
+            .providers
+            .models
+            .openai
+            .get_mut("fresh")
+            .unwrap()
+            .base
+            .extra_headers
+            .remove("X-Foo.bar");
+        config.mark_dirty("providers.models.openai.fresh.extra_headers.X-Foo.bar");
+        config.save_dirty().await.expect("save_dirty must succeed");
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !written.contains("X-Foo.bar"),
+            "unsetting a dotted dynamic secret-map key must delete the literal \
+             on-disk entry; got:\n{written}"
         );
     }
 
