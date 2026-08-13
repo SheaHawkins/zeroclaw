@@ -7267,9 +7267,9 @@ mod tests {
         assert!(matches!(action, SopRunAction::ExecuteStep { .. }));
     }
 
-    // ── Failure cause retention (issue #9783) ────────────
+    // ── Failure cause retention ────────────
 
-    /// A failed run must record WHY it failed. Regression for #9783: the
+    /// A failed run must record WHY it failed. Regression coverage: the
     /// reason was accepted by `finish_run` and dropped, so a terminal `failed`
     /// row carried no cause and the event log had no terminal failure row —
     /// leaving unattended runs undiagnosable once the transcript was gone.
