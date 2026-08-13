@@ -2510,16 +2510,19 @@ struct GatewayChatDispatchCapture {
 static GATEWAY_CHAT_DISPATCH_CAPTURES: std::sync::Mutex<Vec<GatewayChatDispatchCapture>> =
     std::sync::Mutex::new(Vec::new());
 
-#[cfg(test)]
+// Only the Linq webhook tests inspect the captured dispatches, so these
+// helpers are gated on that feature to keep the default-feature test target
+// free of dead code under `-D warnings`.
+#[cfg(all(test, feature = "channel-linq"))]
 static GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
-#[cfg(test)]
+#[cfg(all(test, feature = "channel-linq"))]
 async fn lock_gateway_chat_dispatch_capture_for_test() -> tokio::sync::MutexGuard<'static, ()> {
     GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK.lock().await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "channel-linq"))]
 fn clear_gateway_chat_dispatch_captures_for_test() {
     GATEWAY_CHAT_DISPATCH_CAPTURES
         .lock()
@@ -2527,7 +2530,7 @@ fn clear_gateway_chat_dispatch_captures_for_test() {
         .clear();
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "channel-linq"))]
 fn gateway_chat_dispatch_captures_for_test() -> Vec<GatewayChatDispatchCapture> {
     GATEWAY_CHAT_DISPATCH_CAPTURES
         .lock()
