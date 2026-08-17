@@ -1042,7 +1042,11 @@ cli-bundle-rename-failed = rename failed: {$error}
 
 # ── Agent bundle export — zeroclaw agents export ──
 cli-agent-export-dest-not-a-dir = destination {$path} exists and is not a directory
-cli-agent-export-dest-not-empty = destination {$path} is not empty — pass --force to write into it anyway
+cli-agent-export-dest-not-empty = destination {$path} is not empty — pass --force to replace its contents
+cli-agent-export-dest-no-parent = destination {$path} has no parent directory to stage the bundle beside
+cli-agent-export-dest-contains-workspace = destination {$path} contains the agent workspace {$workspace} — exporting there would replace the workspace itself
+cli-agent-export-dest-inside-workspace = destination {$path} is inside the agent workspace {$workspace} — choose a path outside it
+cli-agent-export-restore-failed = failed to publish the bundle to {$path} ({$error}), and the previous bundle could not be moved back — it is at {$retired}
 cli-agent-export-written = exported agent `{$alias}` to {$path} ({$files} workspace file(s), {$kib} KiB)
 cli-agent-export-symlinks-skipped = {"  "}{$count} symlink(s) skipped — links are not followed into a bundle
 cli-agent-export-risk-header = ⚠️  {$count} capability grant(s) an importing operator must accept:

@@ -34,11 +34,25 @@ zeroclaw agents export <alias> --out ./my-agent
 | --- | --- |
 | `--out <dir>` | Destination bundle directory, created if absent. |
 | `--include-memory` | Carry `workspace/memory/` (off by default). |
-| `--force` | Write into a destination that already has contents. |
+| `--force` | Replace a destination that already has contents. |
 
 Export is read-only against the install and reports three things: the
 capabilities a receiving operator would be accepting, the credentials that were
 scrubbed, and the configuration that could not travel.
+
+A bundle is **published, not merged**. The export is built in a staging
+directory beside the destination and moved into place in one step, so:
+
+- `--force` *replaces* the destination. A file from an earlier export that the
+  new manifest does not describe is gone, rather than left to look like part of
+  the bundle.
+- A failure anywhere, such as an unreadable workspace file or a full disk,
+  leaves the destination exactly as it was. There is no partially written
+  bundle to mistake for a complete one.
+- A destination that overlaps the agent's workspace is refused before anything
+  is created, in both directions: `--out` *inside* the workspace would have the
+  copy consume its own output, and an `--out` that *contains* the workspace
+  would replace the tree being exported.
 
 ### What the closure carries
 

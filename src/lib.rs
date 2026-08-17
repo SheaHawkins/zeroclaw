@@ -362,7 +362,7 @@ pub enum AgentsCommands {
         /// Carry the agent's private memory store into the bundle
         #[arg(long)]
         include_memory: bool,
-        /// Write into a destination directory that already has contents
+        /// Replace the contents of a destination directory that already has files
         #[arg(long)]
         force: bool,
     },
