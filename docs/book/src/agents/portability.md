@@ -131,7 +131,9 @@ that hits one fails rather than publishing a bundle with host content in it.
 ### Credentials
 
 Every field the schema marks secret is scrubbed to an empty string, and its
-config path is listed under `required_secrets` in the manifest. The paths are
+config path is listed under `required_secrets` in the manifest. Scrubbing
+applies to `config.toml` and nothing else; see [Bundle content is not
+scanned](#bundle-content-is-not-scanned) for what that leaves to you. The paths are
 the ones `zeroclaw config set` accepts, so filling a bundle in is a direct
 copy-paste:
 
@@ -142,6 +144,22 @@ zeroclaw config set mcp.servers.github.env.GITHUB_TOKEN
 
 Scrubbing is verified, not assumed: if encrypted config ciphertext survives
 into the closure, the export aborts rather than writing the bundle.
+
+### Bundle content is not scanned
+
+Scrubbing is a schema-driven pass over the config closure. It does not reach the
+files a bundle carries, and nothing else does either: everything under
+`workspace/` and `skills/` is copied byte for byte and is never scanned for
+secrets.
+
+A `.env` file in the workspace, an API token pasted into a note, a `.git/config`
+whose remote URL carries a credential, a private document the agent was working
+on: all of it travels exactly as it is. The export tells you how many files it
+carried, but it cannot tell you what is in them.
+
+Read the carried files yourself before sharing a bundle, the same way you would
+read a repository before making it public. `config.toml` and the manifest are
+the parts the export can vouch for.
 
 ### Risk flags
 

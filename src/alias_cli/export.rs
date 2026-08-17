@@ -699,11 +699,31 @@ fn report(plan: &ExportPlan, out: &Path, copied: &BundleCopy) {
         }
     }
 
+    // Scrubbing is a schema-driven pass over the config closure. It does not
+    // and cannot reach the files a bundle carries, so the operator is told
+    // plainly rather than left to infer it from the scrubbed-credentials list
+    // just above.
+    let carried = copied.workspace.files + copied.skills.tally.files;
+    if carried > 0 {
+        let count = carried.to_string();
+        println!(
+            "\n{}",
+            mta(
+                "cli-agent-export-content-not-scrubbed",
+                &[("count", count.as_str())],
+                "⚠️  {$count} carried file(s) are copied as-is. Scrubbing covers config.toml \
+                 only: workspace and skill content is never scanned for secrets, so a .env \
+                 file, a token in a note, or a credential in a git remote travels with it."
+            )
+        );
+    }
+
     println!(
         "\n{}",
         mt(
             "cli-agent-export-review-hint",
-            "Review config.toml and zeroclaw-agent.toml before sharing the bundle."
+            "Review config.toml, zeroclaw-agent.toml, and the files the bundle carries before \
+             sharing it."
         )
     );
 }

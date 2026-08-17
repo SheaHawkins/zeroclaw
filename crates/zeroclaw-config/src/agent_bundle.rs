@@ -1030,6 +1030,9 @@ const MANIFEST_HEADER: &str = "\
 # `required_secrets` lists config paths whose credentials were scrubbed on
 # export. `risk_flags` lists capabilities the importing operator is being asked
 # to grant. `dropped` lists configuration that could not travel.
+#
+# Scrubbing covers config.toml only. The files under workspace/ and skills/ are
+# copied as-is and are never scanned for secrets.
 ";
 
 /// Render the manifest as the bundle's `zeroclaw-agent.toml`.
