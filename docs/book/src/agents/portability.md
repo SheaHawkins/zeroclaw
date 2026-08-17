@@ -89,6 +89,14 @@ Symlinks inside the workspace are skipped rather than followed: a link's target
 may sit outside the workspace, and it would resolve differently on the
 receiving host anyway.
 
+The workspace stays live while the export runs, since the agent that owns it can
+be writing to it through an ordinary tool call. So the copy never re-opens a
+path by name. The workspace root is opened once, and every entry below it is
+classified *and* read through a handle on the directory that holds it. That is
+what makes the skip a guarantee rather than a check: an entry replaced by a
+symlink in between cannot redirect the copy outside the workspace, and an export
+that hits one fails rather than publishing a bundle with host content in it.
+
 ### Credentials
 
 Every field the schema marks secret is scrubbed to an empty string, and its

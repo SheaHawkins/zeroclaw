@@ -16,6 +16,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
 use zeroclaw_config::agent_bundle::{
     self, CONFIG_FILE, ExportOptions, ExportPlan, MANIFEST_FILE, Provenance, WORKSPACE_DIR,
 };
@@ -291,16 +293,34 @@ async fn write_file(path: &Path, contents: &str) -> Result<()> {
 /// Copy the agent's workspace into the bundle, honoring the plan's memory
 /// exclusion. A missing source workspace is not an error: an agent that has
 /// never run has nothing on disk yet.
+///
+/// The workspace is live — the agent that owns it can be writing to it through
+/// an ordinary tool call while the export runs — so the walk never re-opens a
+/// path by name. The configured root is opened once, and every entry below it
+/// is classified *and* read through a handle on the directory that holds it
+/// (cap-std, the same beneath/no-follow binding `deliver_file` uses). An entry
+/// swapped for a symlink between the classification and the read therefore
+/// cannot redirect the copy outside the tree that handle names; a path-based
+/// walk would have followed it.
 fn copy_workspace(plan: &ExportPlan, dest: &Path) -> Result<WorkspaceCopy> {
     let mut copied = WorkspaceCopy::default();
     if !plan.workspace_source.is_dir() {
         return Ok(copied);
     }
+    let source =
+        Dir::open_ambient_dir(&plan.workspace_source, ambient_authority()).with_context(|| {
+            format!(
+                "failed to open workspace {}",
+                plan.workspace_source.display()
+            )
+        })?;
     std::fs::create_dir_all(dest)
         .with_context(|| format!("failed to create {}", dest.display()))?;
+    let target = Dir::open_ambient_dir(dest, ambient_authority())
+        .with_context(|| format!("failed to open {}", dest.display()))?;
     copy_tree(
-        &plan.workspace_source,
-        dest,
+        &source,
+        &target,
         &PathBuf::new(),
         plan.include_memory,
         &mut copied,
@@ -308,55 +328,108 @@ fn copy_workspace(plan: &ExportPlan, dest: &Path) -> Result<WorkspaceCopy> {
     Ok(copied)
 }
 
+/// Copy one directory's entries, recursing through child handles.
+///
+/// Writes are bound the same way as reads: the bundle side is a handle too, so
+/// a symlink planted in the staging tree cannot redirect a write out of it.
 fn copy_tree(
-    source: &Path,
-    dest: &Path,
+    source: &Dir,
+    dest: &Dir,
     relative: &Path,
     include_memory: bool,
     copied: &mut WorkspaceCopy,
 ) -> Result<()> {
-    let entries = std::fs::read_dir(source)
-        .with_context(|| format!("failed to read {}", source.display()))?;
+    let entries = source
+        .entries()
+        .with_context(|| format!("failed to read {}", rel(relative)))?;
     for entry in entries {
-        let entry = entry.with_context(|| format!("failed to read {}", source.display()))?;
+        let entry = entry.with_context(|| format!("failed to read {}", rel(relative)))?;
         let name = entry.file_name();
-        let child_relative = relative.join(&name);
-        if !agent_bundle::workspace_entry_included(&child_relative, include_memory) {
+        let child = relative.join(&name);
+        if !agent_bundle::workspace_entry_included(&child, include_memory) {
             continue;
         }
 
-        let source_path = entry.path();
-        let metadata = std::fs::symlink_metadata(&source_path)
-            .with_context(|| format!("failed to stat {}", source_path.display()))?;
-        if metadata.file_type().is_symlink() {
+        // `DirEntry::metadata` is a no-follow stat through the directory handle,
+        // so it describes the object sitting in *this* directory under that
+        // name, not whatever a fresh path lookup would resolve to.
+        let file_type = entry
+            .metadata()
+            .with_context(|| format!("failed to stat {}", rel(&child)))?
+            .file_type();
+        if file_type.is_symlink() {
             copied.symlinks_skipped += 1;
             continue;
         }
+        if !file_type.is_dir() && !file_type.is_file() {
+            // Sockets, FIFOs, devices: nothing a bundle can carry.
+            continue;
+        }
 
-        let dest_path = dest.join(&name);
-        if metadata.is_dir() {
-            std::fs::create_dir_all(&dest_path)
-                .with_context(|| format!("failed to create {}", dest_path.display()))?;
-            copy_tree(
-                &source_path,
-                &dest_path,
-                &child_relative,
-                include_memory,
-                copied,
-            )?;
-        } else if metadata.is_file() {
-            std::fs::copy(&source_path, &dest_path).with_context(|| {
-                format!(
-                    "failed to copy {} to {}",
-                    source_path.display(),
-                    dest_path.display()
-                )
-            })?;
+        entry_swap_seam(&child);
+
+        if file_type.is_dir() {
+            let child_source = entry
+                .open_dir()
+                .with_context(|| format!("failed to open {}", rel(&child)))?;
+            dest.create_dir(&name)
+                .with_context(|| format!("failed to create {} in the bundle", rel(&child)))?;
+            let child_dest = dest
+                .open_dir(&name)
+                .with_context(|| format!("failed to open {} in the bundle", rel(&child)))?;
+            copy_tree(&child_source, &child_dest, &child, include_memory, copied)?;
+        } else {
+            let mut reader = entry
+                .open()
+                .with_context(|| format!("failed to open {}", rel(&child)))?;
+            // The opened handle, not the name, decides what gets copied: an
+            // entry that is no longer a regular file is left out rather than
+            // read through whatever replaced it.
+            let source_metadata = reader
+                .metadata()
+                .with_context(|| format!("failed to stat {}", rel(&child)))?;
+            if !source_metadata.is_file() {
+                continue;
+            }
+            let mut writer = dest
+                .open_with(&name, OpenOptions::new().write(true).create_new(true))
+                .with_context(|| format!("failed to create {} in the bundle", rel(&child)))?;
+            let bytes = std::io::copy(&mut reader, &mut writer)
+                .with_context(|| format!("failed to copy {} into the bundle", rel(&child)))?;
+            // Carry the mode across, so an executable in the workspace is still
+            // executable for whoever imports the bundle.
+            writer
+                .set_permissions(source_metadata.permissions())
+                .with_context(|| format!("failed to set permissions on {}", rel(&child)))?;
             copied.files += 1;
-            copied.bytes += metadata.len();
+            copied.bytes += bytes;
         }
     }
     Ok(())
+}
+
+/// Render a workspace-relative path for an error message. The bundle names
+/// entries relative to the workspace root, and so do these.
+fn rel(relative: &Path) -> String {
+    let shown = relative.display().to_string();
+    if shown.is_empty() {
+        WORKSPACE_DIR.to_string()
+    } else {
+        format!("{WORKSPACE_DIR}/{shown}")
+    }
+}
+
+/// Test seam: runs between an entry's no-follow classification and the
+/// handle-bound open of that entry, the interleaving at which a path-based copy
+/// could be made to follow a symlink out of the workspace. Compiled away
+/// outside tests.
+#[cfg(not(test))]
+#[inline]
+fn entry_swap_seam(_relative: &Path) {}
+
+#[cfg(test)]
+fn entry_swap_seam(relative: &Path) {
+    tests::run_entry_swap_seam(relative);
 }
 
 fn report(plan: &ExportPlan, out: &Path, copied: &WorkspaceCopy) {
@@ -505,6 +578,41 @@ mod tests {
         names
     }
 
+    /// A swap to perform mid-copy, keyed on the entry's workspace-relative path.
+    type Swap = Box<dyn Fn(&Path)>;
+
+    thread_local! {
+        /// Swap to perform at [`entry_swap_seam`]. Thread-local, so tests
+        /// running in parallel cannot see each other's.
+        static ENTRY_SWAP: std::cell::RefCell<Option<Swap>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn run_entry_swap_seam(relative: &Path) {
+        ENTRY_SWAP.with_borrow(|swap| {
+            if let Some(swap) = swap.as_ref() {
+                swap(relative);
+            }
+        });
+    }
+
+    /// Installs a swap at the copy's check-to-read seam for as long as it is
+    /// held, so a replacement race can be reproduced at an exact interleaving.
+    struct EntrySwap;
+
+    impl EntrySwap {
+        fn install(swap: impl Fn(&Path) + 'static) -> Self {
+            ENTRY_SWAP.with_borrow_mut(|slot| *slot = Some(Box::new(swap)));
+            Self
+        }
+    }
+
+    impl Drop for EntrySwap {
+        fn drop(&mut self) {
+            ENTRY_SWAP.with_borrow_mut(|slot| *slot = None);
+        }
+    }
+
     #[test]
     fn copy_skips_the_memory_store_by_default() {
         let source = tempfile::tempdir().unwrap();
@@ -565,6 +673,99 @@ mod tests {
         let plan = plan_for(Path::new("/nonexistent/zeroclaw/workspace"), false);
         let copied = copy_workspace(&plan, dest.path()).unwrap();
         assert_eq!(copied, WorkspaceCopy::default());
+    }
+
+    #[test]
+    fn copy_preserves_the_executable_bit() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let source = tempfile::tempdir().unwrap();
+            let dest = tempfile::tempdir().unwrap();
+            let script = source.path().join("run.sh");
+            write(&script, "#!/bin/sh\n");
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            copy_workspace(&plan_for(source.path(), false), dest.path()).unwrap();
+
+            let mode = std::fs::metadata(dest.path().join("run.sh"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o111, "mode {mode:o}");
+        }
+    }
+
+    /// The workspace is writable by the agent being exported, so an entry can be
+    /// replaced between the moment the copy classifies it and the moment the
+    /// copy reads it. The seam reproduces exactly that interleaving.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_replaced_by_an_escaping_symlink_mid_copy_is_not_followed() {
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.txt");
+        write(&secret, "host secret");
+
+        let source = tempfile::tempdir().unwrap();
+        let entry = source.path().join("notes.md");
+        write(&entry, "workspace note");
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let plan = plan_for(source.path(), false);
+        let result = {
+            let _swap = EntrySwap::install(move |relative| {
+                if relative == Path::new("notes.md") {
+                    std::fs::remove_file(&entry).unwrap();
+                    std::os::unix::fs::symlink(&secret, &entry).unwrap();
+                    // The name now resolves outside the workspace: a copy that
+                    // re-opened it by path would read this.
+                    assert_eq!(std::fs::read_to_string(&entry).unwrap(), "host secret");
+                }
+            });
+            write_bundle(&plan, &out, false).await
+        };
+
+        // Fails closed: the bundle is never published, and the host file the
+        // symlink pointed at is nowhere in the output.
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("workspace/notes.md"), "{err}");
+        assert!(!out.exists());
+        assert_eq!(entry_names(parent.path()), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_directory_replaced_by_an_escaping_symlink_mid_copy_is_not_followed() {
+        let outside = tempfile::tempdir().unwrap();
+        write(&outside.path().join("secret.txt"), "host secret");
+
+        let source = tempfile::tempdir().unwrap();
+        let entry = source.path().join("notes");
+        write(&entry.join("plan.md"), "plan");
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let plan = plan_for(source.path(), false);
+        let target = outside.path().to_path_buf();
+        let result = {
+            let _swap = EntrySwap::install(move |relative| {
+                if relative == Path::new("notes") {
+                    std::fs::remove_dir_all(&entry).unwrap();
+                    std::os::unix::fs::symlink(&target, &entry).unwrap();
+                    // A copy that re-walked the name by path would descend here.
+                    assert!(entry.join("secret.txt").is_file());
+                }
+            });
+            write_bundle(&plan, &out, false).await
+        };
+
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("workspace/notes"), "{err}");
+        assert!(!out.exists());
+        assert_eq!(entry_names(parent.path()), Vec::<String>::new());
     }
 
     #[tokio::test]
@@ -688,7 +889,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(err.to_string().contains("failed to copy"), "{err}");
+        assert!(err.to_string().contains("workspace/locked.md"), "{err}");
         assert_eq!(entry_names(&out), vec![CONFIG_FILE.to_string()]);
         assert_eq!(
             std::fs::read_to_string(out.join(CONFIG_FILE)).unwrap(),
