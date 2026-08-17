@@ -5,9 +5,12 @@
 //! ```text
 //! <bundle>/
 //!   zeroclaw-agent.toml   — manifest (format version, root alias, provenance,
-//!                            required secrets, dropped refs, risk flags)
+//!                            required secrets, carried skill bundles,
+//!                            dropped refs, risk flags)
 //!   config.toml           — the config closure this agent needs
 //!   workspace/            — the agent's workspace tree
+//!   skills/<alias>/       — content of each referenced skill bundle, which
+//!                            lives outside the workspace on the source host
 //! ```
 //!
 //! This module owns the *planning* half: given a live [`Config`] and an agent
@@ -46,6 +49,12 @@ pub const CONFIG_FILE: &str = "config.toml";
 
 /// Workspace directory name inside a bundle directory.
 pub const WORKSPACE_DIR: &str = "workspace";
+
+/// Directory inside a bundle holding carried skill-bundle content, one
+/// subdirectory per skill-bundle alias. Skills live under the install-wide
+/// `<install>/shared/skills/` tree rather than the agent's workspace, so
+/// carrying the config alone would import an agent whose skills are missing.
+pub const SKILLS_DIR: &str = "skills";
 
 /// Workspace subdirectory holding the agent's private memory store. Excluded
 /// from the bundle unless [`ExportOptions::include_memory`] is set.
@@ -125,6 +134,9 @@ pub enum RiskKind {
     ProcessSpawn,
     /// Server-controlled text is injected into the system prompt at startup.
     UntrustedStartupContext,
+    /// The bundle carries skill content authored on the exporting install,
+    /// which the agent reads as instructions once installed.
+    CarriedSkills,
 }
 
 impl RiskKind {
@@ -141,6 +153,7 @@ impl RiskKind {
             Self::DelegationEnabled => "delegation_enabled",
             Self::ProcessSpawn => "process_spawn",
             Self::UntrustedStartupContext => "untrusted_startup_context",
+            Self::CarriedSkills => "carried_skills",
         }
     }
 }
@@ -165,6 +178,24 @@ pub struct Provenance {
     pub exported_at: String,
 }
 
+/// One skill bundle's content to carry, resolved to a source directory.
+///
+/// The planner performs no I/O, so this names the directory and the filter
+/// rather than the skills themselves; the caller enumerates and copies.
+#[derive(Debug, Clone)]
+pub struct SkillBundleSource {
+    /// Bundle alias. Also the subdirectory name under [`SKILLS_DIR`], which is
+    /// what lets an import map content back onto the target's own resolved
+    /// directory for the same alias.
+    pub alias: String,
+    /// Absolute source directory on the exporting host.
+    pub source: PathBuf,
+    /// The bundle's own include/exclude filter. Applied to the copy so a skill
+    /// this bundle excludes does not travel: [`SkillBundleConfig::admits_skill`]
+    /// is the same filter the runtime applies.
+    pub filter: SkillBundleConfig,
+}
+
 /// A computed export, ready to be written to disk.
 #[derive(Debug, Clone)]
 pub struct ExportPlan {
@@ -180,6 +211,8 @@ pub struct ExportPlan {
     pub risk_flags: Vec<RiskFlag>,
     /// Source workspace directory to copy into the bundle.
     pub workspace_source: PathBuf,
+    /// Skill-bundle directories to copy into the bundle's `skills/` tree.
+    pub skill_sources: Vec<SkillBundleSource>,
     /// Whether `workspace/memory/` should be copied.
     pub include_memory: bool,
 }
@@ -258,7 +291,14 @@ pub fn plan_export(
     }
 
     // ── bundles ──────────────────────────────────────────────────────────
+    //
+    // A skill bundle is two halves: the config entry, and the skills on disk
+    // under `<install>/shared/skills/`. Carrying only the config would import
+    // an agent whose skills silently do not exist, so the directory travels
+    // too — see `skill_sources`.
     let skill_default = to_table(&SkillBundleConfig::default())?;
+    let install_root = config.install_root_dir();
+    let mut skill_sources = Vec::new();
     for bundle in dedup(&agent.skill_bundles) {
         carry(
             &mut out,
@@ -266,6 +306,41 @@ pub fn plan_export(
             &["skill_bundles", &bundle],
             &skill_default,
         );
+        let Some(configured) = config.skill_bundles.get(&bundle) else {
+            // A dangling bundle reference grants nothing and carries nothing;
+            // the import-side `Config::validate()` reports it.
+            continue;
+        };
+        // An absolute `directory` names this host. Worse, it would fail the
+        // target's own validation, which requires bundle directories to sit
+        // inside *its* `<install>/shared/`. Dropping it lets the target
+        // resolve its default location for the alias, which is where the
+        // carried content is mapped back to.
+        if configured
+            .directory
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|dir| !dir.is_empty() && std::path::Path::new(dir).is_absolute())
+            && let Some(table) = table_at_mut(&mut out, &["skill_bundles", &bundle])
+        {
+            table.remove("directory");
+            dropped.push(DroppedRef {
+                path: format!("skill_bundles.{bundle}.directory"),
+                reason: DropReason::HostSpecific,
+                detail: "the bundle directory is a source-host absolute path, and the target \
+                         requires bundle directories inside its own install; the imported \
+                         bundle uses the target's default location for this alias"
+                    .to_string(),
+            });
+        }
+        if let Ok(source) = crate::skill_bundles::resolve_directory(config, &install_root, &bundle)
+        {
+            skill_sources.push(SkillBundleSource {
+                alias: bundle.clone(),
+                source,
+                filter: configured.clone(),
+            });
+        }
     }
     let knowledge_default = to_table(&KnowledgeBundleConfig::default())?;
     for bundle in dedup(&agent.knowledge_bundles) {
@@ -313,7 +388,7 @@ pub fn plan_export(
     // provider ref, so a bundle that carried only some of them would not
     // import. Credentials are scrubbed below, leaving keyless entries for the
     // operator to fill in.
-    let provider_refs: [(&str, &str); 5] = [
+    let mut provider_refs: Vec<(&str, &str)> = vec![
         ("providers.models", agent.model_provider.trim()),
         ("providers.models", agent.classifier_provider.trim()),
         ("providers.models", agent.summary_provider.trim()),
@@ -323,6 +398,16 @@ pub fn plan_export(
             agent.transcription_provider.trim(),
         ),
     ];
+    // A carried runtime profile can name a summarizer provider of its own,
+    // independently of the agent. `Config::validate()` checks that reference
+    // per profile, so a closure carrying the profile without the provider
+    // fails on the target even though the agent never named it.
+    if let Some(profile) = config.runtime_profiles.get(runtime_alias) {
+        provider_refs.push((
+            "providers.models",
+            profile.context_compression.summary_provider.trim(),
+        ));
+    }
     let mut carried_providers: BTreeSet<String> = BTreeSet::new();
     for (section, reference) in provider_refs {
         let Some((family, entry)) = split_provider_ref(reference) else {
@@ -372,7 +457,7 @@ pub fn plan_export(
         });
     }
 
-    let risk_flags = collect_risk_flags(config, alias, agent, &granted);
+    let risk_flags = collect_risk_flags(config, alias, agent, &granted, &skill_sources);
 
     Ok(ExportPlan {
         root_alias: alias.to_string(),
@@ -381,6 +466,7 @@ pub fn plan_export(
         dropped,
         risk_flags,
         workspace_source: config.agent_workspace_dir(alias),
+        skill_sources,
         include_memory: options.include_memory,
     })
 }
@@ -440,6 +526,42 @@ fn sanitize_agent(
          and must be published deliberately",
     );
 
+    // Dropping the explicit roster is not enough to close delegation reach:
+    // `delegate_same_risk_profile` (default `true`) auto-allows delegation to
+    // every agent sharing the carried risk profile, so an import would wire
+    // the agent to whatever unrelated local agents happen to sit on it. The
+    // bundle arrives with no reach, and the operator grants it deliberately.
+    if agent.delegate_same_risk_profile {
+        table.insert(
+            "delegate_same_risk_profile".to_string(),
+            toml::Value::Boolean(false),
+        );
+        dropped.push(DroppedRef {
+            path: format!("agents.{alias}.delegate_same_risk_profile"),
+            reason: DropReason::Relational,
+            detail: "auto-delegation to same-profile peers would name agents on the target \
+                     install that this agent has never been paired with; the imported agent \
+                     arrives with no delegate reach"
+                .to_string(),
+        });
+    }
+
+    // An identity document path relative to the workspace travels with the
+    // workspace copy; an absolute one names the source host.
+    if let Some(path) = agent.identity.aieos_path.as_deref()
+        && std::path::Path::new(path.trim()).is_absolute()
+        && let Some(toml::Value::Table(identity)) = table.get_mut("identity")
+    {
+        identity.remove("aieos_path");
+        dropped.push(DroppedRef {
+            path: format!("agents.{alias}.identity.aieos_path"),
+            reason: DropReason::HostSpecific,
+            detail: "the AIEOS identity document is referenced by a source-host absolute path; \
+                     point the imported agent at a path inside its own workspace"
+                .to_string(),
+        });
+    }
+
     // The workspace block travels, but three of its fields cannot.
     if let Some(toml::Value::Table(workspace)) = table.get_mut("workspace") {
         workspace.remove("path");
@@ -483,8 +605,19 @@ fn collect_risk_flags(
     alias: &str,
     agent: &AliasedAgentConfig,
     servers: &[McpServerConfig],
+    skill_sources: &[SkillBundleSource],
 ) -> Vec<RiskFlag> {
     let mut flags = Vec::new();
+
+    for source in skill_sources {
+        flags.push(RiskFlag {
+            kind: RiskKind::CarriedSkills,
+            path: format!("skill_bundles.{}", source.alias),
+            detail: "the bundle carries this skill bundle's content from the exporting install; \
+                     skills are instructions the agent reads and act as code it may run"
+                .to_string(),
+        });
+    }
 
     let risk_alias = agent.risk_profile.trim();
     if let Some(profile) = config.risk_profiles.get(risk_alias) {
@@ -650,6 +783,16 @@ fn to_table<T: Serialize>(value: &T) -> Result<toml::Table, ExportError> {
     }
 }
 
+/// Mutable handle on the table already carried at `path`, if there is one.
+fn table_at_mut<'a>(root: &'a mut toml::Table, path: &[&str]) -> Option<&'a mut toml::Table> {
+    let (last, prefix) = path.split_last()?;
+    let mut cursor = root;
+    for segment in prefix {
+        cursor = cursor.get_mut(*segment)?.as_table_mut()?;
+    }
+    cursor.get_mut(*last)?.as_table_mut()
+}
+
 fn lookup<'a>(root: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
     let (last, prefix) = path.split_last()?;
     let mut cursor = root;
@@ -809,6 +952,18 @@ pub fn render_manifest(plan: &ExportPlan, provenance: &Provenance) -> toml::Tabl
             plan.required_secrets
                 .iter()
                 .map(|path| toml::Value::String(path.clone()))
+                .collect(),
+        ),
+    );
+    // Bundle aliases whose content is carried under `skills/<alias>/`. An
+    // import maps each back onto the directory the *target* resolves for that
+    // alias, which is why the alias, not the source path, is what is recorded.
+    manifest.insert(
+        "skill_bundles".to_string(),
+        toml::Value::Array(
+            plan.skill_sources
+                .iter()
+                .map(|source| toml::Value::String(source.alias.clone()))
                 .collect(),
         ),
     );
@@ -1294,6 +1449,291 @@ mod tests {
                 .and_then(toml::Value::as_integer),
             Some(i64::from(BUNDLE_FORMAT_VERSION))
         );
+    }
+
+    /// The fixture agent wired to every reference kind an export has to
+    /// resolve: profiles (including one that names a provider of its own),
+    /// bundles, the typed provider slots, a sibling agent, and host-specific
+    /// paths.
+    fn loaded_fixture() -> Config {
+        let mut config = fixture();
+
+        config.providers.models.anthropic.insert(
+            "summarizer".to_string(),
+            crate::schema::AnthropicModelProviderConfig::default(),
+        );
+        config.providers.models.anthropic.insert(
+            "classifier".to_string(),
+            crate::schema::AnthropicModelProviderConfig::default(),
+        );
+        config.providers.tts.openai.insert(
+            "voice".to_string(),
+            crate::schema::OpenAITtsProviderConfig::default(),
+        );
+
+        let mut profile = RuntimeProfileConfig::default();
+        profile.context_compression.summary_provider = "anthropic.summarizer".into();
+        config
+            .runtime_profiles
+            .insert("standard".to_string(), profile);
+
+        config.skill_bundles.insert(
+            "research_tools".to_string(),
+            SkillBundleConfig {
+                directory: Some("/srv/zeroclaw/shared/skills/pool".to_string()),
+                ..Default::default()
+            },
+        );
+        config
+            .knowledge_bundles
+            .insert("house_docs".to_string(), KnowledgeBundleConfig::default());
+
+        // A sibling on the same risk profile: the peer that same-profile
+        // delegation reach would silently connect on the target.
+        config.agents.insert(
+            "assistant".to_string(),
+            AliasedAgentConfig {
+                model_provider: "anthropic.main".into(),
+                risk_profile: "guarded".into(),
+                ..Default::default()
+            },
+        );
+
+        if let Some(agent) = config.agents.get_mut("researcher") {
+            agent.runtime_profile = "standard".into();
+            agent.classifier_provider = "anthropic.classifier".into();
+            agent.tts_provider = "openai.voice".into();
+            agent.skill_bundles = vec!["research_tools".to_string()];
+            agent.knowledge_bundles = vec!["house_docs".to_string()];
+            agent.delegates = vec![crate::schema::DelegateTargetConfig::bounded("assistant")];
+            agent.identity.aieos_path = Some("/srv/identities/researcher.json".to_string());
+        }
+
+        config
+    }
+
+    /// The bundle's central promise: the closure is complete on its own. An
+    /// import starts from a config that has none of the source install's
+    /// entries, so every reference the closure carries has to resolve within
+    /// the closure itself.
+    #[test]
+    fn closure_validates_on_an_otherwise_empty_install() {
+        for config in [fixture(), loaded_fixture()] {
+            let plan = plan_export(&config, "researcher", options()).unwrap();
+            let text = render_config_toml(&plan).unwrap();
+            let imported: Config = toml::from_str(&text).expect("closure deserializes as a Config");
+
+            // Nothing from the source install survives except the closure:
+            // no sibling agents, no channel bindings, no delegate roster.
+            assert_eq!(imported.agents.len(), 1, "{text}");
+            let agent = &imported.agents["researcher"];
+            assert!(agent.channels.is_empty(), "{text}");
+            assert!(agent.delegates.is_empty(), "{text}");
+
+            imported.validate().unwrap_or_else(|err| {
+                panic!("closure must validate on an empty install: {err}\n{text}")
+            });
+        }
+    }
+
+    /// The reference that only exists on the carried profile, never on the
+    /// agent: without it the closure imports a runtime profile pointing at a
+    /// provider the target has never heard of.
+    #[test]
+    fn a_profile_owned_summary_provider_is_carried_and_validates() {
+        let mut config = fixture();
+        config.providers.models.anthropic.insert(
+            "summarizer".to_string(),
+            crate::schema::AnthropicModelProviderConfig::default(),
+        );
+        let mut profile = RuntimeProfileConfig::default();
+        profile.context_compression.summary_provider = "anthropic.summarizer".into();
+        config
+            .runtime_profiles
+            .insert("standard".to_string(), profile);
+        if let Some(agent) = config.agents.get_mut("researcher") {
+            agent.runtime_profile = "standard".into();
+        }
+
+        let plan = plan_export(&config, "researcher", options()).unwrap();
+        assert!(
+            lookup(
+                &plan.config,
+                &["providers", "models", "anthropic", "summarizer"]
+            )
+            .is_some(),
+            "the profile's own summarizer provider is carried"
+        );
+
+        let text = render_config_toml(&plan).unwrap();
+        let imported: Config = toml::from_str(&text).unwrap();
+        imported.validate().expect("closure validates");
+    }
+
+    #[test]
+    fn same_profile_delegation_reach_is_closed_and_reported() {
+        let plan = plan_export(&fixture(), "researcher", options()).unwrap();
+
+        let agent = lookup(&plan.config, &["agents", "researcher"])
+            .and_then(toml::Value::as_table)
+            .expect("agent entry present");
+        assert_eq!(
+            agent
+                .get("delegate_same_risk_profile")
+                .and_then(toml::Value::as_bool),
+            Some(false),
+            "the bundle must not arrive with same-profile delegation reach"
+        );
+        assert!(
+            plan.dropped
+                .iter()
+                .any(|d| d.path == "agents.researcher.delegate_same_risk_profile"),
+            "{:?}",
+            plan.dropped
+        );
+
+        // The closed reach survives the round trip, rather than being pruned
+        // back to the schema default of `true`.
+        let text = render_config_toml(&plan).unwrap();
+        let imported: Config = toml::from_str(&text).unwrap();
+        assert!(!imported.agents["researcher"].delegate_same_risk_profile);
+        assert!(
+            imported
+                .reachable_delegate_target_configs("researcher")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_absolute_identity_path_is_dropped_and_a_workspace_relative_one_travels() {
+        let mut config = fixture();
+        if let Some(agent) = config.agents.get_mut("researcher") {
+            agent.identity.aieos_path = Some("/srv/identities/researcher.json".to_string());
+        }
+        let plan = plan_export(&config, "researcher", options()).unwrap();
+        let identity = lookup(&plan.config, &["agents", "researcher", "identity"])
+            .and_then(toml::Value::as_table);
+        assert!(
+            identity.is_none_or(|table| !table.contains_key("aieos_path")),
+            "{identity:?}"
+        );
+        assert!(
+            plan.dropped
+                .iter()
+                .any(|d| d.path == "agents.researcher.identity.aieos_path"),
+            "{:?}",
+            plan.dropped
+        );
+
+        // A workspace-relative path points into the tree the bundle carries.
+        if let Some(agent) = config.agents.get_mut("researcher") {
+            agent.identity.aieos_path = Some("identity/aieos.json".to_string());
+        }
+        let plan = plan_export(&config, "researcher", options()).unwrap();
+        assert_eq!(
+            lookup(
+                &plan.config,
+                &["agents", "researcher", "identity", "aieos_path"]
+            )
+            .and_then(toml::Value::as_str),
+            Some("identity/aieos.json")
+        );
+    }
+
+    #[test]
+    fn skill_bundle_content_is_planned_for_copy() {
+        let mut config = fixture();
+        config.skill_bundles.insert(
+            "research_tools".to_string(),
+            SkillBundleConfig {
+                directory: None,
+                include: Vec::new(),
+                exclude: vec!["internal_only".to_string()],
+            },
+        );
+        if let Some(agent) = config.agents.get_mut("researcher") {
+            agent.skill_bundles = vec!["research_tools".to_string()];
+        }
+
+        let plan = plan_export(&config, "researcher", options()).unwrap();
+        assert_eq!(plan.skill_sources.len(), 1);
+        let source = &plan.skill_sources[0];
+        assert_eq!(source.alias, "research_tools");
+        assert_eq!(
+            source.source,
+            config
+                .install_root_dir()
+                .join("shared/skills/research_tools")
+        );
+        assert!(source.filter.admits_skill("web_search"));
+        assert!(!source.filter.admits_skill("internal_only"));
+
+        assert!(
+            plan.risk_flags
+                .iter()
+                .any(|f| f.kind == RiskKind::CarriedSkills
+                    && f.path == "skill_bundles.research_tools"),
+            "{:?}",
+            plan.risk_flags
+        );
+
+        let provenance = Provenance {
+            zeroclaw_version: "0.0.0-test".to_string(),
+            exported_at: "2026-08-17T00:00:00Z".to_string(),
+        };
+        let manifest = render_manifest(&plan, &provenance);
+        assert_eq!(
+            manifest
+                .get("skill_bundles")
+                .and_then(toml::Value::as_array)
+                .map(|aliases| aliases
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .collect::<Vec<_>>()),
+            Some(vec!["research_tools"])
+        );
+    }
+
+    #[test]
+    fn an_absolute_skill_bundle_directory_is_dropped_and_reported() {
+        let mut config = fixture();
+        config.skill_bundles.insert(
+            "research_tools".to_string(),
+            SkillBundleConfig {
+                directory: Some("/srv/zeroclaw/shared/skills/pool".to_string()),
+                ..Default::default()
+            },
+        );
+        if let Some(agent) = config.agents.get_mut("researcher") {
+            agent.skill_bundles = vec!["research_tools".to_string()];
+        }
+
+        let plan = plan_export(&config, "researcher", options()).unwrap();
+        let bundle = lookup(&plan.config, &["skill_bundles", "research_tools"])
+            .and_then(toml::Value::as_table)
+            .expect("bundle carried");
+        assert!(!bundle.contains_key("directory"), "{bundle:?}");
+        assert!(
+            plan.dropped
+                .iter()
+                .any(|d| d.path == "skill_bundles.research_tools.directory"),
+            "{:?}",
+            plan.dropped
+        );
+
+        // The source directory still resolves on this host, so the content
+        // travels even though the path itself cannot.
+        assert_eq!(
+            plan.skill_sources[0].source,
+            std::path::PathBuf::from("/srv/zeroclaw/shared/skills/pool")
+        );
+
+        // And the target validates the bundle against its own install root.
+        let text = render_config_toml(&plan).unwrap();
+        let imported: Config = toml::from_str(&text).unwrap();
+        imported
+            .validate()
+            .expect("a bundle directory the target owns validates");
     }
 
     #[test]

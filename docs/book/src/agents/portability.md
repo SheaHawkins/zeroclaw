@@ -10,9 +10,11 @@ An **agent bundle** is the portable form:
 ```text
 <bundle>/
 ├── zeroclaw-agent.toml    — manifest: format version, root alias, provenance,
-│                             required secrets, dropped refs, risk flags
+│                             required secrets, carried skill bundles,
+│                             dropped refs, risk flags
 ├── config.toml            — the config closure this agent needs
-└── workspace/             — the agent's workspace tree
+├── workspace/             — the agent's workspace tree
+└── skills/<alias>/        — content of each skill bundle the agent references
 ```
 
 `config.toml` is a **fragment**, not a whole config. It carries only the
@@ -49,10 +51,11 @@ directory beside the destination and moved into place in one step, so:
 - A failure anywhere, such as an unreadable workspace file or a full disk,
   leaves the destination exactly as it was. There is no partially written
   bundle to mistake for a complete one.
-- A destination that overlaps the agent's workspace is refused before anything
-  is created, in both directions: `--out` *inside* the workspace would have the
-  copy consume its own output, and an `--out` that *contains* the workspace
-  would replace the tree being exported.
+- A destination that overlaps a tree the export reads is refused before
+  anything is created, in both directions and for the workspace and every skill
+  bundle alike: an `--out` *inside* a source would have the copy consume its own
+  output, and an `--out` that *contains* one would replace the tree being
+  exported.
 
 ### What the closure carries
 
@@ -66,7 +69,18 @@ be reconstituted elsewhere:
   is absent from the bundle too;
 - every provider entry the agent names (`model_provider`, `classifier_provider`,
   `summary_provider`, `tts_provider`, `transcription_provider`), carried
-  **keyless**.
+  **keyless**;
+- the provider a carried runtime profile names in its own
+  `context_compression.summary_provider`, which the agent never mentions but
+  the target validates per profile;
+- the **content** of each referenced skill bundle, under `skills/<alias>/`.
+  Skills live in the install-wide `<install>/shared/skills/` tree rather than
+  the agent's workspace, so config alone would import an agent whose skills do
+  not exist. Each bundle's own `include` and `exclude` filter the copy, so a
+  skill the bundle excludes does not travel.
+
+The test of the closure is that it stands alone: parsed on an install with no
+other entries present, it passes `Config::validate()`.
 
 Values equal to the schema default are pruned, so the fragment shows the
 choices someone actually made rather than the whole schema.
@@ -81,6 +95,9 @@ nothing disappears silently.
 | `channels` | Names accounts and credentials that exist only on the source install. |
 | `delegates`, `workspace.access`, `workspace.read_memory_from` | Name sibling agents that will not exist on the target. |
 | `workspace.path` | A source-host absolute path. |
+| `identity.aieos_path` | Dropped only when absolute; a workspace-relative path travels with the workspace. |
+| `delegate_same_risk_profile` | Set to `false`: same-profile auto-delegation would otherwise reach agents on the target this one has never been paired with. |
+| `skill_bundles.<alias>.directory` | Dropped only when absolute; it names the source host and would fail the target's own validation. The target resolves its default location for the alias. |
 | `a2a` | An outward-facing surface; the agent must be re-published deliberately. |
 | `cron_jobs` | Not carried by bundle format 1. |
 | `workspace/memory/` | The agent's private history. Opt in with `--include-memory`. |
@@ -129,6 +146,7 @@ grants it.
 | `delegation_enabled` | `delegation_policy.mode = "allow"`. |
 | `process_spawn` | A stdio MCP server, which starts a local process on the target host. |
 | `untrusted_startup_context` | An MCP server's `pinned_resources`: server-controlled text read into the system prompt at startup. |
+| `carried_skills` | The bundle carries a skill bundle's content: instructions the agent reads, and files it may run. |
 
 A bundle from an untrusted source is untrusted input. Read `config.toml` and
 the manifest's risk flags before importing one, the same way you would read a
@@ -138,8 +156,10 @@ script before running it.
 
 Not yet implemented. A bundle is applied by hand today: merge `config.toml`
 into your install's config, namespacing any alias that collides with one you
-already have, copy `workspace/` into the agent's workspace directory, and
-supply the credentials listed in `required_secrets`.
+already have, copy `workspace/` into the agent's workspace directory, copy each
+`skills/<alias>/` into the directory *your* install resolves for that bundle
+alias (`<install>/shared/skills/<alias>` unless the bundle sets `directory`),
+and supply the credentials listed in `required_secrets`.
 
 Two rules the future `zeroclaw agents import` will enforce, and that a manual
 merge should follow:

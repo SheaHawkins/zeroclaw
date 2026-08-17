@@ -19,7 +19,8 @@ use anyhow::{Context, Result, bail};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use zeroclaw_config::agent_bundle::{
-    self, CONFIG_FILE, ExportOptions, ExportPlan, MANIFEST_FILE, Provenance, WORKSPACE_DIR,
+    self, CONFIG_FILE, ExportOptions, ExportPlan, MANIFEST_FILE, Provenance, SKILLS_DIR,
+    SkillBundleSource, WORKSPACE_DIR,
 };
 use zeroclaw_config::schema::Config;
 
@@ -32,15 +33,43 @@ const STAGING_PREFIX: &str = ".zeroclaw-export-";
 /// Prefix for the previous bundle while the new one is being moved into place.
 const RETIRED_PREFIX: &str = ".zeroclaw-export-old-";
 
-/// Outcome of copying the agent's workspace into the bundle.
+/// Files carried by one copy pass.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct WorkspaceCopy {
+struct CopyTally {
     files: usize,
     bytes: u64,
     /// Symlinks encountered and skipped. They are not followed: a link's
-    /// target may sit outside the workspace, and it would resolve to
+    /// target may sit outside the copied tree, and it would resolve to
     /// something different on the receiving host regardless.
     symlinks_skipped: usize,
+}
+
+/// Skill-bundle content carried into the bundle.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SkillCopy {
+    tally: CopyTally,
+    /// Bundles whose directory was found and copied.
+    bundles: usize,
+    /// Referenced bundles with no directory on this host. Their config travels
+    /// and their content cannot, which the operator is told rather than left
+    /// to discover after an import.
+    missing: Vec<String>,
+}
+
+/// Everything an export copied, for the operator's report.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BundleCopy {
+    workspace: CopyTally,
+    skills: SkillCopy,
+}
+
+/// What one copy pass is walking: how to name it in errors, and which entries
+/// it carries.
+struct CopySpec<'a> {
+    /// Path prefix inside the bundle, for operator-facing messages.
+    root: String,
+    /// Whether an entry, named relative to that root, is carried.
+    filter: &'a dyn Fn(&Path) -> bool,
 }
 
 pub async fn run(
@@ -65,9 +94,9 @@ pub async fn run(
 /// metadata; only then is a staging directory created, filled, and swapped in.
 /// The destination is never partially written and never keeps an entry the new
 /// manifest does not describe.
-async fn write_bundle(plan: &ExportPlan, out: &Path, force: bool) -> Result<WorkspaceCopy> {
+async fn write_bundle(plan: &ExportPlan, out: &Path, force: bool) -> Result<BundleCopy> {
     let dest = resolve_path(out)?;
-    reject_workspace_overlap(&dest, plan, out)?;
+    reject_source_overlap(&dest, plan, out)?;
     check_destination(&dest, out, force).await?;
 
     let config_toml = agent_bundle::render_config_toml(plan).map_err(anyhow::Error::new)?;
@@ -108,7 +137,11 @@ async fn write_bundle(plan: &ExportPlan, out: &Path, force: bool) -> Result<Work
 
     write_file(&staging.path().join(CONFIG_FILE), &config_toml).await?;
     write_file(&staging.path().join(MANIFEST_FILE), &manifest_toml).await?;
-    let copied = copy_workspace(plan, &staging.path().join(WORKSPACE_DIR))?;
+    let mut copied = BundleCopy {
+        workspace: copy_workspace(plan, &staging.path().join(WORKSPACE_DIR))?,
+        skills: SkillCopy::default(),
+    };
+    copy_skill_bundles(plan, &staging.path().join(SKILLS_DIR), &mut copied)?;
 
     publish(staging, &dest, parent)?;
     Ok(copied)
@@ -118,7 +151,7 @@ async fn write_bundle(plan: &ExportPlan, out: &Path, force: bool) -> Result<Work
 ///
 /// The destination need not exist yet, so the nearest existing ancestor is
 /// canonicalized and the components below it are re-appended. Resolving both
-/// sides this way is what makes [`reject_workspace_overlap`] trustworthy: a
+/// sides this way is what makes [`reject_source_overlap`] trustworthy: a
 /// symlinked ancestor (`/tmp` → `/private/tmp` on macOS, an operator's
 /// symlinked data dir anywhere) would otherwise hide an overlap.
 fn resolve_path(path: &Path) -> Result<PathBuf> {
@@ -144,44 +177,83 @@ fn resolve_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
-/// Refuse an export whose destination and source workspace overlap in either
+/// Refuse an export whose destination overlaps a tree it reads, in either
 /// direction.
 ///
-/// A destination containing the workspace would have publishing replace the
-/// very tree the bundle is reading, destroying the agent's workspace. A
-/// destination inside the workspace would have the copy walk into its own
-/// output. Both are refused before anything is created.
-fn reject_workspace_overlap(dest: &Path, plan: &ExportPlan, out: &Path) -> Result<()> {
-    let workspace = resolve_path(&plan.workspace_source)?;
-    let dest_display = out.display().to_string();
-    let workspace_display = plan.workspace_source.display().to_string();
-    // Containment is checked first so that a destination equal to the
-    // workspace reports the destructive shape rather than the recursive one.
-    if workspace.starts_with(dest) {
-        bail!(
-            "{}",
-            mta(
-                "cli-agent-export-dest-contains-workspace",
-                &[
-                    ("path", dest_display.as_str()),
-                    ("workspace", workspace_display.as_str())
-                ],
-                "destination {$path} contains the agent workspace {$workspace} — exporting there would replace the workspace itself"
-            )
-        );
+/// A destination containing a source would have publishing replace the very
+/// tree the bundle is reading, destroying it. A destination inside a source
+/// would have the copy walk into its own output. Every tree the export reads
+/// is checked, the workspace and each skill bundle alike, before anything is
+/// created.
+fn reject_source_overlap(dest: &Path, plan: &ExportPlan, out: &Path) -> Result<()> {
+    reject_overlap(dest, &plan.workspace_source, out, None)?;
+    for skills in &plan.skill_sources {
+        reject_overlap(dest, &skills.source, out, Some(&skills.alias))?;
     }
-    if dest.starts_with(&workspace) {
-        bail!(
-            "{}",
-            mta(
-                "cli-agent-export-dest-inside-workspace",
-                &[
-                    ("path", dest_display.as_str()),
-                    ("workspace", workspace_display.as_str())
-                ],
-                "destination {$path} is inside the agent workspace {$workspace} — choose a path outside it"
-            )
-        );
+    Ok(())
+}
+
+/// One source tree against the destination. `bundle` names the skill bundle
+/// being read, or `None` for the agent's workspace.
+fn reject_overlap(dest: &Path, source: &Path, out: &Path, bundle: Option<&str>) -> Result<()> {
+    let resolved = resolve_path(source)?;
+    let dest_display = out.display().to_string();
+    let source_display = source.display().to_string();
+    // Containment is checked first so that a destination equal to the source
+    // reports the destructive shape rather than the recursive one.
+    if resolved.starts_with(dest) {
+        match bundle {
+            None => bail!(
+                "{}",
+                mta(
+                    "cli-agent-export-dest-contains-workspace",
+                    &[
+                        ("path", dest_display.as_str()),
+                        ("workspace", source_display.as_str())
+                    ],
+                    "destination {$path} contains the agent workspace {$workspace} — exporting there would replace the workspace itself"
+                )
+            ),
+            Some(alias) => bail!(
+                "{}",
+                mta(
+                    "cli-agent-export-dest-contains-skills",
+                    &[
+                        ("path", dest_display.as_str()),
+                        ("alias", alias),
+                        ("source", source_display.as_str())
+                    ],
+                    "destination {$path} contains skill bundle `{$alias}` at {$source} — exporting there would replace the skills the bundle carries"
+                )
+            ),
+        }
+    }
+    if dest.starts_with(&resolved) {
+        match bundle {
+            None => bail!(
+                "{}",
+                mta(
+                    "cli-agent-export-dest-inside-workspace",
+                    &[
+                        ("path", dest_display.as_str()),
+                        ("workspace", source_display.as_str())
+                    ],
+                    "destination {$path} is inside the agent workspace {$workspace} — choose a path outside it"
+                )
+            ),
+            Some(alias) => bail!(
+                "{}",
+                mta(
+                    "cli-agent-export-dest-inside-skills",
+                    &[
+                        ("path", dest_display.as_str()),
+                        ("alias", alias),
+                        ("source", source_display.as_str())
+                    ],
+                    "destination {$path} is inside skill bundle `{$alias}` at {$source} — choose a path outside it"
+                )
+            ),
+        }
     }
     Ok(())
 }
@@ -302,8 +374,8 @@ async fn write_file(path: &Path, contents: &str) -> Result<()> {
 /// swapped for a symlink between the classification and the read therefore
 /// cannot redirect the copy outside the tree that handle names; a path-based
 /// walk would have followed it.
-fn copy_workspace(plan: &ExportPlan, dest: &Path) -> Result<WorkspaceCopy> {
-    let mut copied = WorkspaceCopy::default();
+fn copy_workspace(plan: &ExportPlan, dest: &Path) -> Result<CopyTally> {
+    let mut copied = CopyTally::default();
     if !plan.workspace_source.is_dir() {
         return Ok(copied);
     }
@@ -314,18 +386,94 @@ fn copy_workspace(plan: &ExportPlan, dest: &Path) -> Result<WorkspaceCopy> {
                 plan.workspace_source.display()
             )
         })?;
-    std::fs::create_dir_all(dest)
-        .with_context(|| format!("failed to create {}", dest.display()))?;
-    let target = Dir::open_ambient_dir(dest, ambient_authority())
-        .with_context(|| format!("failed to open {}", dest.display()))?;
-    copy_tree(
-        &source,
-        &target,
-        &PathBuf::new(),
-        plan.include_memory,
-        &mut copied,
-    )?;
+    let target = open_bundle_dir(dest)?;
+    let include_memory = plan.include_memory;
+    let spec = CopySpec {
+        root: WORKSPACE_DIR.to_string(),
+        filter: &|relative| agent_bundle::workspace_entry_included(relative, include_memory),
+    };
+    copy_tree(&source, &target, &spec, &PathBuf::new(), &mut copied)?;
     Ok(copied)
+}
+
+/// Copy the content of every skill bundle the agent references.
+///
+/// Skills live under the install-wide `shared/skills/` tree rather than the
+/// agent's workspace, so the config alone would import an agent whose skills
+/// are absent. A skill is a directory inside the bundle's directory: the copy
+/// carries the child directories the bundle admits and nothing else, so a
+/// skill the bundle excludes never travels and loose local state (sync
+/// markers and the like) stays behind.
+fn copy_skill_bundles(plan: &ExportPlan, dest_root: &Path, into: &mut BundleCopy) -> Result<()> {
+    for source in &plan.skill_sources {
+        if !source.source.is_dir() {
+            into.skills.missing.push(source.alias.clone());
+            continue;
+        }
+        let bundle = Dir::open_ambient_dir(&source.source, ambient_authority())
+            .with_context(|| format!("failed to open skill bundle `{}`", source.alias))?;
+        let target = open_bundle_dir(&dest_root.join(&source.alias))?;
+        copy_skills(&bundle, &target, source, &mut into.skills.tally)?;
+        into.skills.bundles += 1;
+    }
+    Ok(())
+}
+
+/// Copy the skills one bundle admits, each through its own directory handle.
+fn copy_skills(
+    source: &Dir,
+    dest: &Dir,
+    bundle: &SkillBundleSource,
+    copied: &mut CopyTally,
+) -> Result<()> {
+    let root = format!("{SKILLS_DIR}/{}", bundle.alias);
+    let entries = source
+        .entries()
+        .with_context(|| format!("failed to read {root}"))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("failed to read {root}"))?;
+        let name = entry.file_name();
+        // A skill the config cannot name is not a skill this bundle grants.
+        let Some(skill) = name.to_str() else {
+            continue;
+        };
+        if !bundle.filter.admits_skill(skill) {
+            continue;
+        }
+        let file_type = entry
+            .metadata()
+            .with_context(|| format!("failed to stat {root}/{skill}"))?
+            .file_type();
+        if file_type.is_symlink() {
+            copied.symlinks_skipped += 1;
+            continue;
+        }
+        if !file_type.is_dir() {
+            continue;
+        }
+        let child_source = entry
+            .open_dir()
+            .with_context(|| format!("failed to open {root}/{skill}"))?;
+        dest.create_dir(&name)
+            .with_context(|| format!("failed to create {root}/{skill} in the bundle"))?;
+        let child_dest = dest
+            .open_dir(&name)
+            .with_context(|| format!("failed to open {root}/{skill} in the bundle"))?;
+        let spec = CopySpec {
+            root: root.clone(),
+            filter: &|_| true,
+        };
+        copy_tree(&child_source, &child_dest, &spec, Path::new(skill), copied)?;
+    }
+    Ok(())
+}
+
+/// Create a directory inside the staging bundle and open a handle on it.
+fn open_bundle_dir(path: &Path) -> Result<Dir> {
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    Dir::open_ambient_dir(path, ambient_authority())
+        .with_context(|| format!("failed to open {}", path.display()))
 }
 
 /// Copy one directory's entries, recursing through child handles.
@@ -335,18 +483,18 @@ fn copy_workspace(plan: &ExportPlan, dest: &Path) -> Result<WorkspaceCopy> {
 fn copy_tree(
     source: &Dir,
     dest: &Dir,
+    spec: &CopySpec<'_>,
     relative: &Path,
-    include_memory: bool,
-    copied: &mut WorkspaceCopy,
+    copied: &mut CopyTally,
 ) -> Result<()> {
     let entries = source
         .entries()
-        .with_context(|| format!("failed to read {}", rel(relative)))?;
+        .with_context(|| format!("failed to read {}", rel(spec, relative)))?;
     for entry in entries {
-        let entry = entry.with_context(|| format!("failed to read {}", rel(relative)))?;
+        let entry = entry.with_context(|| format!("failed to read {}", rel(spec, relative)))?;
         let name = entry.file_name();
         let child = relative.join(&name);
-        if !agent_bundle::workspace_entry_included(&child, include_memory) {
+        if !(spec.filter)(&child) {
             continue;
         }
 
@@ -355,7 +503,7 @@ fn copy_tree(
         // name, not whatever a fresh path lookup would resolve to.
         let file_type = entry
             .metadata()
-            .with_context(|| format!("failed to stat {}", rel(&child)))?
+            .with_context(|| format!("failed to stat {}", rel(spec, &child)))?
             .file_type();
         if file_type.is_symlink() {
             copied.symlinks_skipped += 1;
@@ -371,36 +519,36 @@ fn copy_tree(
         if file_type.is_dir() {
             let child_source = entry
                 .open_dir()
-                .with_context(|| format!("failed to open {}", rel(&child)))?;
+                .with_context(|| format!("failed to open {}", rel(spec, &child)))?;
             dest.create_dir(&name)
-                .with_context(|| format!("failed to create {} in the bundle", rel(&child)))?;
+                .with_context(|| format!("failed to create {} in the bundle", rel(spec, &child)))?;
             let child_dest = dest
                 .open_dir(&name)
-                .with_context(|| format!("failed to open {} in the bundle", rel(&child)))?;
-            copy_tree(&child_source, &child_dest, &child, include_memory, copied)?;
+                .with_context(|| format!("failed to open {} in the bundle", rel(spec, &child)))?;
+            copy_tree(&child_source, &child_dest, spec, &child, copied)?;
         } else {
             let mut reader = entry
                 .open()
-                .with_context(|| format!("failed to open {}", rel(&child)))?;
+                .with_context(|| format!("failed to open {}", rel(spec, &child)))?;
             // The opened handle, not the name, decides what gets copied: an
             // entry that is no longer a regular file is left out rather than
             // read through whatever replaced it.
             let source_metadata = reader
                 .metadata()
-                .with_context(|| format!("failed to stat {}", rel(&child)))?;
+                .with_context(|| format!("failed to stat {}", rel(spec, &child)))?;
             if !source_metadata.is_file() {
                 continue;
             }
             let mut writer = dest
                 .open_with(&name, OpenOptions::new().write(true).create_new(true))
-                .with_context(|| format!("failed to create {} in the bundle", rel(&child)))?;
+                .with_context(|| format!("failed to create {} in the bundle", rel(spec, &child)))?;
             let bytes = std::io::copy(&mut reader, &mut writer)
-                .with_context(|| format!("failed to copy {} into the bundle", rel(&child)))?;
+                .with_context(|| format!("failed to copy {} into the bundle", rel(spec, &child)))?;
             // Carry the mode across, so an executable in the workspace is still
             // executable for whoever imports the bundle.
             writer
                 .set_permissions(source_metadata.permissions())
-                .with_context(|| format!("failed to set permissions on {}", rel(&child)))?;
+                .with_context(|| format!("failed to set permissions on {}", rel(spec, &child)))?;
             copied.files += 1;
             copied.bytes += bytes;
         }
@@ -408,14 +556,13 @@ fn copy_tree(
     Ok(())
 }
 
-/// Render a workspace-relative path for an error message. The bundle names
-/// entries relative to the workspace root, and so do these.
-fn rel(relative: &Path) -> String {
+/// Render a path for an error message, named as it sits inside the bundle.
+fn rel(spec: &CopySpec<'_>, relative: &Path) -> String {
     let shown = relative.display().to_string();
     if shown.is_empty() {
-        WORKSPACE_DIR.to_string()
+        spec.root.clone()
     } else {
-        format!("{WORKSPACE_DIR}/{shown}")
+        format!("{}/{shown}", spec.root)
     }
 }
 
@@ -432,9 +579,9 @@ fn entry_swap_seam(relative: &Path) {
     tests::run_entry_swap_seam(relative);
 }
 
-fn report(plan: &ExportPlan, out: &Path, copied: &WorkspaceCopy) {
-    let files = copied.files.to_string();
-    let kib = (copied.bytes / 1024).to_string();
+fn report(plan: &ExportPlan, out: &Path, copied: &BundleCopy) {
+    let files = copied.workspace.files.to_string();
+    let kib = (copied.workspace.bytes / 1024).to_string();
     println!(
         "{}",
         mta(
@@ -449,8 +596,33 @@ fn report(plan: &ExportPlan, out: &Path, copied: &WorkspaceCopy) {
         )
     );
 
-    if copied.symlinks_skipped > 0 {
-        let count = copied.symlinks_skipped.to_string();
+    if copied.skills.bundles > 0 {
+        let files = copied.skills.tally.files.to_string();
+        let bundles = copied.skills.bundles.to_string();
+        println!(
+            "{}",
+            mta(
+                "cli-agent-export-skills-carried",
+                &[("files", files.as_str()), ("bundles", bundles.as_str())],
+                "  {$files} skill file(s) carried from {$bundles} skill bundle(s)"
+            )
+        );
+    }
+    for alias in &copied.skills.missing {
+        eprintln!(
+            "{}",
+            mta(
+                "cli-agent-export-skills-missing",
+                &[("alias", alias.as_str())],
+                "  warning: skill bundle `{$alias}` has no directory on this host — its config \
+                 travels, its content does not"
+            )
+        );
+    }
+
+    let symlinks_skipped = copied.workspace.symlinks_skipped + copied.skills.tally.symlinks_skipped;
+    if symlinks_skipped > 0 {
+        let count = symlinks_skipped.to_string();
         println!(
             "{}",
             mta(
@@ -563,6 +735,7 @@ mod tests {
             dropped: Vec::new(),
             risk_flags: Vec::new(),
             workspace_source: workspace.to_path_buf(),
+            skill_sources: Vec::new(),
             include_memory,
         }
     }
@@ -672,7 +845,135 @@ mod tests {
         let dest = tempfile::tempdir().unwrap();
         let plan = plan_for(Path::new("/nonexistent/zeroclaw/workspace"), false);
         let copied = copy_workspace(&plan, dest.path()).unwrap();
-        assert_eq!(copied, WorkspaceCopy::default());
+        assert_eq!(copied, CopyTally::default());
+    }
+
+    fn skill_source(alias: &str, dir: &Path, exclude: &[&str]) -> SkillBundleSource {
+        SkillBundleSource {
+            alias: alias.to_string(),
+            source: dir.to_path_buf(),
+            filter: zeroclaw_config::schema::SkillBundleConfig {
+                directory: None,
+                include: Vec::new(),
+                exclude: exclude.iter().map(|s| (*s).to_string()).collect(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_bundle_content_travels_next_to_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        write(&workspace.path().join("IDENTITY.md"), "identity");
+
+        // Skills live outside the workspace, under the install-wide tree.
+        let skills = tempfile::tempdir().unwrap();
+        write(&skills.path().join("web_search/SKILL.md"), "# search");
+        write(&skills.path().join("web_search/run.sh"), "#!/bin/sh\n");
+        write(&skills.path().join("internal_only/SKILL.md"), "# internal");
+        write(&skills.path().join(".sync-marker"), "local state");
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_for(workspace.path(), false);
+        plan.skill_sources = vec![skill_source(
+            "research_tools",
+            skills.path(),
+            &["internal_only"],
+        )];
+
+        let copied = write_bundle(&plan, &out, false).await.unwrap();
+
+        assert_eq!(copied.skills.bundles, 1);
+        assert_eq!(copied.skills.tally.files, 2);
+        assert!(copied.skills.missing.is_empty());
+
+        let carried = out.join(SKILLS_DIR).join("research_tools");
+        assert!(carried.join("web_search/SKILL.md").is_file());
+        assert!(carried.join("web_search/run.sh").is_file());
+        // Excluded by the bundle, so it is not the agent's to carry.
+        assert!(!carried.join("internal_only").exists());
+        // A loose file is local state, not a skill.
+        assert!(!carried.join(".sync-marker").exists());
+        assert_eq!(entry_names(&carried), vec!["web_search".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_destination_overlapping_a_skill_bundle_is_refused() {
+        let workspace = tempfile::tempdir().unwrap();
+        write(&workspace.path().join("IDENTITY.md"), "identity");
+        let skills = tempfile::tempdir().unwrap();
+        write(&skills.path().join("web_search/SKILL.md"), "# search");
+
+        let mut plan = plan_for(workspace.path(), false);
+        plan.skill_sources = vec![skill_source("research_tools", skills.path(), &[])];
+
+        // Inside the bundle's directory: the copy would consume its own output.
+        let err = write_bundle(&plan, &skills.path().join("exports/bundle"), true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("inside skill bundle"), "{err}");
+
+        // Containing it: publishing would replace the skills being read.
+        let err = write_bundle(&plan, skills.path(), true).await.unwrap_err();
+        assert!(err.to_string().contains("contains skill bundle"), "{err}");
+        assert!(skills.path().join("web_search/SKILL.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn a_skill_bundle_with_no_directory_on_this_host_is_reported_not_fatal() {
+        let workspace = tempfile::tempdir().unwrap();
+        write(&workspace.path().join("IDENTITY.md"), "identity");
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_for(workspace.path(), false);
+        plan.skill_sources = vec![skill_source(
+            "research_tools",
+            Path::new("/nonexistent/shared/skills/research_tools"),
+            &[],
+        )];
+
+        let copied = write_bundle(&plan, &out, false).await.unwrap();
+
+        assert_eq!(copied.skills.bundles, 0);
+        assert_eq!(copied.skills.missing, vec!["research_tools".to_string()]);
+        assert!(!out.join(SKILLS_DIR).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_skill_is_skipped_rather_than_followed() {
+        let outside = tempfile::tempdir().unwrap();
+        write(&outside.path().join("secret/SKILL.md"), "host secret");
+
+        let workspace = tempfile::tempdir().unwrap();
+        write(&workspace.path().join("IDENTITY.md"), "identity");
+
+        let skills = tempfile::tempdir().unwrap();
+        write(&skills.path().join("web_search/SKILL.md"), "# search");
+        std::os::unix::fs::symlink(
+            outside.path().join("secret"),
+            skills.path().join("borrowed"),
+        )
+        .unwrap();
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_for(workspace.path(), false);
+        plan.skill_sources = vec![skill_source("research_tools", skills.path(), &[])];
+
+        let copied = write_bundle(&plan, &out, false).await.unwrap();
+
+        assert_eq!(copied.skills.tally.files, 1);
+        assert_eq!(copied.skills.tally.symlinks_skipped, 1);
+        assert!(
+            !out.join(SKILLS_DIR)
+                .join("research_tools/borrowed")
+                .exists()
+        );
     }
 
     #[test]
@@ -780,7 +1081,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(copied.files, 1);
+        assert_eq!(copied.workspace.files, 1);
         assert!(out.join(CONFIG_FILE).is_file());
         assert!(out.join(MANIFEST_FILE).is_file());
         assert!(out.join(WORKSPACE_DIR).join("IDENTITY.md").is_file());
@@ -830,7 +1131,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(copied.files, 1);
+        assert_eq!(copied.workspace.files, 1);
         // `leftover.toml` is gone: the bundle was replaced, not merged into.
         assert_eq!(
             entry_names(&out),
