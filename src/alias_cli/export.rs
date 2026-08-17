@@ -19,8 +19,8 @@ use anyhow::{Context, Result, bail};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use zeroclaw_config::agent_bundle::{
-    self, CONFIG_FILE, ExportOptions, ExportPlan, MANIFEST_FILE, Provenance, SKILLS_DIR,
-    SkillBundleSource, WORKSPACE_DIR,
+    self, CONFIG_FILE, ExportPlan, MANIFEST_FILE, Provenance, SKILLS_DIR, SkillBundleSource,
+    WORKSPACE_DIR,
 };
 use zeroclaw_config::schema::Config;
 
@@ -72,15 +72,8 @@ struct CopySpec<'a> {
     filter: &'a dyn Fn(&Path) -> bool,
 }
 
-pub async fn run(
-    config: &Config,
-    alias: &str,
-    out: &Path,
-    include_memory: bool,
-    force: bool,
-) -> Result<()> {
-    let plan = agent_bundle::plan_export(config, alias, ExportOptions { include_memory })
-        .map_err(anyhow::Error::new)?;
+pub async fn run(config: &Config, alias: &str, out: &Path, force: bool) -> Result<()> {
+    let plan = agent_bundle::plan_export(config, alias).map_err(anyhow::Error::new)?;
 
     let copied = write_bundle(&plan, out, force).await?;
 
@@ -387,10 +380,9 @@ fn copy_workspace(plan: &ExportPlan, dest: &Path) -> Result<CopyTally> {
             )
         })?;
     let target = open_bundle_dir(dest)?;
-    let include_memory = plan.include_memory;
     let spec = CopySpec {
         root: WORKSPACE_DIR.to_string(),
-        filter: &|relative| agent_bundle::workspace_entry_included(relative, include_memory),
+        filter: &agent_bundle::workspace_entry_included,
     };
     copy_tree(&source, &target, &spec, &PathBuf::new(), &mut copied)?;
     Ok(copied)
@@ -727,7 +719,7 @@ mod tests {
         std::fs::write(path, body).unwrap();
     }
 
-    fn plan_for(workspace: &Path, include_memory: bool) -> ExportPlan {
+    fn plan_for(workspace: &Path) -> ExportPlan {
         ExportPlan {
             root_alias: "researcher".to_string(),
             config: toml::Table::new(),
@@ -736,7 +728,6 @@ mod tests {
             risk_flags: Vec::new(),
             workspace_source: workspace.to_path_buf(),
             skill_sources: Vec::new(),
-            include_memory,
         }
     }
 
@@ -787,14 +778,14 @@ mod tests {
     }
 
     #[test]
-    fn copy_skips_the_memory_store_by_default() {
+    fn copy_skips_the_memory_store() {
         let source = tempfile::tempdir().unwrap();
         let dest = tempfile::tempdir().unwrap();
         write(&source.path().join("IDENTITY.md"), "identity");
         write(&source.path().join("notes/plan.md"), "plan");
         write(&source.path().join("memory/brain.db"), "sqlite");
 
-        let plan = plan_for(source.path(), false);
+        let plan = plan_for(source.path());
         let copied = copy_workspace(&plan, dest.path()).unwrap();
 
         assert_eq!(copied.files, 2);
@@ -803,18 +794,73 @@ mod tests {
         assert!(!dest.path().join("memory").exists());
     }
 
-    #[test]
-    fn copy_carries_the_memory_store_when_requested() {
+    /// Every file under `dir`, recursively.
+    fn all_files(dir: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let mut queue = vec![dir.to_path_buf()];
+        while let Some(next) = queue.pop() {
+            for entry in std::fs::read_dir(&next).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    queue.push(path);
+                } else {
+                    found.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    /// Format 1 carries no memory at all, so the bundle must contain no
+    /// database — under any name, not just the paths the filter knows about.
+    /// This is the consistency boundary the format chose: a live WAL database
+    /// cannot be copied as files without risking a torn read, so none is
+    /// copied, and the export is checked against the published artifact.
+    #[tokio::test]
+    async fn no_database_reaches_the_published_bundle() {
+        const SQLITE_MAGIC: &[u8] = b"SQLite format 3\0";
+
         let source = tempfile::tempdir().unwrap();
-        let dest = tempfile::tempdir().unwrap();
         write(&source.path().join("IDENTITY.md"), "identity");
-        write(&source.path().join("memory/brain.db"), "sqlite");
+        // A store mid-write: the database plus the WAL sidecars that hold
+        // commits not yet folded back into it.
+        std::fs::create_dir_all(source.path().join("memory")).unwrap();
+        for name in ["brain.db", "brain.db-wal", "brain.db-shm"] {
+            let mut bytes = SQLITE_MAGIC.to_vec();
+            bytes.extend_from_slice(b"\x00\x01uncommitted");
+            std::fs::write(source.path().join("memory").join(name), bytes).unwrap();
+        }
+        // The snapshot the store re-hydrates from lives at the workspace root,
+        // outside `memory/`, and is memory in another form.
+        write(
+            &source.path().join("MEMORY_SNAPSHOT.md"),
+            "# 🧠 ZeroClaw Memory Snapshot\n\n- user's home address\n",
+        );
 
-        let plan = plan_for(source.path(), true);
-        let copied = copy_workspace(&plan, dest.path()).unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
 
-        assert_eq!(copied.files, 2);
-        assert!(dest.path().join("memory/brain.db").exists());
+        let copied = write_bundle(&plan_for(source.path()), &out, false)
+            .await
+            .unwrap();
+
+        assert_eq!(copied.workspace.files, 1);
+        assert!(!out.join(WORKSPACE_DIR).join("memory").exists());
+        assert!(!out.join(WORKSPACE_DIR).join("MEMORY_SNAPSHOT.md").exists());
+
+        for file in all_files(&out) {
+            let bytes = std::fs::read(&file).unwrap();
+            assert!(
+                !bytes.starts_with(SQLITE_MAGIC),
+                "{} is a database",
+                file.display()
+            );
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains("home address"),
+                "{} carries memory content",
+                file.display()
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -832,7 +878,7 @@ mod tests {
         )
         .unwrap();
 
-        let plan = plan_for(source.path(), false);
+        let plan = plan_for(source.path());
         let copied = copy_workspace(&plan, dest.path()).unwrap();
 
         assert_eq!(copied.files, 1);
@@ -843,7 +889,7 @@ mod tests {
     #[test]
     fn missing_workspace_is_not_an_error() {
         let dest = tempfile::tempdir().unwrap();
-        let plan = plan_for(Path::new("/nonexistent/zeroclaw/workspace"), false);
+        let plan = plan_for(Path::new("/nonexistent/zeroclaw/workspace"));
         let copied = copy_workspace(&plan, dest.path()).unwrap();
         assert_eq!(copied, CopyTally::default());
     }
@@ -875,7 +921,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let out = parent.path().join("bundle");
 
-        let mut plan = plan_for(workspace.path(), false);
+        let mut plan = plan_for(workspace.path());
         plan.skill_sources = vec![skill_source(
             "research_tools",
             skills.path(),
@@ -905,7 +951,7 @@ mod tests {
         let skills = tempfile::tempdir().unwrap();
         write(&skills.path().join("web_search/SKILL.md"), "# search");
 
-        let mut plan = plan_for(workspace.path(), false);
+        let mut plan = plan_for(workspace.path());
         plan.skill_sources = vec![skill_source("research_tools", skills.path(), &[])];
 
         // Inside the bundle's directory: the copy would consume its own output.
@@ -928,7 +974,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let out = parent.path().join("bundle");
 
-        let mut plan = plan_for(workspace.path(), false);
+        let mut plan = plan_for(workspace.path());
         plan.skill_sources = vec![skill_source(
             "research_tools",
             Path::new("/nonexistent/shared/skills/research_tools"),
@@ -962,7 +1008,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let out = parent.path().join("bundle");
 
-        let mut plan = plan_for(workspace.path(), false);
+        let mut plan = plan_for(workspace.path());
         plan.skill_sources = vec![skill_source("research_tools", skills.path(), &[])];
 
         let copied = write_bundle(&plan, &out, false).await.unwrap();
@@ -987,7 +1033,7 @@ mod tests {
             write(&script, "#!/bin/sh\n");
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-            copy_workspace(&plan_for(source.path(), false), dest.path()).unwrap();
+            copy_workspace(&plan_for(source.path()), dest.path()).unwrap();
 
             let mode = std::fs::metadata(dest.path().join("run.sh"))
                 .unwrap()
@@ -1014,7 +1060,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let out = parent.path().join("bundle");
 
-        let plan = plan_for(source.path(), false);
+        let plan = plan_for(source.path());
         let result = {
             let _swap = EntrySwap::install(move |relative| {
                 if relative == Path::new("notes.md") {
@@ -1049,7 +1095,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let out = parent.path().join("bundle");
 
-        let plan = plan_for(source.path(), false);
+        let plan = plan_for(source.path());
         let target = outside.path().to_path_buf();
         let result = {
             let _swap = EntrySwap::install(move |relative| {
@@ -1077,7 +1123,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let out = parent.path().join("bundle");
 
-        let copied = write_bundle(&plan_for(source.path(), false), &out, false)
+        let copied = write_bundle(&plan_for(source.path()), &out, false)
             .await
             .unwrap();
 
@@ -1098,7 +1144,7 @@ mod tests {
         let out = parent.path().join("bundle");
         write(&out.join("config.toml"), "# existing");
 
-        let err = write_bundle(&plan_for(source.path(), false), &out, false)
+        let err = write_bundle(&plan_for(source.path()), &out, false)
             .await
             .unwrap_err();
 
@@ -1127,7 +1173,7 @@ mod tests {
             "# stale workspace file",
         );
 
-        let copied = write_bundle(&plan_for(source.path(), false), &out, true)
+        let copied = write_bundle(&plan_for(source.path()), &out, true)
             .await
             .unwrap();
 
@@ -1186,7 +1232,7 @@ mod tests {
         let out = parent.path().join("bundle");
         write(&out.join(CONFIG_FILE), "# previous export");
 
-        let err = write_bundle(&plan_for(source.path(), false), &out, true)
+        let err = write_bundle(&plan_for(source.path()), &out, true)
             .await
             .unwrap_err();
 
@@ -1205,7 +1251,7 @@ mod tests {
         write(&source.path().join("IDENTITY.md"), "identity");
         let out = source.path().join("exports/bundle");
 
-        let err = write_bundle(&plan_for(source.path(), false), &out, true)
+        let err = write_bundle(&plan_for(source.path()), &out, true)
             .await
             .unwrap_err();
 
@@ -1222,7 +1268,7 @@ mod tests {
         let workspace = root.path().join("agents/researcher/workspace");
         write(&workspace.join("IDENTITY.md"), "identity");
 
-        let err = write_bundle(&plan_for(&workspace, false), root.path(), true)
+        let err = write_bundle(&plan_for(&workspace), root.path(), true)
             .await
             .unwrap_err();
 
@@ -1239,7 +1285,7 @@ mod tests {
         let source = tempfile::tempdir().unwrap();
         write(&source.path().join("IDENTITY.md"), "identity");
 
-        let err = write_bundle(&plan_for(source.path(), false), source.path(), true)
+        let err = write_bundle(&plan_for(source.path()), source.path(), true)
             .await
             .unwrap_err();
 
@@ -1262,7 +1308,7 @@ mod tests {
         let link = links.path().join("link");
         std::os::unix::fs::symlink(source.path(), &link).unwrap();
 
-        let err = write_bundle(&plan_for(source.path(), false), &link.join("bundle"), true)
+        let err = write_bundle(&plan_for(source.path()), &link.join("bundle"), true)
             .await
             .unwrap_err();
 
@@ -1282,7 +1328,7 @@ mod tests {
         let out = parent.path().join("bundle");
         write(&out, "not a directory");
 
-        let err = write_bundle(&plan_for(source.path(), false), &out, true)
+        let err = write_bundle(&plan_for(source.path()), &out, true)
             .await
             .unwrap_err();
 

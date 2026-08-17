@@ -35,7 +35,6 @@ zeroclaw agents export <alias> --out ./my-agent
 | Flag | Effect |
 | --- | --- |
 | `--out <dir>` | Destination bundle directory, created if absent. |
-| `--include-memory` | Carry `workspace/memory/` (off by default). |
 | `--force` | Replace a destination that already has contents. |
 
 Export is read-only against the install and reports three things: the
@@ -100,7 +99,22 @@ nothing disappears silently.
 | `skill_bundles.<alias>.directory` | Dropped only when absolute; it names the source host and would fail the target's own validation. The target resolves its default location for the alias. |
 | `a2a` | An outward-facing surface; the agent must be re-published deliberately. |
 | `cron_jobs` | Not carried by bundle format 1. |
-| `workspace/memory/` | The agent's private history. Opt in with `--include-memory`. |
+| `workspace/memory/` | The memory store. See below. |
+| `workspace/MEMORY_SNAPSHOT.md` | The core-memory export the store re-hydrates from: memory in another form. |
+
+### Memory does not travel
+
+Bundle format 1 carries no memory, and there is no flag to opt in. The store is
+a live SQLite database in WAL mode: while the agent is running, its committed
+state is spread across the database and its `-wal` sidecar, so copying those
+files one at a time can capture a torn or stale database. A bundle is not a
+place to discover that. Carrying memory needs a real snapshot boundary, taken
+through SQLite's own backup API against a quiesced store, which a later format
+version can add.
+
+Both forms memory takes on disk stay behind: the store under `workspace/memory/`
+and the `MEMORY_SNAPSHOT.md` at the workspace root that an agent re-hydrates the
+store from. An imported agent starts with an empty memory.
 
 Symlinks inside the workspace are skipped rather than followed: a link's target
 may sit outside the workspace, and it would resolve differently on the

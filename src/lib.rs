@@ -359,9 +359,6 @@ pub enum AgentsCommands {
         /// Destination bundle directory (created if it does not exist)
         #[arg(long, short)]
         out: std::path::PathBuf,
-        /// Carry the agent's private memory store into the bundle
-        #[arg(long)]
-        include_memory: bool,
         /// Replace the contents of a destination directory that already has files
         #[arg(long)]
         force: bool,

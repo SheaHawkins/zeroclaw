@@ -56,22 +56,17 @@ pub const WORKSPACE_DIR: &str = "workspace";
 /// carrying the config alone would import an agent whose skills are missing.
 pub const SKILLS_DIR: &str = "skills";
 
-/// Workspace subdirectory holding the agent's private memory store. Excluded
-/// from the bundle unless [`ExportOptions::include_memory`] is set.
+/// Workspace subdirectory holding the agent's private memory store. Never
+/// carried by bundle format 1 — see [`plan_export`].
 pub const WORKSPACE_MEMORY_DIR: &str = "memory";
+
+/// The memory snapshot at the workspace root, excluded alongside the store.
+/// Re-exported from [`crate::paths`], which owns the name.
+pub use crate::paths::MEMORY_SNAPSHOT_FILE;
 
 /// Config-value prefixes produced by [`crate::secrets::SecretStore`]. A value
 /// carrying one of these has escaped scrubbing and must never reach a bundle.
 const CIPHERTEXT_PREFIXES: &[&str] = &["enc:", "enc2:"];
-
-/// Options controlling what an export carries.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ExportOptions {
-    /// Copy `workspace/memory/` into the bundle. Off by default: the memory
-    /// store is the agent's accumulated private history, not portable
-    /// configuration, and it is usually the largest thing in a workspace.
-    pub include_memory: bool,
-}
 
 /// Why a piece of the agent's configuration was left out of the bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,8 +208,6 @@ pub struct ExportPlan {
     pub workspace_source: PathBuf,
     /// Skill-bundle directories to copy into the bundle's `skills/` tree.
     pub skill_sources: Vec<SkillBundleSource>,
-    /// Whether `workspace/memory/` should be copied.
-    pub include_memory: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -240,11 +233,7 @@ pub enum ExportError {
 /// with dangling references still exports (the unresolvable entries are simply
 /// absent from the closure, and the import-side `Config::validate()` is the
 /// gate that catches them).
-pub fn plan_export(
-    config: &Config,
-    alias: &str,
-    options: ExportOptions,
-) -> Result<ExportPlan, ExportError> {
+pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportError> {
     let agent = config
         .agents
         .get(alias)
@@ -447,15 +436,26 @@ pub fn plan_export(
     required_secrets.sort();
     required_secrets.dedup();
 
-    if !options.include_memory {
-        dropped.push(DroppedRef {
-            path: format!("{WORKSPACE_DIR}/{WORKSPACE_MEMORY_DIR}"),
-            reason: DropReason::PrivateData,
-            detail: "the agent's memory store is private accumulated history; \
-                     re-run with --include-memory to carry it"
-                .to_string(),
-        });
-    }
+    // Memory does not travel in format 1, in either of the forms it takes on
+    // disk. The store is a live SQLite database in WAL mode: copying its files
+    // while the agent is running can capture a torn or stale database, and a
+    // bundle is not a place to discover that. Carrying it needs a real
+    // snapshot boundary, which a later format version can add.
+    dropped.push(DroppedRef {
+        path: format!("{WORKSPACE_DIR}/{WORKSPACE_MEMORY_DIR}"),
+        reason: DropReason::NotYetPortable,
+        detail: "the memory store is a live SQLite database in WAL mode, which cannot be \
+                 copied as files without risking a torn or stale snapshot; bundle format 1 \
+                 does not carry it"
+            .to_string(),
+    });
+    dropped.push(DroppedRef {
+        path: format!("{WORKSPACE_DIR}/{MEMORY_SNAPSHOT_FILE}"),
+        reason: DropReason::PrivateData,
+        detail: "the memory snapshot is an export of the agent's core memories, which an \
+                 agent re-hydrates its store from; it stays with the store it came from"
+            .to_string(),
+    });
 
     let risk_flags = collect_risk_flags(config, alias, agent, &granted, &skill_sources);
 
@@ -467,7 +467,6 @@ pub fn plan_export(
         risk_flags,
         workspace_source: config.agent_workspace_dir(alias),
         skill_sources,
-        include_memory: options.include_memory,
     })
 }
 
@@ -943,10 +942,6 @@ pub fn render_manifest(plan: &ExportPlan, provenance: &Provenance) -> toml::Tabl
         toml::Value::String(plan.root_alias.clone()),
     );
     manifest.insert(
-        "includes_memory".to_string(),
-        toml::Value::Boolean(plan.include_memory),
-    );
-    manifest.insert(
         "required_secrets".to_string(),
         toml::Value::Array(
             plan.required_secrets
@@ -1052,15 +1047,21 @@ pub fn render_manifest_toml(
 }
 
 /// Whether a workspace-relative path should be copied into the bundle.
+///
+/// Both halves of the agent's memory are excluded: the store under
+/// `memory/`, and the [`MEMORY_SNAPSHOT_FILE`] at the workspace root that an
+/// agent re-hydrates the store from. Only the snapshot at the root is the
+/// store's own; a file of that name deeper in the tree is the operator's.
 #[must_use]
-pub fn workspace_entry_included(relative: &std::path::Path, include_memory: bool) -> bool {
-    if include_memory {
+pub fn workspace_entry_included(relative: &std::path::Path) -> bool {
+    let mut components = relative.components();
+    let Some(first) = components.next() else {
         return true;
+    };
+    if first.as_os_str() == WORKSPACE_MEMORY_DIR {
+        return false;
     }
-    relative
-        .components()
-        .next()
-        .is_none_or(|first| first.as_os_str() != WORKSPACE_MEMORY_DIR)
+    components.next().is_some() || first.as_os_str() != MEMORY_SNAPSHOT_FILE
 }
 
 /// Cross-agent access modes present in a bundle, for the import-side report.
@@ -1080,10 +1081,6 @@ mod tests {
     use crate::autonomy::{AutonomyLevel, DelegationMode};
     use crate::multi_agent::AgentWorkspaceConfig;
     use std::collections::HashMap;
-
-    fn options() -> ExportOptions {
-        ExportOptions::default()
-    }
 
     /// Config with one agent wired to a risk profile, an MCP bundle granting
     /// two of three servers, and an Anthropic model provider carrying a key.
@@ -1159,13 +1156,13 @@ mod tests {
     #[test]
     fn unknown_alias_is_an_error() {
         let config = Config::default();
-        let err = plan_export(&config, "nobody", options()).unwrap_err();
+        let err = plan_export(&config, "nobody").unwrap_err();
         assert!(matches!(err, ExportError::UnknownAgent(alias) if alias == "nobody"));
     }
 
     #[test]
     fn closure_carries_only_the_servers_the_bundles_grant() {
-        let plan = plan_export(&fixture(), "researcher", options()).unwrap();
+        let plan = plan_export(&fixture(), "researcher").unwrap();
         let servers = lookup(&plan.config, &["mcp", "servers"])
             .and_then(toml::Value::as_array)
             .expect("closure carries mcp.servers");
@@ -1193,14 +1190,14 @@ mod tests {
             agent.mcp_bundles.push("extra".to_string());
         }
 
-        let plan = plan_export(&config, "researcher", options()).unwrap();
+        let plan = plan_export(&config, "researcher").unwrap();
         let rendered = render_config_toml(&plan).unwrap();
         assert!(!rendered.contains("search.example.com"), "{rendered}");
     }
 
     #[test]
     fn no_credential_survives_into_the_rendered_bundle() {
-        let plan = plan_export(&fixture(), "researcher", options()).unwrap();
+        let plan = plan_export(&fixture(), "researcher").unwrap();
         let rendered = render_config_toml(&plan).unwrap();
         assert!(!rendered.contains("ghp_realsecretvalue"), "{rendered}");
         assert!(!rendered.contains("sk-ant-realkey"), "{rendered}");
@@ -1209,7 +1206,7 @@ mod tests {
 
     #[test]
     fn required_secrets_name_every_scrubbed_leaf_by_config_path() {
-        let plan = plan_export(&fixture(), "researcher", options()).unwrap();
+        let plan = plan_export(&fixture(), "researcher").unwrap();
         assert!(
             plan.required_secrets
                 .contains(&"mcp.servers.github.env.GITHUB_TOKEN".to_string()),
@@ -1226,7 +1223,7 @@ mod tests {
 
     #[test]
     fn scrubbed_leaves_are_emitted_empty_not_masked() {
-        let plan = plan_export(&fixture(), "researcher", options()).unwrap();
+        let plan = plan_export(&fixture(), "researcher").unwrap();
         let key = lookup(
             &plan.config,
             &["providers", "models", "anthropic", "main", "api_key"],
@@ -1248,7 +1245,7 @@ mod tests {
                 unrestricted_filesystem: false,
             };
         }
-        let plan = plan_export(&config, "researcher", options()).unwrap();
+        let plan = plan_export(&config, "researcher").unwrap();
 
         let agent = lookup(&plan.config, &["agents", "researcher"])
             .and_then(toml::Value::as_table)
@@ -1276,58 +1273,59 @@ mod tests {
     fn drop_report_describes_this_agent_not_the_schema() {
         // The fixture agent has no delegates, cron jobs, or A2A publication,
         // so those must not appear in the report.
-        let plan = plan_export(&fixture(), "researcher", options()).unwrap();
+        let plan = plan_export(&fixture(), "researcher").unwrap();
         let paths: Vec<&str> = plan.dropped.iter().map(|d| d.path.as_str()).collect();
         assert!(!paths.contains(&"agents.researcher.delegates"), "{paths:?}");
         assert!(!paths.contains(&"agents.researcher.cron_jobs"), "{paths:?}");
         assert!(!paths.contains(&"agents.researcher.a2a"), "{paths:?}");
     }
 
+    /// Format 1 has no opt-in for memory: a live WAL database cannot be copied
+    /// as files without risking a torn read, so neither half of the agent's
+    /// memory travels, and both are reported.
     #[test]
-    fn memory_is_excluded_by_default_and_reported() {
-        let plan = plan_export(&fixture(), "researcher", options()).unwrap();
-        assert!(!plan.include_memory);
+    fn neither_half_of_memory_travels_and_both_are_reported() {
+        let plan = plan_export(&fixture(), "researcher").unwrap();
+        let dropped: Vec<(&str, &str)> = plan
+            .dropped
+            .iter()
+            .map(|d| (d.path.as_str(), d.reason.as_wire()))
+            .collect();
         assert!(
-            plan.dropped
-                .iter()
-                .any(|d| d.reason == DropReason::PrivateData)
+            dropped.contains(&("workspace/memory", "not_yet_portable")),
+            "{dropped:?}"
         );
-
-        let with_memory = plan_export(
-            &fixture(),
-            "researcher",
-            ExportOptions {
-                include_memory: true,
-            },
-        )
-        .unwrap();
-        assert!(with_memory.include_memory);
         assert!(
-            !with_memory
-                .dropped
-                .iter()
-                .any(|d| d.reason == DropReason::PrivateData)
+            dropped.contains(&("workspace/MEMORY_SNAPSHOT.md", "private_data")),
+            "{dropped:?}"
         );
     }
 
     #[test]
-    fn memory_directory_is_filtered_out_of_the_workspace_copy() {
+    fn memory_is_filtered_out_of_the_workspace_copy() {
         use std::path::Path;
-        assert!(!workspace_entry_included(
-            Path::new("memory/brain.db"),
-            false
-        ));
-        assert!(workspace_entry_included(Path::new("memory/brain.db"), true));
-        assert!(workspace_entry_included(Path::new("IDENTITY.md"), false));
-        assert!(workspace_entry_included(
-            Path::new("notes/memory/scratch.md"),
-            false
-        ));
+        // The store, including the WAL sidecars beside the database.
+        assert!(!workspace_entry_included(Path::new("memory")));
+        assert!(!workspace_entry_included(Path::new("memory/brain.db")));
+        assert!(!workspace_entry_included(Path::new("memory/brain.db-wal")));
+        assert!(!workspace_entry_included(Path::new("memory/brain.db-shm")));
+        // The snapshot the store re-hydrates from, at the workspace root.
+        assert!(!workspace_entry_included(Path::new("MEMORY_SNAPSHOT.md")));
+
+        // Ordinary workspace content, including paths that merely look like
+        // memory: only the root-level snapshot is the store's own.
+        assert!(workspace_entry_included(Path::new("IDENTITY.md")));
+        assert!(workspace_entry_included(Path::new(
+            "notes/memory/scratch.md"
+        )));
+        assert!(workspace_entry_included(Path::new(
+            "notes/MEMORY_SNAPSHOT.md"
+        )));
     }
 
     #[test]
     fn stdio_servers_are_flagged_as_process_spawn() {
-        let plan = plan_export(&fixture(), "researcher", options()).unwrap();
+        let plan = plan_export(&fixture(), "researcher").unwrap();
         let flag = plan
             .risk_flags
             .iter()
@@ -1360,7 +1358,7 @@ mod tests {
             agent.workspace.unrestricted_filesystem = true;
         }
 
-        let plan = plan_export(&config, "researcher", options()).unwrap();
+        let plan = plan_export(&config, "researcher").unwrap();
         let kinds: BTreeSet<&'static str> = plan
             .risk_flags
             .iter()
@@ -1381,7 +1379,7 @@ mod tests {
 
     #[test]
     fn default_profile_raises_no_flags_beyond_transport() {
-        let plan = plan_export(&fixture(), "researcher", options()).unwrap();
+        let plan = plan_export(&fixture(), "researcher").unwrap();
         let policy_flags: Vec<&str> = plan
             .risk_flags
             .iter()
@@ -1397,7 +1395,7 @@ mod tests {
         if let Some(server) = config.mcp.servers.iter_mut().find(|s| s.name == "github") {
             server.pinned_resources = vec!["repo://readme".to_string()];
         }
-        let plan = plan_export(&config, "researcher", options()).unwrap();
+        let plan = plan_export(&config, "researcher").unwrap();
         assert!(
             plan.risk_flags
                 .iter()
@@ -1415,7 +1413,7 @@ mod tests {
         if let Some(agent) = config.agents.get_mut("researcher") {
             agent.tts_provider = "openai.voice".into();
         }
-        let plan = plan_export(&config, "researcher", options()).unwrap();
+        let plan = plan_export(&config, "researcher").unwrap();
         assert!(
             lookup(&plan.config, &["providers", "tts", "openai", "voice"]).is_some(),
             "tts provider carried"
@@ -1428,7 +1426,7 @@ mod tests {
 
     #[test]
     fn rendered_bundle_round_trips_as_toml() {
-        let plan = plan_export(&fixture(), "researcher", options()).unwrap();
+        let plan = plan_export(&fixture(), "researcher").unwrap();
         let config_text = render_config_toml(&plan).unwrap();
         let parsed: toml::Table = config_text.parse().expect("config fragment re-parses");
         assert!(parsed.contains_key("agents"));
@@ -1519,7 +1517,7 @@ mod tests {
     #[test]
     fn closure_validates_on_an_otherwise_empty_install() {
         for config in [fixture(), loaded_fixture()] {
-            let plan = plan_export(&config, "researcher", options()).unwrap();
+            let plan = plan_export(&config, "researcher").unwrap();
             let text = render_config_toml(&plan).unwrap();
             let imported: Config = toml::from_str(&text).expect("closure deserializes as a Config");
 
@@ -1555,7 +1553,7 @@ mod tests {
             agent.runtime_profile = "standard".into();
         }
 
-        let plan = plan_export(&config, "researcher", options()).unwrap();
+        let plan = plan_export(&config, "researcher").unwrap();
         assert!(
             lookup(
                 &plan.config,
@@ -1572,7 +1570,7 @@ mod tests {
 
     #[test]
     fn same_profile_delegation_reach_is_closed_and_reported() {
-        let plan = plan_export(&fixture(), "researcher", options()).unwrap();
+        let plan = plan_export(&fixture(), "researcher").unwrap();
 
         let agent = lookup(&plan.config, &["agents", "researcher"])
             .and_then(toml::Value::as_table)
@@ -1610,7 +1608,7 @@ mod tests {
         if let Some(agent) = config.agents.get_mut("researcher") {
             agent.identity.aieos_path = Some("/srv/identities/researcher.json".to_string());
         }
-        let plan = plan_export(&config, "researcher", options()).unwrap();
+        let plan = plan_export(&config, "researcher").unwrap();
         let identity = lookup(&plan.config, &["agents", "researcher", "identity"])
             .and_then(toml::Value::as_table);
         assert!(
@@ -1629,7 +1627,7 @@ mod tests {
         if let Some(agent) = config.agents.get_mut("researcher") {
             agent.identity.aieos_path = Some("identity/aieos.json".to_string());
         }
-        let plan = plan_export(&config, "researcher", options()).unwrap();
+        let plan = plan_export(&config, "researcher").unwrap();
         assert_eq!(
             lookup(
                 &plan.config,
@@ -1655,7 +1653,7 @@ mod tests {
             agent.skill_bundles = vec!["research_tools".to_string()];
         }
 
-        let plan = plan_export(&config, "researcher", options()).unwrap();
+        let plan = plan_export(&config, "researcher").unwrap();
         assert_eq!(plan.skill_sources.len(), 1);
         let source = &plan.skill_sources[0];
         assert_eq!(source.alias, "research_tools");
@@ -1708,7 +1706,7 @@ mod tests {
             agent.skill_bundles = vec!["research_tools".to_string()];
         }
 
-        let plan = plan_export(&config, "researcher", options()).unwrap();
+        let plan = plan_export(&config, "researcher").unwrap();
         let bundle = lookup(&plan.config, &["skill_bundles", "research_tools"])
             .and_then(toml::Value::as_table)
             .expect("bundle carried");
@@ -1738,7 +1736,7 @@ mod tests {
 
     #[test]
     fn closure_parses_back_into_a_config_that_names_the_agent() {
-        let plan = plan_export(&fixture(), "researcher", options()).unwrap();
+        let plan = plan_export(&fixture(), "researcher").unwrap();
         let text = render_config_toml(&plan).unwrap();
         let reparsed: Config = toml::from_str(&text).expect("closure deserializes as a Config");
         let agent = reparsed.agents.get("researcher").expect("agent present");

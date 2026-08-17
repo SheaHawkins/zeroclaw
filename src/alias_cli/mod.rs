@@ -364,12 +364,9 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
             create_entry(config, "agents", &alias)?;
             save(config).await
         }
-        AgentsCommands::Export {
-            alias,
-            out,
-            include_memory,
-            force,
-        } => export::run(config, &alias, &out, include_memory, force).await,
+        AgentsCommands::Export { alias, out, force } => {
+            export::run(config, &alias, &out, force).await
+        }
         AgentsCommands::Rename { from, to } => {
             // Capture the workspace path while the `from` entry still exists
             // (custom paths are read off the entry, which the rename moves).
