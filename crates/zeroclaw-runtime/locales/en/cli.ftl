@@ -1059,7 +1059,7 @@ cli-agent-export-secrets-header = 🔑 {$count} credential(s) were scrubbed and 
 cli-agent-export-secrets-entry = {"  "}{$path}
 cli-agent-export-dropped-header = ℹ️  {$count} item(s) could not travel and were left behind:
 cli-agent-export-dropped-entry = {"  "}{$path} ({$reason}) — {$detail}
-cli-agent-export-content-not-scrubbed = ⚠️  {$count} carried file(s) are copied as-is. Scrubbing covers config.toml only: workspace and skill content is never scanned for secrets, so a .env file, a token in a note, or a credential in a git remote travels with it.
+cli-agent-export-content-not-scrubbed = ⚠️  {$count} carried file(s) are copied as-is. Scrubbing covers config.toml only: workspace and skill content is never scanned for secrets, so a .env file, a token in a note, or a credential in a git remote will be contained in the export.
 cli-agent-export-review-hint = Review config.toml, zeroclaw-agent.toml, and the files the bundle carries before sharing it.
 
 # ── Skill-bundle CLI — zeroclaw skills bundle {add,remove,rename} (#7468 / #7175) ──

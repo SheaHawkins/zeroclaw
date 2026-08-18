@@ -713,7 +713,8 @@ fn report(plan: &ExportPlan, out: &Path, copied: &BundleCopy) {
                 &[("count", count.as_str())],
                 "⚠️  {$count} carried file(s) are copied as-is. Scrubbing covers config.toml \
                  only: workspace and skill content is never scanned for secrets, so a .env \
-                 file, a token in a note, or a credential in a git remote travels with it."
+                 file, a token in a note, or a credential in a git remote will be contained in \
+                 the export."
             )
         );
     }
