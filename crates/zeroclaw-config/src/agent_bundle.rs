@@ -448,7 +448,7 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
             value.clear();
         }
     });
-    if let Some(path) = find_ciphertext(&root) {
+    if let Some(path) = find_ciphertext(&root, "") {
         return Err(ExportError::UnscrubbedSecret { path });
     }
     let toml::Value::Table(config_table) = root else {
@@ -931,16 +931,23 @@ fn visit_strings_mut(
         }
         toml::Value::Array(items) => {
             for (index, child) in items.iter_mut().enumerate() {
-                let segment = child
-                    .as_table()
-                    .and_then(|table| table.get("name"))
-                    .and_then(toml::Value::as_str)
-                    .map_or_else(|| index.to_string(), str::to_string);
+                let segment = array_segment(child, index);
                 visit_strings_mut(child, &join(path, &segment), visit);
             }
         }
         _ => {}
     }
+}
+
+/// Segment addressing an array element: its natural `name` key when it has
+/// one, else its index. Shared by both walks so a reported path means the same
+/// thing whichever one produced it.
+fn array_segment(value: &toml::Value, index: usize) -> String {
+    value
+        .as_table()
+        .and_then(|table| table.get("name"))
+        .and_then(toml::Value::as_str)
+        .map_or_else(|| index.to_string(), str::to_string)
 }
 
 fn join(prefix: &str, segment: &str) -> String {
@@ -952,15 +959,24 @@ fn join(prefix: &str, segment: &str) -> String {
 }
 
 /// First path holding config ciphertext, if any survived scrubbing.
-fn find_ciphertext(root: &toml::Value) -> Option<String> {
-    let mut found: Option<String> = None;
-    let mut probe = root.clone();
-    visit_strings_mut(&mut probe, "", &mut |path, value| {
-        if found.is_none() && CIPHERTEXT_PREFIXES.iter().any(|p| value.starts_with(p)) {
-            found = Some(path.to_string());
-        }
-    });
-    found
+///
+/// The read-only twin of [`visit_strings_mut`]'s walk, sharing its path naming
+/// through [`array_segment`]. Verifying the scrub is a check, not a rewrite, so
+/// it neither copies the closure nor keeps walking past the first hit.
+fn find_ciphertext(value: &toml::Value, path: &str) -> Option<String> {
+    match value {
+        toml::Value::String(text) => CIPHERTEXT_PREFIXES
+            .iter()
+            .any(|prefix| text.starts_with(prefix))
+            .then(|| path.to_string()),
+        toml::Value::Table(table) => table
+            .iter()
+            .find_map(|(key, child)| find_ciphertext(child, &join(path, key))),
+        toml::Value::Array(items) => items.iter().enumerate().find_map(|(index, child)| {
+            find_ciphertext(child, &join(path, &array_segment(child, index)))
+        }),
+        _ => None,
+    }
 }
 
 // ── rendering ────────────────────────────────────────────────────────────
@@ -1921,7 +1937,10 @@ mod tests {
             );
             table.insert("providers".to_string(), toml::Value::Table(inner));
         }
-        assert_eq!(find_ciphertext(&root).as_deref(), Some("providers.api_key"));
+        assert_eq!(
+            find_ciphertext(&root, "").as_deref(),
+            Some("providers.api_key")
+        );
     }
 
     #[test]
