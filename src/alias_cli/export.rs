@@ -16,6 +16,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use zeroclaw_config::agent_bundle::{
@@ -363,10 +364,15 @@ async fn write_file(path: &Path, contents: &str) -> Result<()> {
 /// an ordinary tool call while the export runs — so the walk never re-opens a
 /// path by name. The configured root is opened once, and every entry below it
 /// is classified *and* read through a handle on the directory that holds it
-/// (cap-std, the same beneath/no-follow binding `deliver_file` uses). An entry
-/// swapped for a symlink between the classification and the read therefore
-/// cannot redirect the copy outside the tree that handle names; a path-based
-/// walk would have followed it.
+/// (cap-std, the same binding `deliver_file` uses).
+///
+/// Both steps refuse symlinks, which is what makes them describe one object.
+/// Keeping the read merely *beneath* the root is not enough: this exporter has
+/// content boundaries of its own inside that root, so an entry classified as an
+/// ordinary file and then swapped for an in-root link to `memory/brain.db`
+/// would copy the memory store under the admitted name without ever leaving the
+/// workspace. The open therefore refuses to traverse a link at all, and a swap
+/// between the two steps fails the export instead of silently redirecting it.
 fn copy_workspace(plan: &ExportPlan, dest: &Path) -> Result<CopyTally> {
     let mut copied = CopyTally::default();
     if !plan.workspace_source.is_dir() {
@@ -412,6 +418,10 @@ fn copy_skill_bundles(plan: &ExportPlan, dest_root: &Path, into: &mut BundleCopy
 }
 
 /// Copy the skills one bundle admits, each through its own directory handle.
+///
+/// The open is no-follow like the workspace walk's: an admitted skill swapped
+/// for a link to a sibling the bundle excludes would otherwise carry the
+/// excluded content under the admitted name.
 fn copy_skills(
     source: &Dir,
     dest: &Dir,
@@ -443,13 +453,15 @@ fn copy_skills(
         if !file_type.is_dir() {
             continue;
         }
-        let child_source = entry
-            .open_dir()
+        entry_swap_seam(Path::new(skill));
+
+        let child_source = source
+            .open_dir_nofollow(&name)
             .with_context(|| format!("failed to open {root}/{skill}"))?;
         dest.create_dir(&name)
             .with_context(|| format!("failed to create {root}/{skill} in the bundle"))?;
         let child_dest = dest
-            .open_dir(&name)
+            .open_dir_nofollow(&name)
             .with_context(|| format!("failed to open {root}/{skill} in the bundle"))?;
         let spec = CopySpec {
             root: root.clone(),
@@ -492,7 +504,9 @@ fn copy_tree(
 
         // `DirEntry::metadata` is a no-follow stat through the directory handle,
         // so it describes the object sitting in *this* directory under that
-        // name, not whatever a fresh path lookup would resolve to.
+        // name, not whatever a fresh path lookup would resolve to. The opens
+        // below are no-follow through the same handle, so the object that is
+        // read is the object this classified.
         let file_type = entry
             .metadata()
             .with_context(|| format!("failed to stat {}", rel(spec, &child)))?
@@ -509,18 +523,18 @@ fn copy_tree(
         entry_swap_seam(&child);
 
         if file_type.is_dir() {
-            let child_source = entry
-                .open_dir()
+            let child_source = source
+                .open_dir_nofollow(&name)
                 .with_context(|| format!("failed to open {}", rel(spec, &child)))?;
             dest.create_dir(&name)
                 .with_context(|| format!("failed to create {} in the bundle", rel(spec, &child)))?;
             let child_dest = dest
-                .open_dir(&name)
+                .open_dir_nofollow(&name)
                 .with_context(|| format!("failed to open {} in the bundle", rel(spec, &child)))?;
             copy_tree(&child_source, &child_dest, spec, &child, copied)?;
         } else {
             let mut reader = entry
-                .open()
+                .open_with(OpenOptions::new().read(true).follow(FollowSymlinks::No))
                 .with_context(|| format!("failed to open {}", rel(spec, &child)))?;
             // The opened handle, not the name, decides what gets copied: an
             // entry that is no longer a regular file is left out rather than
@@ -1099,6 +1113,94 @@ mod tests {
         // symlink pointed at is nowhere in the output.
         let err = result.unwrap_err();
         assert!(err.to_string().contains("workspace/notes.md"), "{err}");
+        assert!(!out.exists());
+        assert_eq!(entry_names(parent.path()), Vec::<String>::new());
+    }
+
+    /// Staying inside the workspace is not the boundary that matters here: the
+    /// bundle has content exclusions of its own, and an in-root link would
+    /// carry excluded content under an admitted name without ever escaping.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_replaced_by_an_in_root_symlink_to_memory_is_not_followed() {
+        let source = tempfile::tempdir().unwrap();
+        write(&source.path().join("notes.md"), "workspace note");
+        write(
+            &source.path().join("memory/brain.db"),
+            "SQLite format 3\0the agent's private history",
+        );
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let entry = source.path().join("notes.md");
+        let plan = plan_for(source.path());
+        let result = {
+            let _swap = EntrySwap::install(move |relative| {
+                if relative == Path::new("notes.md") {
+                    std::fs::remove_file(&entry).unwrap();
+                    // Relative, and squarely inside the workspace root: cap-std's
+                    // beneath check has nothing to object to.
+                    std::os::unix::fs::symlink("memory/brain.db", &entry).unwrap();
+                    assert!(
+                        std::fs::read_to_string(&entry)
+                            .unwrap()
+                            .contains("private history")
+                    );
+                }
+            });
+            write_bundle(&plan, &out, false).await
+        };
+
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("workspace/notes.md"), "{err}");
+        assert!(!out.exists());
+        assert_eq!(entry_names(parent.path()), Vec::<String>::new());
+    }
+
+    /// The same shape one level down: the bundle's own include/exclude filter
+    /// is a content boundary, so an admitted skill must not be able to become a
+    /// link to an excluded one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_skill_replaced_by_a_symlink_to_an_excluded_sibling_is_not_followed() {
+        let workspace = tempfile::tempdir().unwrap();
+        write(&workspace.path().join("IDENTITY.md"), "identity");
+
+        let skills = tempfile::tempdir().unwrap();
+        write(&skills.path().join("web_search/SKILL.md"), "# search");
+        write(
+            &skills.path().join("internal_only/SKILL.md"),
+            "# internal runbook",
+        );
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_for(workspace.path());
+        plan.skill_sources = vec![skill_source(
+            "research_tools",
+            skills.path(),
+            &["internal_only"],
+        )];
+
+        let admitted = skills.path().join("web_search");
+        let result = {
+            let _swap = EntrySwap::install(move |relative| {
+                if relative == Path::new("web_search") {
+                    std::fs::remove_dir_all(&admitted).unwrap();
+                    std::os::unix::fs::symlink("internal_only", &admitted).unwrap();
+                    assert!(admitted.join("SKILL.md").is_file());
+                }
+            });
+            write_bundle(&plan, &out, false).await
+        };
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("skills/research_tools/web_search"),
+            "{err}"
+        );
         assert!(!out.exists());
         assert_eq!(entry_names(parent.path()), Vec::<String>::new());
     }

@@ -355,6 +355,16 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
     // Resolution goes through `mcp_servers_for_bundles` rather than a manual
     // union so `exclude` keeps winning here exactly as it does at runtime: the
     // bundle carries the servers this agent can really reach, no more.
+    //
+    // INVARIANT: a server name addresses exactly one entry in the closure.
+    // The manifest's `required_secrets` paths are addressed by that name
+    // (`mcp.servers.github.env.GITHUB_TOKEN`), and the promise that they can be
+    // pasted into `zeroclaw config set` holds only while it is true. Two things
+    // hold it up: `Config::validate` rejects duplicate `mcp.servers` names, and
+    // `mcp_servers_for_bundles` resolves each granted name to the first
+    // matching entry, so even a config hand-edited past validation collapses to
+    // one entry per name here. `duplicate_server_names_collapse_to_one_entry`
+    // pins the second half, which is the one this module owns.
     let granted = config.mcp_servers_for_bundles(&agent.mcp_bundles);
     if !granted.is_empty() {
         let server_default = to_table(&McpServerConfig::default())?;
@@ -862,7 +872,10 @@ fn split_provider_ref(reference: &str) -> Option<(&str, &str)> {
 ///
 /// Array elements carrying a `name` are addressed by that natural key
 /// (`mcp.servers.github.env.TOKEN`) so reported paths match the ones
-/// `zeroclaw config set` accepts.
+/// `zeroclaw config set` accepts. That addressing is only unambiguous while
+/// names are unique within the array; `mcp.servers` is the only array the
+/// closure carries, and the invariant that keeps it so is recorded where it is
+/// built in [`plan_export`].
 fn visit_strings_mut(
     value: &mut toml::Value,
     path: &str,
@@ -1175,6 +1188,49 @@ mod tests {
             .collect();
         // `search` is excluded by the bundle and `unrelated` is not referenced.
         assert_eq!(names, vec!["github"]);
+    }
+
+    /// `required_secrets` promises paths that can be pasted into
+    /// `zeroclaw config set`, which holds only while a server name addresses
+    /// one entry. `Config::validate` rejects duplicate names, so this pins what
+    /// the exporter does on its own with a config that reached it hand-edited.
+    #[test]
+    fn duplicate_server_names_collapse_to_one_entry() {
+        let mut config = fixture();
+        config.mcp.servers.push(McpServerConfig {
+            name: "github".to_string(),
+            transport: McpTransport::Stdio,
+            command: "impostor".to_string(),
+            env: HashMap::from([("GITHUB_TOKEN".to_string(), "ghp_theotherone".to_string())]),
+            ..Default::default()
+        });
+
+        let plan = plan_export(&config, "researcher").unwrap();
+
+        let servers = lookup(&plan.config, &["mcp", "servers"])
+            .and_then(toml::Value::as_array)
+            .expect("closure carries mcp.servers");
+        let names: Vec<&str> = servers
+            .iter()
+            .filter_map(|s| s.get("name").and_then(toml::Value::as_str))
+            .collect();
+        assert_eq!(names, vec!["github"], "one entry per name");
+
+        // One path, so the operator has one thing to fill in and no ambiguity
+        // about which entry they are filling.
+        let github_secrets: Vec<&str> = plan
+            .required_secrets
+            .iter()
+            .filter(|path| path.starts_with("mcp.servers.github"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(github_secrets, vec!["mcp.servers.github.env.GITHUB_TOKEN"]);
+
+        // Resolution and masking agree on which entry won, so the shadowed
+        // one contributes nothing to the bundle.
+        let rendered = render_config_toml(&plan).unwrap();
+        assert!(!rendered.contains("impostor"), "{rendered}");
+        assert!(!rendered.contains("ghp_theotherone"), "{rendered}");
     }
 
     #[test]

@@ -123,10 +123,18 @@ receiving host anyway.
 The workspace stays live while the export runs, since the agent that owns it can
 be writing to it through an ordinary tool call. So the copy never re-opens a
 path by name. The workspace root is opened once, and every entry below it is
-classified *and* read through a handle on the directory that holds it. That is
-what makes the skip a guarantee rather than a check: an entry replaced by a
-symlink in between cannot redirect the copy outside the workspace, and an export
-that hits one fails rather than publishing a bundle with host content in it.
+classified *and* read through a handle on the directory that holds it, with both
+steps refusing to traverse a symlink. That is what makes the skip a guarantee
+rather than a check: the object that is read is the object that was classified,
+so an entry replaced by a link in between fails the export rather than
+redirecting it.
+
+Refusing the link matters even when it points *inside* the workspace. The bundle
+has content boundaries of its own, and a link that never escapes the root can
+still cross them: an admitted file replaced by a link to `memory/brain.db` would
+carry the memory store under the admitted name, and an admitted skill replaced by
+a link to one the bundle excludes would carry the excluded content. Neither
+leaves the workspace, and neither is allowed.
 
 ### Credentials
 
