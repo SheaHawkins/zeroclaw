@@ -78,6 +78,12 @@ be reconstituted elsewhere:
   not exist. Each bundle's own `include` and `exclude` filter the copy, so a
   skill the bundle excludes does not travel.
 
+The manifest's `skill_bundles` list records what the bundle *contains*, not what
+the export set out to carry. A bundle configured on the agent but with no
+directory on the exporting host is named in `dropped` with reason
+`source_missing` instead, and raises no `carried_skills` flag, so the artifact
+never advertises a `skills/<alias>/` tree it does not have.
+
 The test of the closure is that it stands alone: parsed on an install with no
 other entries present, it passes `Config::validate()`.
 

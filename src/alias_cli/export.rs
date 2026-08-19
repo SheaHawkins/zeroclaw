@@ -51,10 +51,12 @@ struct SkillCopy {
     tally: CopyTally,
     /// Bundles whose directory was found and copied.
     bundles: usize,
-    /// Referenced bundles with no directory on this host. Their config travels
-    /// and their content cannot, which the operator is told rather than left
-    /// to discover after an import.
-    missing: Vec<String>,
+    /// Referenced bundles that contributed no skills: the directory is absent,
+    /// or holds nothing this bundle admits. Config load scaffolds an empty
+    /// directory for every configured bundle, so "present but empty" is the
+    /// ordinary shape of this, not an exotic one. Either way there is no
+    /// content for the manifest to advertise.
+    without_content: Vec<String>,
 }
 
 /// Everything an export copied, for the operator's report.
@@ -74,9 +76,9 @@ struct CopySpec<'a> {
 }
 
 pub async fn run(config: &Config, alias: &str, out: &Path, force: bool) -> Result<()> {
-    let plan = agent_bundle::plan_export(config, alias).map_err(anyhow::Error::new)?;
+    let mut plan = agent_bundle::plan_export(config, alias).map_err(anyhow::Error::new)?;
 
-    let copied = write_bundle(&plan, out, force).await?;
+    let copied = write_bundle(&mut plan, out, force).await?;
 
     report(&plan, out, &copied);
     Ok(())
@@ -88,20 +90,12 @@ pub async fn run(config: &Config, alias: &str, out: &Path, force: bool) -> Resul
 /// metadata; only then is a staging directory created, filled, and swapped in.
 /// The destination is never partially written and never keeps an entry the new
 /// manifest does not describe.
-async fn write_bundle(plan: &ExportPlan, out: &Path, force: bool) -> Result<BundleCopy> {
+async fn write_bundle(plan: &mut ExportPlan, out: &Path, force: bool) -> Result<BundleCopy> {
     let dest = resolve_path(out)?;
     reject_source_overlap(&dest, plan, out)?;
     check_destination(&dest, out, force).await?;
 
     let config_toml = agent_bundle::render_config_toml(plan).map_err(anyhow::Error::new)?;
-    let manifest_toml = agent_bundle::render_manifest_toml(
-        plan,
-        &Provenance {
-            zeroclaw_version: env!("CARGO_PKG_VERSION").to_string(),
-            exported_at: chrono::Utc::now().to_rfc3339(),
-        },
-    )
-    .map_err(anyhow::Error::new)?;
 
     let Some(parent) = dest.parent() else {
         bail!(
@@ -130,12 +124,25 @@ async fn write_bundle(plan: &ExportPlan, out: &Path, force: bool) -> Result<Bund
         })?;
 
     write_file(&staging.path().join(CONFIG_FILE), &config_toml).await?;
-    write_file(&staging.path().join(MANIFEST_FILE), &manifest_toml).await?;
     let mut copied = BundleCopy {
         workspace: copy_workspace(plan, &staging.path().join(WORKSPACE_DIR))?,
         skills: SkillCopy::default(),
     };
     copy_skill_bundles(plan, &staging.path().join(SKILLS_DIR), &mut copied)?;
+
+    // The manifest describes the bundle, so it is rendered from what the copy
+    // actually carried and written last. Advertising a `skills/<alias>/` tree
+    // that is not there would outlive the terminal that said otherwise.
+    agent_bundle::record_missing_skill_content(plan, &copied.skills.without_content);
+    let manifest_toml = agent_bundle::render_manifest_toml(
+        plan,
+        &Provenance {
+            zeroclaw_version: env!("CARGO_PKG_VERSION").to_string(),
+            exported_at: chrono::Utc::now().to_rfc3339(),
+        },
+    )
+    .map_err(anyhow::Error::new)?;
+    write_file(&staging.path().join(MANIFEST_FILE), &manifest_toml).await?;
 
     publish(staging, &dest, parent)?;
     Ok(copied)
@@ -414,14 +421,28 @@ fn copy_workspace(plan: &ExportPlan, dest: &Path) -> Result<CopyTally> {
 fn copy_skill_bundles(plan: &ExportPlan, dest_root: &Path, into: &mut BundleCopy) -> Result<()> {
     for source in &plan.skill_sources {
         if !source.source.is_dir() {
-            into.skills.missing.push(source.alias.clone());
+            into.skills.without_content.push(source.alias.clone());
             continue;
         }
         let bundle = Dir::open_ambient_dir(&source.source, ambient_authority())
             .with_context(|| format!("failed to open skill bundle `{}`", source.alias))?;
-        let target = open_bundle_dir(&dest_root.join(&source.alias))?;
-        copy_skills(&bundle, &target, source, &mut into.skills.tally)?;
+        let bundle_dest = dest_root.join(&source.alias);
+        let target = open_bundle_dir(&bundle_dest)?;
+        let carried = copy_skills(&bundle, &target, source, &mut into.skills.tally)?;
+        if carried == 0 {
+            // An empty tree is not content. Leave neither the directory nor
+            // the manifest claim behind for it.
+            drop(target);
+            std::fs::remove_dir_all(&bundle_dest).ok();
+            into.skills.without_content.push(source.alias.clone());
+            continue;
+        }
         into.skills.bundles += 1;
+    }
+    if into.skills.bundles == 0 {
+        // Nothing was carried, so the bundle gets no `skills/` at all rather
+        // than an empty directory implying otherwise.
+        std::fs::remove_dir_all(dest_root).ok();
     }
     Ok(())
 }
@@ -436,7 +457,8 @@ fn copy_skills(
     dest: &Dir,
     bundle: &SkillBundleSource,
     copied: &mut CopyTally,
-) -> Result<()> {
+) -> Result<usize> {
+    let mut skills = 0;
     let root = format!("{SKILLS_DIR}/{}", bundle.alias);
     let entries = source
         .entries()
@@ -477,8 +499,9 @@ fn copy_skills(
             filter: &|_| true,
         };
         copy_tree(&child_source, &child_dest, &spec, Path::new(skill), copied)?;
+        skills += 1;
     }
-    Ok(())
+    Ok(skills)
 }
 
 /// Name to move the existing bundle aside under.
@@ -637,18 +660,6 @@ fn report(plan: &ExportPlan, out: &Path, copied: &BundleCopy) {
             )
         );
     }
-    for alias in &copied.skills.missing {
-        eprintln!(
-            "{}",
-            mta(
-                "cli-agent-export-skills-missing",
-                &[("alias", alias.as_str())],
-                "  warning: skill bundle `{$alias}` has no directory on this host — its config \
-                 travels, its content does not"
-            )
-        );
-    }
-
     let symlinks_skipped = copied.workspace.symlinks_skipped + copied.skills.tally.symlinks_skipped;
     if symlinks_skipped > 0 {
         let count = symlinks_skipped.to_string();
@@ -789,6 +800,25 @@ mod tests {
         }
     }
 
+    /// The published manifest, parsed.
+    fn manifest_of(out: &Path) -> toml::Table {
+        std::fs::read_to_string(out.join(MANIFEST_FILE))
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    /// Values of a manifest array field, as strings.
+    fn manifest_list(manifest: &toml::Table, field: &str) -> Vec<String> {
+        manifest
+            .get(field)
+            .and_then(toml::Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+    }
+
     /// Sorted names directly under `dir` — used to assert that an export left
     /// no staging or retired directory behind.
     fn entry_names(dir: &Path) -> Vec<String> {
@@ -898,7 +928,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let out = parent.path().join("bundle");
 
-        let copied = write_bundle(&plan_for(source.path()), &out, false)
+        let copied = write_bundle(&mut plan_for(source.path()), &out, false)
             .await
             .unwrap();
 
@@ -952,6 +982,21 @@ mod tests {
         assert_eq!(copied, CopyTally::default());
     }
 
+    /// A plan carrying one skill bundle the way `plan_export` builds one: the
+    /// source to copy, plus the `carried_skills` grant that advertises it in
+    /// the manifest. The advertisement is what has to track reality.
+    fn plan_with_skills(workspace: &Path, dir: &Path, exclude: &[&str]) -> ExportPlan {
+        let mut plan = plan_for(workspace);
+        plan.skill_sources = vec![skill_source("research_tools", dir, exclude)];
+        plan.risk_flags
+            .push(zeroclaw_config::agent_bundle::RiskFlag {
+                kind: zeroclaw_config::agent_bundle::RiskKind::CarriedSkills,
+                path: "skill_bundles.research_tools".to_string(),
+                detail: "carries this skill bundle's content".to_string(),
+            });
+        plan
+    }
+
     fn skill_source(alias: &str, dir: &Path, exclude: &[&str]) -> SkillBundleSource {
         SkillBundleSource {
             alias: alias.to_string(),
@@ -986,11 +1031,11 @@ mod tests {
             &["internal_only"],
         )];
 
-        let copied = write_bundle(&plan, &out, false).await.unwrap();
+        let copied = write_bundle(&mut plan, &out, false).await.unwrap();
 
         assert_eq!(copied.skills.bundles, 1);
         assert_eq!(copied.skills.tally.files, 2);
-        assert!(copied.skills.missing.is_empty());
+        assert!(copied.skills.without_content.is_empty());
 
         let carried = out.join(SKILLS_DIR).join("research_tools");
         assert!(carried.join("web_search/SKILL.md").is_file());
@@ -1013,37 +1058,153 @@ mod tests {
         plan.skill_sources = vec![skill_source("research_tools", skills.path(), &[])];
 
         // Inside the bundle's directory: the copy would consume its own output.
-        let err = write_bundle(&plan, &skills.path().join("exports/bundle"), true)
+        let err = write_bundle(&mut plan, &skills.path().join("exports/bundle"), true)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("inside skill bundle"), "{err}");
 
         // Containing it: publishing would replace the skills being read.
-        let err = write_bundle(&plan, skills.path(), true).await.unwrap_err();
+        let err = write_bundle(&mut plan, skills.path(), true)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("contains skill bundle"), "{err}");
         assert!(skills.path().join("web_search/SKILL.md").is_file());
     }
 
     #[tokio::test]
-    async fn a_skill_bundle_with_no_directory_on_this_host_is_reported_not_fatal() {
+    async fn a_skill_bundle_with_no_content_is_recorded_in_the_manifest_not_advertised() {
         let workspace = tempfile::tempdir().unwrap();
         write(&workspace.path().join("IDENTITY.md"), "identity");
 
         let parent = tempfile::tempdir().unwrap();
         let out = parent.path().join("bundle");
 
-        let mut plan = plan_for(workspace.path());
-        plan.skill_sources = vec![skill_source(
-            "research_tools",
+        let mut plan = plan_with_skills(
+            workspace.path(),
             Path::new("/nonexistent/shared/skills/research_tools"),
             &[],
-        )];
+        );
 
-        let copied = write_bundle(&plan, &out, false).await.unwrap();
+        let copied = write_bundle(&mut plan, &out, false).await.unwrap();
+        assert_eq!(copied.skills.bundles, 0);
+
+        // The manifest and the tree have to agree: no content on disk, and
+        // nothing in the artifact claiming otherwise once the terminal that
+        // ran the export is gone.
+        assert!(!out.join(SKILLS_DIR).exists());
+        let manifest = manifest_of(&out);
+        assert_eq!(
+            manifest_list(&manifest, "skill_bundles"),
+            Vec::<String>::new(),
+            "{manifest:?}"
+        );
+        let flags = manifest
+            .get("risk_flags")
+            .and_then(toml::Value::as_array)
+            .unwrap();
+        assert!(
+            !flags
+                .iter()
+                .any(|f| f.get("kind").and_then(toml::Value::as_str) == Some("carried_skills")),
+            "{flags:?}"
+        );
+
+        // And the omission is recorded where an importer will read it.
+        let dropped = manifest
+            .get("dropped")
+            .and_then(toml::Value::as_array)
+            .unwrap();
+        let entry = dropped
+            .iter()
+            .find(|d| d.get("path").and_then(toml::Value::as_str) == Some("skills/research_tools"))
+            .unwrap_or_else(|| panic!("{dropped:?}"));
+        assert_eq!(
+            entry.get("reason").and_then(toml::Value::as_str),
+            Some("source_missing")
+        );
+    }
+
+    /// The ordinary shape of "no content": config load scaffolds a directory
+    /// for every configured bundle, so a bundle nobody has installed skills
+    /// into is an empty directory, not a missing one. It must not be
+    /// advertised either, and must not leave an empty tree in the artifact.
+    #[tokio::test]
+    async fn an_empty_skill_bundle_is_not_advertised_and_leaves_no_tree() {
+        let workspace = tempfile::tempdir().unwrap();
+        write(&workspace.path().join("IDENTITY.md"), "identity");
+        // Scaffolded, never populated. Plus one the bundle excludes, so the
+        // "everything here is filtered out" case lands in the same place.
+        let skills = tempfile::tempdir().unwrap();
+        write(&skills.path().join("internal_only/SKILL.md"), "# internal");
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_with_skills(workspace.path(), skills.path(), &["internal_only"]);
+        let copied = write_bundle(&mut plan, &out, false).await.unwrap();
 
         assert_eq!(copied.skills.bundles, 0);
-        assert_eq!(copied.skills.missing, vec!["research_tools".to_string()]);
+        assert_eq!(
+            copied.skills.without_content,
+            vec!["research_tools".to_string()]
+        );
         assert!(!out.join(SKILLS_DIR).exists());
+
+        let manifest = manifest_of(&out);
+        assert_eq!(
+            manifest_list(&manifest, "skill_bundles"),
+            Vec::<String>::new(),
+            "{manifest:?}"
+        );
+        let dropped = manifest
+            .get("dropped")
+            .and_then(toml::Value::as_array)
+            .unwrap();
+        assert!(
+            dropped.iter().any(|d| {
+                d.get("path").and_then(toml::Value::as_str) == Some("skills/research_tools")
+                    && d.get("reason").and_then(toml::Value::as_str) == Some("source_missing")
+            }),
+            "{dropped:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_carried_skill_bundle_is_advertised_and_present() {
+        let workspace = tempfile::tempdir().unwrap();
+        write(&workspace.path().join("IDENTITY.md"), "identity");
+        let skills = tempfile::tempdir().unwrap();
+        write(&skills.path().join("web_search/SKILL.md"), "# search");
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_with_skills(workspace.path(), skills.path(), &[]);
+
+        write_bundle(&mut plan, &out, false).await.unwrap();
+
+        // The same two things checked together, in the case where the claim is
+        // true: the manifest advertises the alias and the tree backs it up.
+        let manifest = manifest_of(&out);
+        assert_eq!(
+            manifest_list(&manifest, "skill_bundles"),
+            vec!["research_tools".to_string()]
+        );
+        assert!(
+            out.join(SKILLS_DIR)
+                .join("research_tools/web_search/SKILL.md")
+                .is_file()
+        );
+        let flags = manifest
+            .get("risk_flags")
+            .and_then(toml::Value::as_array)
+            .unwrap();
+        assert!(
+            flags
+                .iter()
+                .any(|f| f.get("kind").and_then(toml::Value::as_str) == Some("carried_skills")),
+            "{flags:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -1069,7 +1230,7 @@ mod tests {
         let mut plan = plan_for(workspace.path());
         plan.skill_sources = vec![skill_source("research_tools", skills.path(), &[])];
 
-        let copied = write_bundle(&plan, &out, false).await.unwrap();
+        let copied = write_bundle(&mut plan, &out, false).await.unwrap();
 
         assert_eq!(copied.skills.tally.files, 1);
         assert_eq!(copied.skills.tally.symlinks_skipped, 1);
@@ -1118,7 +1279,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let out = parent.path().join("bundle");
 
-        let plan = plan_for(source.path());
+        let mut plan = plan_for(source.path());
         let result = {
             let _swap = EntrySwap::install(move |relative| {
                 if relative == Path::new("notes.md") {
@@ -1129,7 +1290,7 @@ mod tests {
                     assert_eq!(std::fs::read_to_string(&entry).unwrap(), "host secret");
                 }
             });
-            write_bundle(&plan, &out, false).await
+            write_bundle(&mut plan, &out, false).await
         };
 
         // Fails closed: the bundle is never published, and the host file the
@@ -1157,7 +1318,7 @@ mod tests {
         let out = parent.path().join("bundle");
 
         let entry = source.path().join("notes.md");
-        let plan = plan_for(source.path());
+        let mut plan = plan_for(source.path());
         let result = {
             let _swap = EntrySwap::install(move |relative| {
                 if relative == Path::new("notes.md") {
@@ -1172,7 +1333,7 @@ mod tests {
                     );
                 }
             });
-            write_bundle(&plan, &out, false).await
+            write_bundle(&mut plan, &out, false).await
         };
 
         let err = result.unwrap_err();
@@ -1216,7 +1377,7 @@ mod tests {
                     assert!(admitted.join("SKILL.md").is_file());
                 }
             });
-            write_bundle(&plan, &out, false).await
+            write_bundle(&mut plan, &out, false).await
         };
 
         let err = result.unwrap_err();
@@ -1241,7 +1402,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let out = parent.path().join("bundle");
 
-        let plan = plan_for(source.path());
+        let mut plan = plan_for(source.path());
         let target = outside.path().to_path_buf();
         let result = {
             let _swap = EntrySwap::install(move |relative| {
@@ -1252,7 +1413,7 @@ mod tests {
                     assert!(entry.join("secret.txt").is_file());
                 }
             });
-            write_bundle(&plan, &out, false).await
+            write_bundle(&mut plan, &out, false).await
         };
 
         let err = result.unwrap_err();
@@ -1269,7 +1430,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let out = parent.path().join("bundle");
 
-        let copied = write_bundle(&plan_for(source.path()), &out, false)
+        let copied = write_bundle(&mut plan_for(source.path()), &out, false)
             .await
             .unwrap();
 
@@ -1290,7 +1451,7 @@ mod tests {
         let out = parent.path().join("bundle");
         write(&out.join("config.toml"), "# existing");
 
-        let err = write_bundle(&plan_for(source.path()), &out, false)
+        let err = write_bundle(&mut plan_for(source.path()), &out, false)
             .await
             .unwrap_err();
 
@@ -1319,7 +1480,7 @@ mod tests {
             "# stale workspace file",
         );
 
-        let copied = write_bundle(&plan_for(source.path()), &out, true)
+        let copied = write_bundle(&mut plan_for(source.path()), &out, true)
             .await
             .unwrap();
 
@@ -1378,7 +1539,7 @@ mod tests {
         let out = parent.path().join("bundle");
         write(&out.join(CONFIG_FILE), "# previous export");
 
-        let err = write_bundle(&plan_for(source.path()), &out, true)
+        let err = write_bundle(&mut plan_for(source.path()), &out, true)
             .await
             .unwrap_err();
 
@@ -1397,7 +1558,7 @@ mod tests {
         write(&source.path().join("IDENTITY.md"), "identity");
         let out = source.path().join("exports/bundle");
 
-        let err = write_bundle(&plan_for(source.path()), &out, true)
+        let err = write_bundle(&mut plan_for(source.path()), &out, true)
             .await
             .unwrap_err();
 
@@ -1414,7 +1575,7 @@ mod tests {
         let workspace = root.path().join("agents/researcher/workspace");
         write(&workspace.join("IDENTITY.md"), "identity");
 
-        let err = write_bundle(&plan_for(&workspace), root.path(), true)
+        let err = write_bundle(&mut plan_for(&workspace), root.path(), true)
             .await
             .unwrap_err();
 
@@ -1431,7 +1592,7 @@ mod tests {
         let source = tempfile::tempdir().unwrap();
         write(&source.path().join("IDENTITY.md"), "identity");
 
-        let err = write_bundle(&plan_for(source.path()), source.path(), true)
+        let err = write_bundle(&mut plan_for(source.path()), source.path(), true)
             .await
             .unwrap_err();
 
@@ -1454,7 +1615,7 @@ mod tests {
         let link = links.path().join("link");
         std::os::unix::fs::symlink(source.path(), &link).unwrap();
 
-        let err = write_bundle(&plan_for(source.path()), &link.join("bundle"), true)
+        let err = write_bundle(&mut plan_for(source.path()), &link.join("bundle"), true)
             .await
             .unwrap_err();
 
@@ -1474,7 +1635,7 @@ mod tests {
         let out = parent.path().join("bundle");
         write(&out, "not a directory");
 
-        let err = write_bundle(&plan_for(source.path()), &out, true)
+        let err = write_bundle(&mut plan_for(source.path()), &out, true)
             .await
             .unwrap_err();
 

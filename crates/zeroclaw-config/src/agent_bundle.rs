@@ -82,6 +82,9 @@ pub enum DropReason {
     PrivateData,
     /// Not carried by this bundle format version yet.
     NotYetPortable,
+    /// Referenced content the exporting host did not have, so there was
+    /// nothing to carry. Recorded by the caller once the copy has run.
+    SourceMissing,
 }
 
 impl DropReason {
@@ -94,6 +97,7 @@ impl DropReason {
             Self::DefaultClosed => "default_closed",
             Self::PrivateData => "private_data",
             Self::NotYetPortable => "not_yet_portable",
+            Self::SourceMissing => "source_missing",
         }
     }
 }
@@ -478,6 +482,34 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
         workspace_source: config.agent_workspace_dir(alias),
         skill_sources,
     })
+}
+
+/// Record that `missing` skill bundles contributed no content to the bundle.
+///
+/// The planner runs before any filesystem work, so it plans to carry every
+/// referenced bundle. Only the caller learns which of them actually had
+/// content, and the manifest is rendered from this plan: without folding that
+/// back in, a bundle would advertise `skill_bundles` and a `carried_skills`
+/// grant for a `skills/<alias>/` tree it does not contain, and the only
+/// accurate record would be the terminal the export was run from.
+///
+/// Call before [`render_manifest_toml`].
+pub fn record_missing_skill_content(plan: &mut ExportPlan, missing: &[String]) {
+    for alias in missing {
+        plan.skill_sources.retain(|source| &source.alias != alias);
+        plan.risk_flags.retain(|flag| {
+            flag.kind != RiskKind::CarriedSkills || flag.path != format!("skill_bundles.{alias}")
+        });
+        plan.dropped.push(DroppedRef {
+            path: format!("{SKILLS_DIR}/{alias}"),
+            reason: DropReason::SourceMissing,
+            detail: "the skill bundle carried no skills from the exporting host: its \
+                     directory is absent, or holds nothing the bundle admits. Its config \
+                     travels, so install the skills on the target, or re-export from a host \
+                     that has them"
+                .to_string(),
+        });
+    }
 }
 
 /// Remove the parts of an agent entry that cannot travel, recording each.
@@ -966,6 +998,10 @@ pub fn render_manifest(plan: &ExportPlan, provenance: &Provenance) -> toml::Tabl
     // Bundle aliases whose content is carried under `skills/<alias>/`. An
     // import maps each back onto the directory the *target* resolves for that
     // alias, which is why the alias, not the source path, is what is recorded.
+    //
+    // This lists what the bundle *contains*, so it is only accurate once
+    // `record_missing_skill_content` has folded in what the copy found. A
+    // bundle whose content was unavailable is named in `dropped` instead.
     manifest.insert(
         "skill_bundles".to_string(),
         toml::Value::Array(
@@ -1748,6 +1784,59 @@ mod tests {
                     .filter_map(toml::Value::as_str)
                     .collect::<Vec<_>>()),
             Some(vec!["research_tools"])
+        );
+    }
+
+    /// The planner cannot know whether a referenced bundle has content, so the
+    /// caller folds that back in before the manifest is rendered.
+    #[test]
+    fn recording_missing_skill_content_stops_the_manifest_advertising_it() {
+        let mut config = fixture();
+        config
+            .skill_bundles
+            .insert("research_tools".to_string(), SkillBundleConfig::default());
+        if let Some(agent) = config.agents.get_mut("researcher") {
+            agent.skill_bundles = vec!["research_tools".to_string()];
+        }
+
+        let mut plan = plan_export(&config, "researcher").unwrap();
+        assert_eq!(plan.skill_sources.len(), 1);
+        assert!(
+            plan.risk_flags
+                .iter()
+                .any(|f| f.kind == RiskKind::CarriedSkills)
+        );
+
+        record_missing_skill_content(&mut plan, &["research_tools".to_string()]);
+
+        assert!(plan.skill_sources.is_empty());
+        assert!(
+            !plan
+                .risk_flags
+                .iter()
+                .any(|f| f.kind == RiskKind::CarriedSkills),
+            "a grant for content that is not in the bundle"
+        );
+        let dropped = plan
+            .dropped
+            .iter()
+            .find(|d| d.path == "skills/research_tools")
+            .unwrap_or_else(|| panic!("{:?}", plan.dropped));
+        assert_eq!(dropped.reason, DropReason::SourceMissing);
+
+        let manifest = render_manifest(
+            &plan,
+            &Provenance {
+                zeroclaw_version: "0.0.0-test".to_string(),
+                exported_at: "2026-08-19T00:00:00Z".to_string(),
+            },
+        );
+        assert_eq!(
+            manifest
+                .get("skill_bundles")
+                .and_then(toml::Value::as_array)
+                .map(Vec::len),
+            Some(0)
         );
     }
 
