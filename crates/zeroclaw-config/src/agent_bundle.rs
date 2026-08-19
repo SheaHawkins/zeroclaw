@@ -1135,6 +1135,10 @@ pub fn render_manifest_toml(
 /// `memory/`, and the [`MEMORY_SNAPSHOT_FILE`] at the workspace root that an
 /// agent re-hydrates the store from. Only the snapshot at the root is the
 /// store's own; a file of that name deeper in the tree is the operator's.
+///
+/// Both matches are anchored at the workspace root on purpose, and neither is
+/// a substring test: the store is `<workspace>/memory/`, so a nested
+/// `notes/memory/` is the operator's own directory and travels.
 #[must_use]
 pub fn workspace_entry_included(relative: &std::path::Path) -> bool {
     let mut components = relative.components();

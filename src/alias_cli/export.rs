@@ -50,6 +50,10 @@ struct CopyTally {
     /// target may sit outside the copied tree, and it would resolve to
     /// something different on the receiving host regardless.
     symlinks_skipped: usize,
+    /// Sockets, FIFOs, and device nodes encountered and skipped. Counted for
+    /// the same reason symlinks are: an entry that did not travel should be
+    /// something the operator hears about, not something they discover.
+    others_skipped: usize,
 }
 
 /// Skill-bundle content carried into the bundle.
@@ -573,6 +577,7 @@ fn copy_tree(
         }
         if !file_type.is_dir() && !file_type.is_file() {
             // Sockets, FIFOs, devices: nothing a bundle can carry.
+            copied.others_skipped += 1;
             continue;
         }
 
@@ -670,6 +675,20 @@ fn report(plan: &ExportPlan, out: &Path, copied: &BundleCopy) {
             )
         );
     }
+    let others_skipped = copied.workspace.others_skipped + copied.skills.tally.others_skipped;
+    if others_skipped > 0 {
+        let count = others_skipped.to_string();
+        println!(
+            "{}",
+            mta(
+                "cli-agent-export-others-skipped",
+                &[("count", count.as_str())],
+                "  {$count} special file(s) skipped — sockets, FIFOs, and devices are host \
+                 state, not content a bundle can carry"
+            )
+        );
+    }
+
     let symlinks_skipped = copied.workspace.symlinks_skipped + copied.skills.tally.symlinks_skipped;
     if symlinks_skipped > 0 {
         let count = symlinks_skipped.to_string();
@@ -984,6 +1003,27 @@ mod tests {
                 file.display()
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_counts_special_files_it_skips() {
+        use std::os::unix::net::UnixListener;
+
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        write(&source.path().join("IDENTITY.md"), "identity");
+        // A socket is host state: it cannot travel, and the operator should
+        // hear that it did not rather than infer it from a file count.
+        let _socket = UnixListener::bind(source.path().join("agent.sock")).unwrap();
+
+        let plan = plan_for(source.path());
+        let copied = copy_workspace(&plan, dest.path()).unwrap();
+
+        assert_eq!(copied.files, 1);
+        assert_eq!(copied.others_skipped, 1);
+        assert_eq!(copied.symlinks_skipped, 0);
+        assert!(!dest.path().join("agent.sock").exists());
     }
 
     #[cfg(unix)]
