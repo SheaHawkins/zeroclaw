@@ -7,11 +7,18 @@
 //! asked to grant.
 //!
 //! A bundle is published, not merged: it is built in a staging directory beside
-//! the destination and swapped into place in one move. An export therefore
-//! either replaces the destination with a complete bundle or leaves it exactly
-//! as it found it — a half-written bundle and a bundle carrying leftovers from
-//! an earlier export are both states a receiving operator would have no way to
-//! detect from the manifest.
+//! the destination and swapped in once complete. A half-written bundle, and a
+//! bundle carrying leftovers from an earlier export, are both states a
+//! receiving operator has no way to detect from the manifest, so neither is
+//! ever published.
+//!
+//! The swap is two renames, not one: the old bundle moves aside, then the
+//! staged one moves in. That is rollback, not atomicity. Any failure the export
+//! *returns* leaves the destination as it found it, because the rollback runs.
+//! A crash between the two renames cannot roll anything back, and leaves the
+//! destination absent with the old bundle intact under [`RETIRED_PREFIX`].
+//! A crash-atomic directory exchange would need `RENAME_EXCHANGE`, which is
+//! Linux-only, so the guarantee is stated as it is rather than widened.
 
 use std::path::{Path, PathBuf};
 
@@ -89,7 +96,7 @@ pub async fn run(config: &Config, alias: &str, out: &Path, force: bool) -> Resul
 /// Everything that can refuse the export runs first, against nothing but
 /// metadata; only then is a staging directory created, filled, and swapped in.
 /// The destination is never partially written and never keeps an entry the new
-/// manifest does not describe.
+/// manifest does not describe. On any returned error it is left as it was.
 async fn write_bundle(plan: &mut ExportPlan, out: &Path, force: bool) -> Result<BundleCopy> {
     let dest = resolve_path(out)?;
     reject_source_overlap(&dest, plan, out)?;
@@ -112,7 +119,8 @@ async fn write_bundle(plan: &mut ExportPlan, out: &Path, force: bool) -> Result<
         .with_context(|| format!("failed to create destination parent {}", parent.display()))?;
 
     // Dropping the staging directory removes it, so every `?` below cleans up
-    // after itself and leaves the destination untouched.
+    // after itself and leaves the destination untouched. A crash skips the
+    // drop, leaving the staged tree behind for the operator to delete.
     let staging = tempfile::Builder::new()
         .prefix(STAGING_PREFIX)
         .tempdir_in(parent)
@@ -310,8 +318,10 @@ fn publish(staging: tempfile::TempDir, dest: &Path, parent: &Path) -> Result<()>
 /// Move `staged` onto `dest`, replacing whatever the destination held.
 ///
 /// An existing bundle is moved aside rather than deleted first, so a failed
-/// move can put it back: there is no window in which the destination is
-/// missing a bundle it had.
+/// move can put it back. The window between the two renames is real: a crash
+/// inside it leaves the destination absent and the previous bundle under the
+/// retired name, which is why that name is derived from the staging token
+/// rather than being random on its own. Recovery is renaming it back.
 fn swap_into_place(staged: &Path, dest: &Path, parent: &Path) -> Result<()> {
     if !dest.exists() {
         return std::fs::rename(staged, dest)
@@ -863,6 +873,17 @@ mod tests {
         fn drop(&mut self) {
             ENTRY_SWAP.with_borrow_mut(|slot| *slot = None);
         }
+    }
+
+    /// The guide tells an operator to recover a crashed export by renaming
+    /// `.zeroclaw-export-old-<token>` back, and to recognise the pair by their
+    /// shared token. That pairing is a promise, so it is pinned here.
+    #[test]
+    fn the_retired_name_pairs_with_the_staging_directory() {
+        assert_eq!(
+            retired_name(Path::new("/tmp/bundles/.zeroclaw-export-AbC123")),
+            ".zeroclaw-export-old-AbC123"
+        );
     }
 
     #[test]

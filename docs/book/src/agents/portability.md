@@ -42,19 +42,38 @@ capabilities a receiving operator would be accepting, the credentials that were
 scrubbed, and the configuration that could not travel.
 
 A bundle is **published, not merged**. The export is built in a staging
-directory beside the destination and moved into place in one step, so:
+directory beside the destination and swapped in once it is complete, so:
 
 - `--force` *replaces* the destination. A file from an earlier export that the
   new manifest does not describe is gone, rather than left to look like part of
   the bundle.
-- A failure anywhere, such as an unreadable workspace file or a full disk,
-  leaves the destination exactly as it was. There is no partially written
-  bundle to mistake for a complete one.
+- A failure the export reports, such as an unreadable workspace file or a full
+  disk, leaves the destination as it was. The staged tree is discarded and any
+  existing bundle is put back, so there is no partially written bundle to
+  mistake for a complete one.
 - A destination that overlaps a tree the export reads is refused before
   anything is created, in both directions and for the workspace and every skill
   bundle alike: an `--out` *inside* a source would have the copy consume its own
   output, and an `--out` that *contains* one would replace the tree being
   exported.
+
+### If the export is killed partway
+
+The swap is two renames, not one: the existing bundle is moved aside, then the
+staged one is moved in. That is enough to roll back a failure the export
+reports, but it is not crash-atomic. If the process or the host dies between
+those two renames, the destination is missing and the previous bundle is intact
+beside it, under a name that pairs with the staging directory:
+
+```text
+<parent>/
+├── .zeroclaw-export-<token>       staged bundle, incomplete (safe to delete)
+└── .zeroclaw-export-old-<token>   the previous bundle, unchanged
+```
+
+Recover by renaming `.zeroclaw-export-old-<token>` back to the destination.
+Both directories are hidden and share the same `<token>`, so a crashed export
+leaves a matching pair. A successful export leaves neither.
 
 ### What the closure carries
 
