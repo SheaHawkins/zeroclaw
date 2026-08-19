@@ -311,7 +311,16 @@ fn swap_into_place(staged: &Path, dest: &Path, parent: &Path) -> Result<()> {
             .with_context(|| format!("failed to move the staged bundle into {}", dest.display()));
     }
 
-    let retired = parent.join(format!("{RETIRED_PREFIX}{}", uuid::Uuid::new_v4()));
+    let retired = parent.join(retired_name(staged));
+    if retired.exists() {
+        // A leftover from a run that died mid-publish, wearing the same token.
+        // Refuse rather than consume it: the caller cleans up the staged tree
+        // and the destination is still the bundle it was.
+        bail!(
+            "cannot retire the existing bundle: {} already exists",
+            retired.display()
+        );
+    }
     std::fs::rename(dest, &retired).with_context(|| {
         format!(
             "failed to move the existing bundle at {} aside",
@@ -470,6 +479,20 @@ fn copy_skills(
         copy_tree(&child_source, &child_dest, &spec, Path::new(skill), copied)?;
     }
     Ok(())
+}
+
+/// Name to move the existing bundle aside under.
+///
+/// The staging directory's name was allocated uniquely in this parent, so
+/// reusing its random token keeps the retired name unique too, without the
+/// exporter carrying a random-number dependency of its own.
+fn retired_name(staged: &Path) -> String {
+    let token = staged
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let token = token.strip_prefix(STAGING_PREFIX).unwrap_or(&token);
+    format!("{RETIRED_PREFIX}{token}")
 }
 
 /// Create a directory inside the staging bundle and open a handle on it.
