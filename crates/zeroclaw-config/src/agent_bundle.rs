@@ -370,6 +370,15 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
     // one entry per name here. `duplicate_server_names_collapse_to_one_entry`
     // pins the second half, which is the one this module owns.
     let granted = config.mcp_servers_for_bundles(&agent.mcp_bundles);
+    debug_assert_eq!(
+        granted
+            .iter()
+            .map(|s| &s.name)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        granted.len(),
+        "mcp.servers names must be unique in the closure: required_secrets paths key on them"
+    );
     if !granted.is_empty() {
         let server_default = to_table(&McpServerConfig::default())?;
         let mut servers = Vec::with_capacity(granted.len());
