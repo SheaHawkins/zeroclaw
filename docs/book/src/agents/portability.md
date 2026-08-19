@@ -164,9 +164,7 @@ leaves the workspace, and neither is allowed.
 ### Credentials
 
 Every field the schema marks secret is scrubbed to an empty string, and its
-config path is listed under `required_secrets` in the manifest. Scrubbing
-applies to `config.toml` and nothing else; see [Bundle content is not
-scanned](#bundle-content-is-not-scanned) for what that leaves to you. The paths are
+config path is listed under `required_secrets` in the manifest. The paths are
 the ones `zeroclaw config set` accepts, so filling a bundle in is a direct
 copy-paste:
 
@@ -177,6 +175,25 @@ zeroclaw config set mcp.servers.github.env.GITHUB_TOKEN
 
 Scrubbing is verified, not assumed: if encrypted config ciphertext survives
 into the closure, the export aborts rather than writing the bundle.
+
+#### What scrubbing does not do
+
+Scrubbing blanks the fields the schema marks secret. It is not credential
+detection, and it does not look at the values it carries. Every other string in
+the closure travels exactly as configured:
+
+| Carried as written | A credential ends up there when |
+| --- | --- |
+| `mcp.servers.<name>.url` | The endpoint carries a token or signed query string. |
+| `mcp.servers.<name>.command`, `.args` | A key is passed on the command line rather than through `env`. |
+| `providers.*.api_url` | A self-hosted endpoint embeds an access token. |
+
+The manifest repeats stdio server command lines verbatim in `risk_flags`, so a
+credential in `args` is in the manifest as well as the config fragment.
+
+Read those values before sharing a bundle. Two things need your eyes rather than
+the schema's: the strings described here, and the carried files described in
+[Bundle content is not scanned](#bundle-content-is-not-scanned).
 
 ### Bundle content is not scanned
 

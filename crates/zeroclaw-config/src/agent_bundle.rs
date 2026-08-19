@@ -963,6 +963,10 @@ const CONFIG_HEADER: &str = "\
 # merges it into the target install; it never replaces the target's config.
 # Empty-string values are credentials that were scrubbed on export and must be
 # supplied on the target — see `required_secrets` in zeroclaw-agent.toml.
+#
+# Scrubbing blanks the fields the schema marks secret. It is not credential
+# detection: any other value here travels as written, so a token in an MCP
+# server's `url`, or a credential in its `command` or `args`, is still present.
 ";
 
 /// Render the closure as the bundle's `config.toml`.
@@ -1080,8 +1084,10 @@ const MANIFEST_HEADER: &str = "\
 # export. `risk_flags` lists capabilities the importing operator is being asked
 # to grant. `dropped` lists configuration that could not travel.
 #
-# Scrubbing covers config.toml only. The files under workspace/ and skills/ are
-# copied as-is and are never scanned for secrets.
+# Scrubbing blanks the fields the schema marks secret in config.toml, and
+# nothing more. Other config strings travel as written, and `risk_flags` below
+# repeats stdio server command lines verbatim. The files under workspace/ and
+# skills/ are copied as-is. None of it is scanned for secrets.
 ";
 
 /// Render the manifest as the bundle's `zeroclaw-agent.toml`.

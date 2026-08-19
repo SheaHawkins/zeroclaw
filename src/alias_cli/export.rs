@@ -761,6 +761,20 @@ fn report(plan: &ExportPlan, out: &Path, copied: &BundleCopy) {
     // and cannot reach the files a bundle carries, so the operator is told
     // plainly rather than left to infer it from the scrubbed-credentials list
     // just above.
+    // The scrubbed-credentials list above is easy to read as "credentials were
+    // detected and removed". It is narrower than that, and the difference is
+    // the operator's to act on.
+    println!(
+        "\n{}",
+        mt(
+            "cli-agent-export-scrub-scope",
+            "⚠️  Scrubbing blanks the fields the schema marks secret. It is not credential \
+             detection: other config values travel as written, so a token in an MCP server's \
+             url, or a credential in its command or args, is carried and repeated in the \
+             manifest's risk flags."
+        )
+    );
+
     let carried = copied.workspace.files + copied.skills.tally.files;
     if carried > 0 {
         let count = carried.to_string();
