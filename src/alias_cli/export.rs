@@ -386,6 +386,50 @@ async fn write_file(path: &Path, contents: &str) -> Result<()> {
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
+/// What opening a copy source's root found.
+enum SourceRoot {
+    /// A real directory, opened without traversing a link at its final
+    /// component.
+    Opened(Dir),
+    /// Nothing to copy: the path is absent, or is not a directory.
+    Nothing,
+    /// The final component is a symlink. Refused rather than followed.
+    Symlinked,
+}
+
+/// Open a copy source's root, refusing a symlink at its final component.
+///
+/// `Dir::open_ambient_dir` resolves the whole path, final component included,
+/// so a symlinked root would put the entire walk outside the tree the bundle
+/// claims to carry before the no-follow descent below it ever runs. The
+/// ancestors are the operator's configured path and are followed as such; the
+/// last component is opened through a handle on its parent, where a link is an
+/// error instead of a redirect.
+///
+/// The `symlink_metadata` call only picks which answer to give. The open is
+/// what enforces it, so a swap between the two cannot turn a refusal into a
+/// traversal.
+fn open_source_root(path: &Path) -> Result<SourceRoot> {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return Ok(SourceRoot::Nothing);
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok(SourceRoot::Symlinked);
+    }
+    if !metadata.is_dir() {
+        return Ok(SourceRoot::Nothing);
+    }
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Ok(SourceRoot::Nothing);
+    };
+    let parent = Dir::open_ambient_dir(parent, ambient_authority())
+        .with_context(|| format!("failed to open {}", parent.display()))?;
+    let opened = parent
+        .open_dir_nofollow(name)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    Ok(SourceRoot::Opened(opened))
+}
+
 /// Copy the agent's workspace into the bundle, honoring the plan's memory
 /// exclusion. A missing source workspace is not an error: an agent that has
 /// never run has nothing on disk yet.
@@ -405,16 +449,20 @@ async fn write_file(path: &Path, contents: &str) -> Result<()> {
 /// between the two steps fails the export instead of silently redirecting it.
 fn copy_workspace(plan: &ExportPlan, dest: &Path) -> Result<CopyTally> {
     let mut copied = CopyTally::default();
-    if !plan.workspace_source.is_dir() {
-        return Ok(copied);
-    }
-    let source =
-        Dir::open_ambient_dir(&plan.workspace_source, ambient_authority()).with_context(|| {
-            format!(
-                "failed to open workspace {}",
-                plan.workspace_source.display()
+    let source = match open_source_root(&plan.workspace_source)? {
+        SourceRoot::Opened(dir) => dir,
+        SourceRoot::Nothing => return Ok(copied),
+        SourceRoot::Symlinked => bail!(
+            "{}",
+            mta(
+                "cli-agent-export-workspace-root-symlink",
+                &[("path", plan.workspace_source.display().to_string().as_str())],
+                "the agent workspace {$path} is a symlink; the bundle would carry whatever it \
+                 points at as the agent's own tree, so set `workspace.path` to the real \
+                 directory and export again"
             )
-        })?;
+        ),
+    };
     let target = open_bundle_dir(dest)?;
     let spec = CopySpec {
         root: WORKSPACE_DIR.to_string(),
@@ -434,12 +482,25 @@ fn copy_workspace(plan: &ExportPlan, dest: &Path) -> Result<CopyTally> {
 /// markers and the like) stays behind.
 fn copy_skill_bundles(plan: &ExportPlan, dest_root: &Path, into: &mut BundleCopy) -> Result<()> {
     for source in &plan.skill_sources {
-        if !source.source.is_dir() {
-            into.skills.without_content.push(source.alias.clone());
-            continue;
-        }
-        let bundle = Dir::open_ambient_dir(&source.source, ambient_authority())
-            .with_context(|| format!("failed to open skill bundle `{}`", source.alias))?;
+        let bundle = match open_source_root(&source.source)? {
+            SourceRoot::Opened(dir) => dir,
+            SourceRoot::Nothing => {
+                into.skills.without_content.push(source.alias.clone());
+                continue;
+            }
+            SourceRoot::Symlinked => bail!(
+                "{}",
+                mta(
+                    "cli-agent-export-skill-root-symlink",
+                    &[
+                        ("alias", source.alias.as_str()),
+                        ("path", source.source.display().to_string().as_str())
+                    ],
+                    "skill bundle `{$alias}` resolves to the symlink {$path}; a bundle \
+                     directory must be a real directory inside the install's shared tree"
+                )
+            ),
+        };
         let bundle_dest = dest_root.join(&source.alias);
         let target = open_bundle_dir(&bundle_dest)?;
         let carried = copy_skills(&bundle, &target, source, &mut into.skills.tally)?;
@@ -1374,6 +1435,62 @@ mod tests {
         assert!(err.to_string().contains("workspace/notes.md"), "{err}");
         assert!(!out.exists());
         assert_eq!(entry_names(parent.path()), Vec::<String>::new());
+    }
+
+    /// The no-follow descent starts *below* the root, so the root itself is a
+    /// separate boundary: a symlinked workspace puts the whole walk outside the
+    /// tree the bundle claims to carry before any of it runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_workspace_root_is_refused() {
+        let outside = tempfile::tempdir().unwrap();
+        write(&outside.path().join("host-secret.txt"), "not the agent's");
+
+        // The configured workspace path is a link to somewhere else entirely.
+        let home = tempfile::tempdir().unwrap();
+        let workspace = home.path().join("workspace");
+        std::os::unix::fs::symlink(outside.path(), &workspace).unwrap();
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let err = write_bundle(&mut plan_for(&workspace), &out, false)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("is a symlink"), "{err}");
+        assert!(!out.exists());
+        assert_eq!(entry_names(parent.path()), Vec::<String>::new());
+        assert!(outside.path().join("host-secret.txt").is_file());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_skill_bundle_root_is_refused() {
+        let outside = tempfile::tempdir().unwrap();
+        write(
+            &outside.path().join("host-skill/SKILL.md"),
+            "not the agent's",
+        );
+
+        let workspace = tempfile::tempdir().unwrap();
+        write(&workspace.path().join("IDENTITY.md"), "identity");
+
+        // `<install>/shared/skills/<alias>` is a link out of the shared tree.
+        let shared = tempfile::tempdir().unwrap();
+        let bundle_root = shared.path().join("research_tools");
+        std::os::unix::fs::symlink(outside.path(), &bundle_root).unwrap();
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_with_skills(workspace.path(), &bundle_root, &[]);
+        let err = write_bundle(&mut plan, &out, false).await.unwrap_err();
+
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(!out.exists());
+        assert_eq!(entry_names(parent.path()), Vec::<String>::new());
+        assert!(outside.path().join("host-skill/SKILL.md").is_file());
     }
 
     /// Staying inside the workspace is not the boundary that matters here: the
