@@ -23,7 +23,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use zeroclaw_config::agent_bundle::{
@@ -54,6 +54,10 @@ struct CopyTally {
     /// the same reason symlinks are: an entry that did not travel should be
     /// something the operator hears about, not something they discover.
     others_skipped: usize,
+    /// Files carrying more than one name, skipped rather than copied. A hard
+    /// link is a second name for an object that may live anywhere on the host,
+    /// so its bytes are not this tree's to carry.
+    hard_links_skipped: usize,
 }
 
 /// Skill-bundle content carried into the bundle.
@@ -679,6 +683,16 @@ fn copy_tree(
             if !source_metadata.is_file() {
                 continue;
             }
+            // No-follow proves the name is not a symlink. It does not prove the
+            // bytes behind it belong to this tree: a hard link is a second name
+            // for one object, so an entry swapped for a link to a host file
+            // still classifies and opens as an ordinary regular file. A link
+            // count above one is that second name, checked on the handle the
+            // copy is about to read.
+            if source_metadata.nlink() > 1 {
+                copied.hard_links_skipped += 1;
+                continue;
+            }
             let mut writer = dest
                 .open_with(&name, OpenOptions::new().write(true).create_new(true))
                 .with_context(|| format!("failed to create {} in the bundle", rel(spec, &child)))?;
@@ -748,6 +762,21 @@ fn report(plan: &ExportPlan, out: &Path, copied: &BundleCopy) {
             )
         );
     }
+    let hard_links_skipped =
+        copied.workspace.hard_links_skipped + copied.skills.tally.hard_links_skipped;
+    if hard_links_skipped > 0 {
+        let count = hard_links_skipped.to_string();
+        println!(
+            "{}",
+            mta(
+                "cli-agent-export-hard-links-skipped",
+                &[("count", count.as_str())],
+                "  {$count} hard-linked file(s) skipped — a second name for a file that may \
+                 live anywhere on this host is not this workspace's content to carry"
+            )
+        );
+    }
+
     let others_skipped = copied.workspace.others_skipped + copied.skills.tally.others_skipped;
     if others_skipped > 0 {
         let count = others_skipped.to_string();
@@ -1565,6 +1594,55 @@ mod tests {
         assert!(!out.exists());
         assert_eq!(entry_names(parent.path()), Vec::<String>::new());
         assert!(outside.path().join("host-skill/SKILL.md").is_file());
+    }
+
+    /// No-follow proves a name is not a symlink; it says nothing about whether
+    /// the bytes belong to this tree. A hard link is the same object under a
+    /// second name, so it classifies and opens as an ordinary regular file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_replaced_by_a_hard_link_to_a_host_file_is_not_copied() {
+        let outside = tempfile::tempdir().unwrap();
+        let host = outside.path().join("host-secret.txt");
+        write(&host, "host secret bytes");
+
+        let source = tempfile::tempdir().unwrap();
+        let entry = source.path().join("notes.md");
+        write(&entry, "workspace note");
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_for(source.path());
+        let copied = {
+            let _swap = EntrySwap::install(move |relative| {
+                if relative == Path::new("notes.md") {
+                    std::fs::remove_file(&entry).unwrap();
+                    std::fs::hard_link(&host, &entry).unwrap();
+                    // Still a regular file, still not a symlink, and the name
+                    // never leaves the workspace directory.
+                    let meta = std::fs::symlink_metadata(&entry).unwrap();
+                    assert!(meta.file_type().is_file());
+                    assert_eq!(
+                        std::fs::read_to_string(&entry).unwrap(),
+                        "host secret bytes"
+                    );
+                }
+            });
+            write_bundle(&mut plan, &out, false).await.unwrap()
+        };
+
+        assert_eq!(copied.workspace.hard_links_skipped, 1);
+        assert_eq!(copied.workspace.files, 0);
+        assert!(!out.join(WORKSPACE_DIR).join("notes.md").exists());
+        for file in all_files(&out) {
+            let bytes = std::fs::read(&file).unwrap();
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains("host secret bytes"),
+                "{} carries the host file",
+                file.display()
+            );
+        }
     }
 
     /// Staying inside the workspace is not the boundary that matters here: the

@@ -156,9 +156,13 @@ be writing to it through an ordinary tool call. So the copy never re-opens a
 path by name. The workspace root is opened once, and every entry below it is
 classified *and* read through a handle on the directory that holds it, with both
 steps refusing to traverse a symlink. That is what makes the skip a guarantee
-rather than a check: the object that is read is the object that was classified,
-so an entry replaced by a link in between fails the export rather than
-redirecting it.
+rather than a check: an entry replaced by a link in between fails the export
+rather than redirecting it.
+
+Refusing to follow a name is not the same as proving the bytes belong to this
+tree, so the copy also skips any file carrying more than one name. A hard link
+is a second name for one object, which may live anywhere on the host, and it
+classifies and opens as an ordinary regular file.
 
 Refusing the link matters even when it points *inside* the workspace. The bundle
 has content boundaries of its own, and a link that never escapes the root can
