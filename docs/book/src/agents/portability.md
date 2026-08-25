@@ -119,7 +119,7 @@ nothing disappears silently.
 | `channels` | Names accounts and credentials that exist only on the source install. |
 | `delegates`, `workspace.access`, `workspace.read_memory_from` | Name sibling agents that will not exist on the target. |
 | `workspace.path` | A source-host absolute path. |
-| `identity.aieos_path` | Kept only when it resolves to a file inside the exported workspace. Absolute paths, paths escaping the workspace with `..`, paths into `memory/`, and paths whose file the copy did not carry are all dropped. |
+| `identity.aieos_path` | Kept only when it resolves to a file inside the exported workspace under the format's own path grammar: `/`-separated, no `..`, no backslashes, drive or UNC prefixes, or control characters, since the importing host may read those differently than the exporting one. Paths into `memory/`, and paths whose file the copy did not carry, are dropped too. |
 | `delegate_same_risk_profile` | Set to `false`: same-profile auto-delegation would otherwise reach agents on the target this one has never been paired with. |
 | `skill_bundles.<alias>.directory` | Dropped only when absolute; it names the source host and would fail the target's own validation. The target resolves its default location for the alias. |
 | `a2a` | An outward-facing surface; the agent must be re-published deliberately. |

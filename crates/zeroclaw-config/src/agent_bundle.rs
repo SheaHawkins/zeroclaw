@@ -675,6 +675,41 @@ fn sanitize_agent(
 /// judged by [`crate::paths::resolve_under`], the same helper the scoped file
 /// browser uses, against the workspace root the bundle recreates.
 fn portable_identity_path(raw: &str) -> Result<String, String> {
+    // The exporting host's `Path` semantics are not the importing host's. On
+    // Unix a backslash is an ordinary filename character, so `..\\outside.json`
+    // reads as one harmless name here and as a traversal on Windows, where the
+    // loader joins it to the workspace. A bundle is judged by whoever opens it,
+    // so the grammar below is the format's own: `/`-separated, no device or
+    // host prefixes, no parent components, nothing a platform could read as a
+    // separator or a control.
+    let trimmed = raw.trim();
+    for segment in trimmed.split('/') {
+        if segment.contains('\\') {
+            return Err(
+                "the AIEOS identity document path contains a backslash, which a Windows \
+                        target reads as a directory separator; use `/` only"
+                    .to_string(),
+            );
+        }
+        if segment.contains(':') {
+            return Err(
+                "the AIEOS identity document path contains a drive or stream prefix, \
+                        which does not resolve inside the imported workspace"
+                    .to_string(),
+            );
+        }
+        if segment.chars().any(char::is_control) {
+            return Err(
+                "the AIEOS identity document path contains a control character".to_string(),
+            );
+        }
+    }
+    portable_identity_path_inner(trimmed)
+}
+
+/// The rest of the check, once the path is known to be one a target reads the
+/// same way this host does.
+fn portable_identity_path_inner(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err("the AIEOS identity document path is empty".to_string());
@@ -1927,6 +1962,65 @@ mod tests {
 
     /// Inside the workspace lexically, but in the half the bundle does not
     /// carry, so the reference would dangle on the target.
+    /// A Unix exporter cannot judge a path with the importing host's rules, so
+    /// the format's own grammar has to reject anything another platform would
+    /// read as a separator, a device, or a traversal.
+    #[test]
+    fn an_identity_path_that_only_traverses_on_another_platform_is_dropped() {
+        for hostile in [
+            r"..\outside.json",
+            r"identity\..\..\outside.json",
+            r"C:\Windows\System32\config\sam",
+            "C:/Windows/System32/config/sam",
+            r"\\server\share\outside.json",
+            "identity/aieos.json:stream",
+            "identity/\u{7}bell.json",
+        ] {
+            let mut config = fixture();
+            if let Some(agent) = config.agents.get_mut("researcher") {
+                agent.identity.aieos_path = Some(hostile.to_string());
+            }
+            let plan = plan_export(&config, "researcher").unwrap();
+
+            assert!(plan.identity_document.is_none(), "{hostile:?} was retained");
+            let identity = lookup(&plan.config, &["agents", "researcher", "identity"])
+                .and_then(toml::Value::as_table);
+            assert!(
+                identity.is_none_or(|table| !table.contains_key("aieos_path")),
+                "{hostile:?} survived: {identity:?}"
+            );
+
+            let text = render_config_toml(&plan).unwrap();
+            let imported: Config = toml::from_str(&text).unwrap();
+            assert_eq!(imported.agents["researcher"].identity.aieos_path, None);
+        }
+    }
+
+    /// What a retained path is allowed to look like, checked as a grammar so
+    /// the guarantee does not depend on the exporting platform.
+    #[test]
+    fn a_retained_identity_path_resolves_the_same_on_any_platform() {
+        let mut config = fixture();
+        if let Some(agent) = config.agents.get_mut("researcher") {
+            agent.identity.aieos_path = Some("identity/aieos.json".to_string());
+        }
+        let plan = plan_export(&config, "researcher").unwrap();
+        let kept = plan.identity_document.as_deref().expect("retained");
+
+        assert!(!kept.contains('\\'), "{kept}");
+        assert!(!kept.contains(':'), "{kept}");
+        assert!(!kept.starts_with('/'), "{kept}");
+        assert!(
+            kept.split('/')
+                .all(|s| !s.is_empty() && s != "." && s != ".."),
+            "{kept}"
+        );
+        // Resolved with Windows separator rules, it still lands inside the
+        // workspace the bundle recreates.
+        let windows_joined = format!("workspace\\{}", kept.replace('/', "\\"));
+        assert!(!windows_joined.contains("\\..\\"), "{windows_joined}");
+    }
+
     #[test]
     fn an_identity_path_inside_the_memory_store_is_dropped() {
         let mut config = fixture();
