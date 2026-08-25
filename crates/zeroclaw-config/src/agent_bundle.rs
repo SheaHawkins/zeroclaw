@@ -212,6 +212,11 @@ pub struct ExportPlan {
     pub workspace_source: PathBuf,
     /// Skill-bundle directories to copy into the bundle's `skills/` tree.
     pub skill_sources: Vec<SkillBundleSource>,
+    /// Workspace-relative path of the AIEOS identity document the closure
+    /// still references, if it kept one. The caller checks that the workspace
+    /// copy actually carried it: a reference the bundle cannot satisfy is
+    /// dropped rather than shipped.
+    pub identity_document: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -255,7 +260,14 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
     let mut dropped = Vec::new();
 
     // ── the agent entry itself ───────────────────────────────────────────
-    let agent_table = sanitize_agent(&to_table(agent)?, alias, agent, &mut dropped);
+    let mut identity_document = None;
+    let agent_table = sanitize_agent(
+        &to_table(agent)?,
+        alias,
+        agent,
+        &mut dropped,
+        &mut identity_document,
+    );
     let agent_table = prune(agent_table, &to_table(&AliasedAgentConfig::default())?);
     insert_at(
         &mut out,
@@ -490,6 +502,7 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
         risk_flags,
         workspace_source: config.agent_workspace_dir(alias),
         skill_sources,
+        identity_document,
     })
 }
 
@@ -530,6 +543,7 @@ fn sanitize_agent(
     alias: &str,
     agent: &AliasedAgentConfig,
     dropped: &mut Vec<DroppedRef>,
+    identity_document: &mut Option<String>,
 ) -> toml::Table {
     let mut table = table.clone();
 
@@ -596,20 +610,24 @@ fn sanitize_agent(
         });
     }
 
-    // An identity document path relative to the workspace travels with the
-    // workspace copy; an absolute one names the source host.
-    if let Some(path) = agent.identity.aieos_path.as_deref()
-        && std::path::Path::new(path.trim()).is_absolute()
-        && let Some(toml::Value::Table(identity)) = table.get_mut("identity")
-    {
-        identity.remove("aieos_path");
-        dropped.push(DroppedRef {
-            path: format!("agents.{alias}.identity.aieos_path"),
-            reason: DropReason::HostSpecific,
-            detail: "the AIEOS identity document is referenced by a source-host absolute path; \
-                     point the imported agent at a path inside its own workspace"
-                .to_string(),
-        });
+    // The identity document travels only if it is part of the workspace the
+    // bundle carries. The loader joins a relative `aieos_path` to the workspace
+    // without rejecting `..`, so a path that escapes would have the imported
+    // agent read outside its own workspace at startup.
+    if let Some(raw) = agent.identity.aieos_path.as_deref() {
+        match portable_identity_path(raw) {
+            Ok(relative) => *identity_document = Some(relative),
+            Err(detail) => {
+                if let Some(toml::Value::Table(identity)) = table.get_mut("identity") {
+                    identity.remove("aieos_path");
+                }
+                dropped.push(DroppedRef {
+                    path: format!("agents.{alias}.identity.aieos_path"),
+                    reason: DropReason::HostSpecific,
+                    detail,
+                });
+            }
+        }
     }
 
     // The workspace block travels, but three of its fields cannot.
@@ -647,6 +665,73 @@ fn sanitize_agent(
     }
 
     table
+}
+
+/// The workspace-relative form of an `aieos_path` the bundle can carry, or why
+/// it cannot.
+///
+/// Portable means: relative, staying beneath the workspace once `..` is
+/// resolved, and inside the part of the workspace the copy carries. Escape is
+/// judged by [`crate::paths::resolve_under`], the same helper the scoped file
+/// browser uses, against the workspace root the bundle recreates.
+fn portable_identity_path(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("the AIEOS identity document path is empty".to_string());
+    }
+    if std::path::Path::new(trimmed).is_absolute() {
+        return Err(
+            "the AIEOS identity document is referenced by a source-host absolute path; \
+                    point the imported agent at a path inside its own workspace"
+                .to_string(),
+        );
+    }
+    let root = std::path::Path::new(WORKSPACE_DIR);
+    let Ok(resolved) = crate::paths::resolve_under(root, trimmed) else {
+        return Err(
+            "the AIEOS identity document path escapes the workspace, which would have \
+                    the imported agent read outside its own tree at startup"
+                .to_string(),
+        );
+    };
+    let Ok(relative) = resolved.strip_prefix(root) else {
+        return Err(
+            "the AIEOS identity document path could not be resolved inside the workspace"
+                .to_string(),
+        );
+    };
+    if !workspace_entry_included(relative) {
+        return Err(
+            "the AIEOS identity document sits in the part of the workspace this bundle \
+                    does not carry, so the reference would dangle on the target"
+                .to_string(),
+        );
+    }
+    Ok(relative.display().to_string())
+}
+
+/// Record that the workspace copy did not carry the identity document the
+/// closure references, and drop the reference.
+///
+/// Whether the file is really there is a filesystem question, so the caller
+/// answers it once the workspace has been copied. Call before
+/// [`render_config_toml`].
+pub fn record_missing_identity_document(plan: &mut ExportPlan) {
+    let Some(relative) = plan.identity_document.take() else {
+        return;
+    };
+    let alias = plan.root_alias.clone();
+    if let Some(identity) = table_at_mut(&mut plan.config, &["agents", &alias, "identity"]) {
+        identity.remove("aieos_path");
+    }
+    plan.dropped.push(DroppedRef {
+        path: format!("agents.{alias}.identity.aieos_path"),
+        reason: DropReason::SourceMissing,
+        detail: format!(
+            "the AIEOS identity document `{relative}` is not in the exported workspace, so the \
+             reference is dropped rather than shipped pointing at nothing"
+        ),
+    });
 }
 
 /// Capabilities in this closure that widen the target install's trust boundary.
@@ -1729,6 +1814,89 @@ mod tests {
             imported
                 .reachable_delegate_target_configs("researcher")
                 .is_empty()
+        );
+    }
+
+    /// The loader joins a relative `aieos_path` to the workspace without
+    /// rejecting `..`, so a traversing path in a bundle would have the imported
+    /// agent read outside its own workspace at startup. It never reaches the
+    /// fragment.
+    #[test]
+    fn an_identity_path_that_escapes_the_workspace_is_dropped() {
+        for escaping in [
+            "../outside.json",
+            "identity/../../outside.json",
+            "..//outside.json",
+        ] {
+            let mut config = fixture();
+            if let Some(agent) = config.agents.get_mut("researcher") {
+                agent.identity.aieos_path = Some(escaping.to_string());
+            }
+            let plan = plan_export(&config, "researcher").unwrap();
+
+            let identity = lookup(&plan.config, &["agents", "researcher", "identity"])
+                .and_then(toml::Value::as_table);
+            assert!(
+                identity.is_none_or(|table| !table.contains_key("aieos_path")),
+                "{escaping} survived: {identity:?}"
+            );
+            assert!(plan.identity_document.is_none(), "{escaping}");
+            assert!(
+                plan.dropped
+                    .iter()
+                    .any(|d| d.path == "agents.researcher.identity.aieos_path"),
+                "{escaping} was dropped silently"
+            );
+
+            // What an importer would actually load: no path, so nothing to
+            // resolve outside the workspace.
+            let text = render_config_toml(&plan).unwrap();
+            assert!(!text.contains("outside.json"), "{escaping}: {text}");
+            let imported: Config = toml::from_str(&text).unwrap();
+            assert_eq!(imported.agents["researcher"].identity.aieos_path, None);
+        }
+    }
+
+    /// Inside the workspace lexically, but in the half the bundle does not
+    /// carry, so the reference would dangle on the target.
+    #[test]
+    fn an_identity_path_inside_the_memory_store_is_dropped() {
+        let mut config = fixture();
+        if let Some(agent) = config.agents.get_mut("researcher") {
+            agent.identity.aieos_path = Some("memory/aieos.json".to_string());
+        }
+        let plan = plan_export(&config, "researcher").unwrap();
+
+        assert!(plan.identity_document.is_none());
+        let identity = lookup(&plan.config, &["agents", "researcher", "identity"])
+            .and_then(toml::Value::as_table);
+        assert!(identity.is_none_or(|table| !table.contains_key("aieos_path")));
+    }
+
+    #[test]
+    fn a_carried_identity_path_is_tracked_for_the_caller_to_verify() {
+        let mut config = fixture();
+        if let Some(agent) = config.agents.get_mut("researcher") {
+            agent.identity.aieos_path = Some("identity/aieos.json".to_string());
+        }
+        let plan = plan_export(&config, "researcher").unwrap();
+        assert_eq!(
+            plan.identity_document.as_deref(),
+            Some("identity/aieos.json")
+        );
+
+        // And dropping it after the copy takes the reference with it.
+        let mut plan = plan;
+        record_missing_identity_document(&mut plan);
+        assert!(plan.identity_document.is_none());
+        let identity = lookup(&plan.config, &["agents", "researcher", "identity"])
+            .and_then(toml::Value::as_table);
+        assert!(identity.is_none_or(|table| !table.contains_key("aieos_path")));
+        assert!(
+            plan.dropped
+                .iter()
+                .any(|d| d.reason == DropReason::SourceMissing
+                    && d.path == "agents.researcher.identity.aieos_path")
         );
     }
 

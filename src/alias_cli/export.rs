@@ -106,8 +106,6 @@ async fn write_bundle(plan: &mut ExportPlan, out: &Path, force: bool) -> Result<
     reject_source_overlap(&dest, plan, out)?;
     check_destination(&dest, out, force).await?;
 
-    let config_toml = agent_bundle::render_config_toml(plan).map_err(anyhow::Error::new)?;
-
     let Some(parent) = dest.parent() else {
         bail!(
             "{}",
@@ -135,12 +133,26 @@ async fn write_bundle(plan: &mut ExportPlan, out: &Path, force: bool) -> Result<
             )
         })?;
 
-    write_file(&staging.path().join(CONFIG_FILE), &config_toml).await?;
+    let workspace_dest = staging.path().join(WORKSPACE_DIR);
     let mut copied = BundleCopy {
-        workspace: copy_workspace(plan, &staging.path().join(WORKSPACE_DIR))?,
+        workspace: copy_workspace(plan, &workspace_dest)?,
         skills: SkillCopy::default(),
     };
     copy_skill_bundles(plan, &staging.path().join(SKILLS_DIR), &mut copied)?;
+
+    // The closure may reference an identity document inside the workspace. The
+    // planner proved the path stays in the tree; only the copy knows whether
+    // the file was actually there to carry.
+    if let Some(relative) = plan.identity_document.as_deref()
+        && !workspace_dest.join(relative).is_file()
+    {
+        agent_bundle::record_missing_identity_document(plan);
+    }
+
+    // Both files describe the bundle, so both are rendered from what the copy
+    // carried and written once it is done.
+    let config_toml = agent_bundle::render_config_toml(plan).map_err(anyhow::Error::new)?;
+    write_file(&staging.path().join(CONFIG_FILE), &config_toml).await?;
 
     // The manifest describes the bundle, so it is rendered from what the copy
     // actually carried and written last. Advertising a `skills/<alias>/` tree
@@ -892,6 +904,22 @@ mod tests {
         std::fs::write(path, body).unwrap();
     }
 
+    /// A closure whose agent entry names an identity document.
+    fn agent_identity_config(path: &str) -> toml::Table {
+        let mut identity = toml::Table::new();
+        identity.insert(
+            "aieos_path".to_string(),
+            toml::Value::String(path.to_string()),
+        );
+        let mut agent = toml::Table::new();
+        agent.insert("identity".to_string(), toml::Value::Table(identity));
+        let mut agents = toml::Table::new();
+        agents.insert("researcher".to_string(), toml::Value::Table(agent));
+        let mut root = toml::Table::new();
+        root.insert("agents".to_string(), toml::Value::Table(agents));
+        root
+    }
+
     fn plan_for(workspace: &Path) -> ExportPlan {
         ExportPlan {
             root_alias: "researcher".to_string(),
@@ -901,6 +929,7 @@ mod tests {
             risk_flags: Vec::new(),
             workspace_source: workspace.to_path_buf(),
             skill_sources: Vec::new(),
+            identity_document: None,
         }
     }
 
@@ -1435,6 +1464,51 @@ mod tests {
         assert!(err.to_string().contains("workspace/notes.md"), "{err}");
         assert!(!out.exists());
         assert_eq!(entry_names(parent.path()), Vec::<String>::new());
+    }
+
+    /// The planner keeps a workspace-relative identity path; only the copy
+    /// knows whether the file was there. A reference the bundle cannot satisfy
+    /// is dropped from the published config rather than shipped dangling.
+    #[tokio::test]
+    async fn an_identity_document_the_copy_did_not_carry_is_dropped() {
+        let source = tempfile::tempdir().unwrap();
+        write(&source.path().join("IDENTITY.md"), "identity");
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_for(source.path());
+        plan.identity_document = Some("identity/aieos.json".to_string());
+        plan.config = agent_identity_config("identity/aieos.json");
+
+        write_bundle(&mut plan, &out, false).await.unwrap();
+
+        let published = std::fs::read_to_string(out.join(CONFIG_FILE)).unwrap();
+        assert!(!published.contains("aieos.json"), "{published}");
+        assert!(plan.identity_document.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_identity_document_the_copy_carried_is_kept() {
+        let source = tempfile::tempdir().unwrap();
+        write(&source.path().join("identity/aieos.json"), "{}");
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_for(source.path());
+        plan.identity_document = Some("identity/aieos.json".to_string());
+        plan.config = agent_identity_config("identity/aieos.json");
+
+        write_bundle(&mut plan, &out, false).await.unwrap();
+
+        let published = std::fs::read_to_string(out.join(CONFIG_FILE)).unwrap();
+        assert!(published.contains("identity/aieos.json"), "{published}");
+        assert!(
+            out.join(WORKSPACE_DIR)
+                .join("identity/aieos.json")
+                .is_file()
+        );
     }
 
     /// The no-follow descent starts *below* the root, so the root itself is a
