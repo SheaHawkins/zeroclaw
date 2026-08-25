@@ -208,14 +208,20 @@ the schema's: the strings described here, and the carried files described in
 ### Bundle content is not scanned
 
 Scrubbing is a schema-driven pass over the config closure. It does not reach the
-files a bundle carries, and nothing else does either: everything under
-`workspace/` and `skills/` is copied byte for byte and is never scanned for
-secrets.
+files a bundle carries, and nothing else does either. Filters decide *which*
+files travel; nothing inspects what is inside the ones that do.
 
-A `.env` file in the workspace, an API token pasted into a note, a `.git/config`
-whose remote URL carries a credential, a private document the agent was working
-on: all of it travels exactly as it is. The export tells you how many files it
-carried, but it cannot tell you what is in them.
+Each regular file that survives the workspace and skill filters is copied
+byte for byte and is never scanned for secrets. What does not travel at all is
+listed elsewhere on this page: the [memory store and its
+snapshot](#memory-does-not-travel), [symlinks, special files, and hard
+links](#exporting), skills a bundle's `exclude` rejects, and loose state at a
+skill bundle's root.
+
+So a `.env` file in the workspace, an API token pasted into a note, a
+`.git/config` whose remote URL carries a credential, or a private document the
+agent was working on all travel exactly as they are. The export tells you how
+many files it carried, but it cannot tell you what is in them.
 
 Read the carried files yourself before sharing a bundle, the same way you would
 read a repository before making it public. `config.toml` and the manifest are
