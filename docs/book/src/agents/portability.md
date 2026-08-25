@@ -226,7 +226,7 @@ grants it.
 | Flag | Raised by |
 | --- | --- |
 | `full_autonomy` | `level = "full"`, no per-operation approval gate. |
-| `filesystem_escape` | `workspace_only = false`, or `workspace.unrestricted_filesystem = true`. |
+| `filesystem_escape` | The *effective* policy is unconfined: `workspace_only = false`, `level = "full"` (which forces confinement off whatever `workspace_only` says), or `workspace.unrestricted_filesystem = true`. |
 | `sandbox_disabled` | `sandbox_enabled = false`. |
 | `approval_bypass` | `block_high_risk_commands` or `require_approval_for_medium_risk` turned off. |
 | `env_passthrough` | Non-empty `shell_env_passthrough`: host environment variables reach shell subprocesses. |

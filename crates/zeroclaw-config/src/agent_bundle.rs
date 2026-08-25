@@ -767,11 +767,33 @@ fn collect_risk_flags(
                     .to_string(),
             });
         }
-        if !profile.workspace_only {
+        // The runtime does not take the authored `workspace_only` at face
+        // value: `SecurityPolicy::from_profiles` forces it off under full
+        // autonomy. Build the policy the target will build, so this names the
+        // authority the imported agent actually gets rather than the value
+        // someone typed into the profile.
+        let effective = crate::policy::SecurityPolicy::from_profiles(
+            profile,
+            config.runtime_profiles.get(agent.runtime_profile.trim()),
+            &config.agent_workspace_dir(alias),
+        );
+        if !effective.workspace_only {
+            let (path, detail) = if profile.workspace_only {
+                (
+                    at("level"),
+                    "full autonomy turns workspace confinement off, so filesystem access is not                      confined to the workspace even though `workspace_only` is set"
+                        .to_string(),
+                )
+            } else {
+                (
+                    at("workspace_only"),
+                    "filesystem access is not confined to the workspace".to_string(),
+                )
+            };
             flags.push(RiskFlag {
                 kind: RiskKind::FilesystemEscape,
-                path: at("workspace_only"),
-                detail: "filesystem access is not confined to the workspace".to_string(),
+                path,
+                detail,
             });
         }
         if profile.sandbox_enabled == Some(false) {
@@ -1590,6 +1612,52 @@ mod tests {
         ] {
             assert!(kinds.contains(expected), "{kinds:?} missing {expected}");
         }
+    }
+
+    /// The authored profile says the agent is workspace-confined; the runtime
+    /// says otherwise, because full autonomy forces confinement off. The
+    /// manifest has to disclose the authority the importer actually grants.
+    #[test]
+    fn full_autonomy_discloses_the_filesystem_escape_it_forces() {
+        let mut config = fixture();
+        config.risk_profiles.insert(
+            "guarded".to_string(),
+            RiskProfileConfig {
+                level: AutonomyLevel::Full,
+                // Left at the default: authored as confined.
+                ..Default::default()
+            },
+        );
+        assert!(
+            config.risk_profiles["guarded"].workspace_only,
+            "fixture must exercise the default, or the test proves nothing"
+        );
+
+        let plan = plan_export(&config, "researcher").unwrap();
+        let flags: Vec<(&str, &str)> = plan
+            .risk_flags
+            .iter()
+            .map(|f| (f.kind.as_wire(), f.path.as_str()))
+            .collect();
+
+        assert!(
+            flags.contains(&("full_autonomy", "risk_profiles.guarded.level")),
+            "{flags:?}"
+        );
+        // Bound to `level`, which is what grants it, not to the
+        // `workspace_only` field that still reads `true`.
+        assert!(
+            flags.contains(&("filesystem_escape", "risk_profiles.guarded.level")),
+            "{flags:?}"
+        );
+
+        // The effective policy the target builds agrees with the disclosure.
+        let effective = crate::policy::SecurityPolicy::from_profiles(
+            &config.risk_profiles["guarded"],
+            None,
+            std::path::Path::new("/tmp/workspace"),
+        );
+        assert!(!effective.workspace_only);
     }
 
     #[test]
