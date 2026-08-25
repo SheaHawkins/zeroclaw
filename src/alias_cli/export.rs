@@ -589,8 +589,19 @@ fn copy_skills(
             root: root.clone(),
             filter: &|_| true,
         };
+        // Count skills by what the copy actually wrote, not by how many
+        // directories were admitted. A skill whose every entry is skipped
+        // (symlinks, special files, hard links) leaves nothing behind, and a
+        // bundle must not advertise a capability it has no content for.
+        let before = copied.files;
         copy_tree(&child_source, &child_dest, &spec, Path::new(skill), copied)?;
-        skills += 1;
+        if copied.files > before {
+            skills += 1;
+        } else {
+            dest.remove_dir_all(&name).with_context(|| {
+                format!("failed to remove the empty {root}/{skill} from the bundle")
+            })?;
+        }
     }
     Ok(skills)
 }
@@ -1315,6 +1326,60 @@ mod tests {
         assert_eq!(
             entry.get("reason").and_then(toml::Value::as_str),
             Some("source_missing")
+        );
+    }
+
+    /// An admitted skill directory is not carried content: if everything in it
+    /// is skipped, the bundle has no skill file, and the manifest must not say
+    /// otherwise.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_skill_whose_entries_are_all_skipped_is_not_advertised() {
+        let outside = tempfile::tempdir().unwrap();
+        write(&outside.path().join("host.md"), "host content");
+
+        let workspace = tempfile::tempdir().unwrap();
+        write(&workspace.path().join("IDENTITY.md"), "identity");
+
+        // Admitted by the bundle's filter, but holding nothing that travels.
+        let skills = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(skills.path().join("web_search")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("host.md"),
+            skills.path().join("web_search/SKILL.md"),
+        )
+        .unwrap();
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_with_skills(workspace.path(), skills.path(), &[]);
+        let copied = write_bundle(&mut plan, &out, false).await.unwrap();
+
+        assert_eq!(copied.skills.tally.files, 0);
+        assert_eq!(copied.skills.bundles, 0);
+        assert_eq!(
+            copied.skills.without_content,
+            vec!["research_tools".to_string()]
+        );
+
+        // Manifest and tree agree that nothing was carried.
+        assert!(!out.join(SKILLS_DIR).exists());
+        let manifest = manifest_of(&out);
+        assert_eq!(
+            manifest_list(&manifest, "skill_bundles"),
+            Vec::<String>::new(),
+            "{manifest:?}"
+        );
+        let flags = manifest
+            .get("risk_flags")
+            .and_then(toml::Value::as_array)
+            .unwrap();
+        assert!(
+            !flags
+                .iter()
+                .any(|f| f.get("kind").and_then(toml::Value::as_str) == Some("carried_skills")),
+            "{flags:?}"
         );
     }
 
