@@ -145,11 +145,19 @@ Symlinks inside the workspace are skipped rather than followed: a link's target
 may sit outside the workspace, and it would resolve differently on the
 receiving host anyway.
 
-The source roots themselves are checked first: a workspace or skill-bundle
+The source roots themselves are checked first. A workspace or skill-bundle
 directory that is a symlink is refused rather than followed, because following
 it would put the whole copy outside the tree the bundle claims to carry before
 any of the per-entry checks below run. Point the config at the real directory
 and export again.
+
+Its ancestors are checked too: a source that uses its default location must
+still resolve inside the install once every symlink in its path is followed, so
+a redirected `shared`, `shared/skills`, or `agents` directory is refused rather
+than silently read. The comparison is made against the install root, since the
+subdirectory a source sits in is the very component such a redirect replaces. A
+`workspace.path` the operator configured elsewhere is exempt: there the
+configured location is the boundary.
 
 The workspace stays live while the export runs, since the agent that owns it can
 be writing to it through an ordinary tool call. So the copy never re-opens a

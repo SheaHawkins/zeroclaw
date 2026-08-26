@@ -195,6 +195,26 @@ pub struct SkillBundleSource {
     pub filter: SkillBundleConfig,
 }
 
+/// Where each kind of copy source is allowed to resolve to.
+///
+/// A path is opened after its symlinks are resolved, so a symlinked `shared`,
+/// `shared/skills`, or `agents` directory would otherwise hand the copy a tree
+/// outside the install while every component below it looked ordinary.
+///
+/// Both boundaries are the install root rather than the subdirectory each
+/// source sits in. Anchoring at `<install>/shared` or `<install>/agents` would
+/// be vacuous: those are the very components an attacker replaces, and
+/// resolving the boundary would follow the same link the source did.
+#[derive(Debug, Clone)]
+pub struct SourceBoundaries {
+    /// Skill-bundle content must resolve inside the install.
+    pub skills: PathBuf,
+    /// The agent's workspace must resolve inside the install when it uses the
+    /// default location. `None` when `workspace.path` places it deliberately,
+    /// since then the configured location is the operator's own boundary.
+    pub workspace: Option<PathBuf>,
+}
+
 /// A computed export, ready to be written to disk.
 #[derive(Debug, Clone)]
 pub struct ExportPlan {
@@ -212,6 +232,12 @@ pub struct ExportPlan {
     pub workspace_source: PathBuf,
     /// Skill-bundle directories to copy into the bundle's `skills/` tree.
     pub skill_sources: Vec<SkillBundleSource>,
+    /// Boundary each copy source must resolve inside once symlinks anywhere in
+    /// its path are followed. `None` means the operator pointed the source
+    /// somewhere deliberately (a configured `workspace.path`), so the
+    /// configured location *is* the boundary and there is nothing to compare
+    /// against.
+    pub source_boundaries: SourceBoundaries,
     /// Workspace-relative path of the AIEOS identity document the closure
     /// still references, if it kept one. The caller checks that the workspace
     /// copy actually carried it: a reference the bundle cannot satisfy is
@@ -516,6 +542,13 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
         risk_flags,
         workspace_source: config.agent_workspace_dir(alias),
         skill_sources,
+        source_boundaries: SourceBoundaries {
+            skills: install_root.clone(),
+            // A configured `workspace.path` is the operator saying where the
+            // workspace lives; only the default location is anchored to the
+            // install.
+            workspace: agent.workspace.path.is_none().then(|| install_root.clone()),
+        },
         identity_document,
     })
 }
