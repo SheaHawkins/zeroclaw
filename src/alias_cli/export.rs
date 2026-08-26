@@ -58,6 +58,9 @@ struct CopyTally {
     /// link is a second name for an object that may live anywhere on the host,
     /// so its bytes are not this tree's to carry.
     hard_links_skipped: usize,
+    /// Entries whose object changed between being classified and being opened.
+    /// The copy carries what it inspected or nothing at all.
+    replaced_skipped: usize,
 }
 
 /// Skill-bundle content carried into the bundle.
@@ -620,6 +623,15 @@ fn retired_name(staged: &Path) -> String {
     format!("{RETIRED_PREFIX}{token}")
 }
 
+/// Whether two metadata views describe one filesystem object.
+///
+/// `dev`/`ino` are the portable identity pair `cap-fs-ext` exposes: on Windows
+/// they are the volume serial and file index, and cap-primitives builds both
+/// views from an opened handle, so neither side is a by-name guess.
+fn is_same_object(classified: &cap_std::fs::Metadata, opened: &cap_std::fs::Metadata) -> bool {
+    classified.dev() == opened.dev() && classified.ino() == opened.ino()
+}
+
 /// Create a directory inside the staging bundle and open a handle on it.
 fn open_bundle_dir(path: &Path) -> Result<Dir> {
     std::fs::create_dir_all(path)
@@ -655,10 +667,10 @@ fn copy_tree(
         // name, not whatever a fresh path lookup would resolve to. The opens
         // below are no-follow through the same handle, so the object that is
         // read is the object this classified.
-        let file_type = entry
+        let classified = entry
             .metadata()
-            .with_context(|| format!("failed to stat {}", rel(spec, &child)))?
-            .file_type();
+            .with_context(|| format!("failed to stat {}", rel(spec, &child)))?;
+        let file_type = classified.file_type();
         if file_type.is_symlink() {
             copied.symlinks_skipped += 1;
             continue;
@@ -677,6 +689,13 @@ fn copy_tree(
                 .with_context(|| format!("failed to open {}", rel(spec, &child)))?;
             dest.create_dir(&name)
                 .with_context(|| format!("failed to create {} in the bundle", rel(spec, &child)))?;
+            let opened = child_source
+                .dir_metadata()
+                .with_context(|| format!("failed to stat {}", rel(spec, &child)))?;
+            if !is_same_object(&classified, &opened) {
+                copied.replaced_skipped += 1;
+                continue;
+            }
             let child_dest = dest
                 .open_dir_nofollow(&name)
                 .with_context(|| format!("failed to open {} in the bundle", rel(spec, &child)))?;
@@ -702,6 +721,16 @@ fn copy_tree(
             // copy is about to read.
             if source_metadata.nlink() > 1 {
                 copied.hard_links_skipped += 1;
+                continue;
+            }
+            // Refusing to follow a name says nothing about *which* object now
+            // wears it. Between the classification above and this open, the
+            // entry can be unlinked and a host file renamed into its place:
+            // still a regular file, still one link, still inside the directory
+            // handle. The copy carries the object it inspected, so the two
+            // views have to name one object.
+            if !is_same_object(&classified, &source_metadata) {
+                copied.replaced_skipped += 1;
                 continue;
             }
             let mut writer = dest
@@ -773,6 +802,20 @@ fn report(plan: &ExportPlan, out: &Path, copied: &BundleCopy) {
             )
         );
     }
+    let replaced_skipped = copied.workspace.replaced_skipped + copied.skills.tally.replaced_skipped;
+    if replaced_skipped > 0 {
+        let count = replaced_skipped.to_string();
+        println!(
+            "{}",
+            mta(
+                "cli-agent-export-replaced-skipped",
+                &[("count", count.as_str())],
+                "  {$count} entry/entries were replaced while the export ran and were skipped — \
+                 the bundle carries the objects it inspected"
+            )
+        );
+    }
+
     let hard_links_skipped =
         copied.workspace.hard_links_skipped + copied.skills.tally.hard_links_skipped;
     if hard_links_skipped > 0 {
@@ -1659,6 +1702,89 @@ mod tests {
         assert!(!out.exists());
         assert_eq!(entry_names(parent.path()), Vec::<String>::new());
         assert!(outside.path().join("host-skill/SKILL.md").is_file());
+    }
+
+    /// The replacement that passes every shape test: a different regular file,
+    /// one link, no symlink anywhere. Only identity separates it from the entry
+    /// the copy classified.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_renamed_over_an_admitted_entry_is_not_copied() {
+        // Same filesystem as the workspace, so this is a rename, not a copy.
+        let root = tempfile::tempdir().unwrap();
+        let host = root.path().join("host-secret.txt");
+        write(&host, "host secret bytes");
+
+        let source = root.path().join("workspace");
+        let entry = source.join("notes.md");
+        write(&entry, "workspace note");
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_for(&source);
+        let copied = {
+            let _swap = EntrySwap::install(move |relative| {
+                if relative == Path::new("notes.md") {
+                    std::fs::rename(&host, &entry).unwrap();
+                    let meta = std::fs::symlink_metadata(&entry).unwrap();
+                    assert!(meta.file_type().is_file());
+                    assert_eq!(std::os::unix::fs::MetadataExt::nlink(&meta), 1);
+                }
+            });
+            write_bundle(&mut plan, &out, false).await.unwrap()
+        };
+
+        assert_eq!(copied.workspace.replaced_skipped, 1);
+        assert_eq!(copied.workspace.files, 0);
+        for file in all_files(&out) {
+            let bytes = std::fs::read(&file).unwrap();
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains("host secret bytes"),
+                "{} carries the host file",
+                file.display()
+            );
+        }
+    }
+
+    /// The same shape one level down, inside carried skill content.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_skill_file_renamed_over_an_admitted_entry_is_not_copied() {
+        let root = tempfile::tempdir().unwrap();
+        let host = root.path().join("host-secret.md");
+        write(&host, "host secret bytes");
+
+        let workspace = tempfile::tempdir().unwrap();
+        write(&workspace.path().join("IDENTITY.md"), "identity");
+
+        let skills = root.path().join("skills");
+        write(&skills.join("web_search/SKILL.md"), "# search");
+        write(&skills.join("web_search/notes.md"), "skill note");
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let target = skills.join("web_search/notes.md");
+        let mut plan = plan_with_skills(workspace.path(), &skills, &[]);
+        let copied = {
+            let _swap = EntrySwap::install(move |relative| {
+                if relative == Path::new("web_search/notes.md") {
+                    std::fs::rename(&host, &target).unwrap();
+                }
+            });
+            write_bundle(&mut plan, &out, false).await.unwrap()
+        };
+
+        assert_eq!(copied.skills.tally.replaced_skipped, 1);
+        for file in all_files(&out) {
+            let bytes = std::fs::read(&file).unwrap();
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains("host secret bytes"),
+                "{} carries the host file",
+                file.display()
+            );
+        }
     }
 
     /// No-follow proves a name is not a symlink; it says nothing about whether

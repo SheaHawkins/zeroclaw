@@ -160,9 +160,12 @@ rather than a check: an entry replaced by a link in between fails the export
 rather than redirecting it.
 
 Refusing to follow a name is not the same as proving the bytes belong to this
-tree, so the copy also skips any file carrying more than one name. A hard link
-is a second name for one object, which may live anywhere on the host, and it
-classifies and opens as an ordinary regular file.
+tree, so two further checks run on the handle the copy is about to read. A file
+carrying more than one name is skipped, because a hard link is a second name for
+one object that may live anywhere on the host. And the opened object must be the
+one that was classified, compared by filesystem identity rather than by shape:
+an entry unlinked and replaced by a different host file would otherwise pass
+every test, being a regular file with one link inside the same directory.
 
 Refusing the link matters even when it points *inside* the workspace. The bundle
 has content boundaries of its own, and a link that never escapes the root can

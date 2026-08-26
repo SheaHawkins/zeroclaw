@@ -1068,6 +1068,7 @@ cli-agent-export-dest-inside-skills = destination {$path} is inside skill bundle
 cli-agent-export-restore-failed = failed to publish the bundle to {$path} ({$error}), and the previous bundle could not be moved back — it is at {$retired}
 cli-agent-export-written = exported agent `{$alias}` to {$path} ({$files} workspace file(s), {$kib} KiB)
 cli-agent-export-skills-carried = {"  "}{$files} skill file(s) carried from {$bundles} skill bundle(s)
+cli-agent-export-replaced-skipped = {"  "}{$count} entry/entries were replaced while the export ran and were skipped — the bundle carries the objects it inspected
 cli-agent-export-hard-links-skipped = {"  "}{$count} hard-linked file(s) skipped — a second name for a file that may live anywhere on this host is not this workspace's content to carry
 cli-agent-export-others-skipped = {"  "}{$count} special file(s) skipped — sockets, FIFOs, and devices are host state, not content a bundle can carry
 cli-agent-export-symlinks-skipped = {"  "}{$count} symlink(s) skipped — links are not followed into a bundle
