@@ -500,6 +500,14 @@ fn copy_workspace(plan: &ExportPlan, dest: &Path) -> Result<CopyTally> {
 /// skill the bundle excludes never travels and loose local state (sync
 /// markers and the like) stays behind.
 fn copy_skill_bundles(plan: &ExportPlan, dest_root: &Path, into: &mut BundleCopy) -> Result<()> {
+    if plan.skill_sources.is_empty() {
+        return Ok(());
+    }
+    // Every bundle directory is created and opened *through* this handle, so an
+    // alias that is not a single component cannot place content outside the
+    // staging tree even if it reaches here. The planner rejects such aliases;
+    // this is the boundary that does not depend on it having done so.
+    let skills_root = open_bundle_dir(dest_root)?;
     for source in &plan.skill_sources {
         let bundle = match open_source_root(&source.source)? {
             SourceRoot::Opened(dir) => dir,
@@ -520,14 +528,23 @@ fn copy_skill_bundles(plan: &ExportPlan, dest_root: &Path, into: &mut BundleCopy
                 )
             ),
         };
-        let bundle_dest = dest_root.join(&source.alias);
-        let target = open_bundle_dir(&bundle_dest)?;
+        skills_root.create_dir(&source.alias).with_context(|| {
+            format!(
+                "failed to create {SKILLS_DIR}/{} in the bundle",
+                source.alias
+            )
+        })?;
+        let target = skills_root
+            .open_dir_nofollow(&source.alias)
+            .with_context(|| {
+                format!("failed to open {SKILLS_DIR}/{} in the bundle", source.alias)
+            })?;
         let carried = copy_skills(&bundle, &target, source, &mut into.skills.tally)?;
         if carried == 0 {
             // An empty tree is not content. Leave neither the directory nor
             // the manifest claim behind for it.
             drop(target);
-            std::fs::remove_dir_all(&bundle_dest).ok();
+            skills_root.remove_dir_all(&source.alias).ok();
             into.skills.without_content.push(source.alias.clone());
             continue;
         }
@@ -536,6 +553,7 @@ fn copy_skill_bundles(plan: &ExportPlan, dest_root: &Path, into: &mut BundleCopy
     if into.skills.bundles == 0 {
         // Nothing was carried, so the bundle gets no `skills/` at all rather
         // than an empty directory implying otherwise.
+        drop(skills_root);
         std::fs::remove_dir_all(dest_root).ok();
     }
     Ok(())
@@ -1424,6 +1442,38 @@ mod tests {
                 .any(|f| f.get("kind").and_then(toml::Value::as_str) == Some("carried_skills")),
             "{flags:?}"
         );
+    }
+
+    /// Defence in depth for the planner's alias check: even handed a hostile
+    /// alias, materialization goes through a handle on `skills/`, so nothing
+    /// can be written outside the staging tree.
+    #[tokio::test]
+    async fn a_traversing_skill_alias_writes_nothing_outside_the_staging_tree() {
+        let workspace = tempfile::tempdir().unwrap();
+        write(&workspace.path().join("IDENTITY.md"), "identity");
+        let skills = tempfile::tempdir().unwrap();
+        write(&skills.path().join("web_search/SKILL.md"), "# search");
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_for(workspace.path());
+        plan.skill_sources = vec![SkillBundleSource {
+            alias: "../../outside".to_string(),
+            source: skills.path().to_path_buf(),
+            filter: zeroclaw_config::schema::SkillBundleConfig::default(),
+        }];
+
+        let result = write_bundle(&mut plan, &out, false).await;
+
+        // Whether it errors or carries nothing, the one thing that must hold is
+        // that no file appeared outside the requested destination.
+        assert_eq!(entry_names(parent.path()), Vec::<String>::new());
+        assert!(!parent.path().join("outside").exists());
+        assert!(!parent.path().parent().unwrap().join("outside").exists());
+        if let Ok(copied) = result {
+            assert_eq!(copied.skills.tally.files, 0);
+        }
     }
 
     /// The ordinary shape of "no content": config load scaffolds a directory

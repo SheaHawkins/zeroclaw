@@ -338,6 +338,20 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
                     .to_string(),
             });
         }
+        if !is_safe_path_component(&bundle) {
+            // The alias names a directory inside the bundle. One that is not a
+            // single component would place carried content outside the bundle
+            // being built, so nothing is planned for it.
+            dropped.push(DroppedRef {
+                path: format!("skill_bundles.{bundle}"),
+                reason: DropReason::HostSpecific,
+                detail: "the skill-bundle alias is not usable as a single directory name, so \
+                         its content cannot be placed inside a bundle; rename the bundle to a \
+                         plain name"
+                    .to_string(),
+            });
+            continue;
+        }
         if let Ok(source) = crate::skill_bundles::resolve_directory(config, &install_root, &bundle)
         {
             skill_sources.push(SkillBundleSource {
@@ -665,6 +679,26 @@ fn sanitize_agent(
     }
 
     table
+}
+
+/// Whether `alias` is safe to use as one path component inside a bundle.
+///
+/// A skill-bundle alias is a config map key, and the bundle materializes its
+/// content at `skills/<alias>/`. The skill-bundle validator constrains where a
+/// bundle's *directory* may sit, not what its key may contain, so the key is
+/// checked here before it is ever joined to a path: one component, no
+/// separator in any platform's reading, no parent or current directory, no
+/// device or stream prefix, no controls.
+#[must_use]
+pub fn is_safe_path_component(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias == alias.trim()
+        && alias != "."
+        && alias != ".."
+        && !alias.contains('/')
+        && !alias.contains('\\')
+        && !alias.contains(':')
+        && !alias.chars().any(char::is_control)
 }
 
 /// The workspace-relative form of an `aieos_path` the bundle can carry, or why
@@ -2203,6 +2237,56 @@ mod tests {
                 .map(Vec::len),
             Some(0)
         );
+    }
+
+    /// The alias is a config map key and becomes a directory name inside the
+    /// bundle. The skill-bundle validator constrains where a bundle's directory
+    /// may sit, not what its key may contain.
+    #[test]
+    fn a_skill_bundle_alias_that_is_not_one_component_is_not_planned() {
+        for hostile in [
+            "../../outside",
+            "..",
+            "nested/alias",
+            r"..\outside",
+            "/absolute",
+            "C:evil",
+        ] {
+            let mut config = fixture();
+            config
+                .skill_bundles
+                .insert(hostile.to_string(), SkillBundleConfig::default());
+            if let Some(agent) = config.agents.get_mut("researcher") {
+                agent.skill_bundles = vec![hostile.to_string()];
+            }
+
+            let plan = plan_export(&config, "researcher").unwrap();
+            assert!(
+                plan.skill_sources.is_empty(),
+                "{hostile:?} was planned for materialization"
+            );
+            assert!(
+                !plan
+                    .risk_flags
+                    .iter()
+                    .any(|f| f.kind == RiskKind::CarriedSkills),
+                "{hostile:?} raised a carried-skills grant"
+            );
+            assert!(
+                plan.dropped
+                    .iter()
+                    .any(|d| d.path == format!("skill_bundles.{hostile}")),
+                "{hostile:?} was dropped silently"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_skill_bundle_alias_is_planned() {
+        assert!(is_safe_path_component("research_tools"));
+        assert!(is_safe_path_component("core"));
+        assert!(!is_safe_path_component(""));
+        assert!(!is_safe_path_component(" spaced"));
     }
 
     #[test]
