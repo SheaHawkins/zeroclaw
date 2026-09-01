@@ -1056,8 +1056,10 @@ cli-bundle-not-configured = skill bundle '{$alias}' is not configured
 cli-bundle-rename-failed = rename failed: {$error}
 
 # ── Agent bundle export — zeroclaw agents export ──
-cli-agent-export-workspace-root-outside = the agent workspace {$path} resolves to {$resolved}, outside the install's agents directory; a symlink above it points out of the install
-cli-agent-export-skill-root-outside = skill bundle `{$alias}` at {$path} resolves to {$resolved}, outside the install's shared tree; a symlink above it points out of the install
+cli-agent-export-workspace-root-escape = the agent workspace {$path} is not reachable through real directories under the install's agents tree: {$at} is a symlink or leaves that tree, so the copy cannot prove what it would carry
+cli-agent-export-skill-root-escape = skill bundle `{$alias}` at {$path} is not reachable through real directories under the install's shared tree: {$at} is a symlink or leaves that tree, so the copy cannot prove what it would carry
+cli-agent-export-workspace-path-unresolvable = the configured workspace path {$path} does not end in a plain directory name, so the export cannot bind what it copies to what it checked; set `workspace.path` to the resolved directory and export again
+cli-agent-export-source-root-replaced = {$path} was replaced while the export was opening it; the copy carries the tree it inspected or nothing at all, so run the export again
 cli-agent-export-workspace-root-symlink = the agent workspace {$path} is a symlink; the bundle would carry whatever it points at as the agent's own tree, so set `workspace.path` to the real directory and export again
 cli-agent-export-skill-root-symlink = skill bundle `{$alias}` resolves to the symlink {$path}; a bundle directory must be a real directory inside the install's shared tree
 cli-agent-export-dest-not-a-dir = destination {$path} exists and is not a directory

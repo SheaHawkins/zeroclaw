@@ -187,31 +187,42 @@ pub struct SkillBundleSource {
     /// what lets an import map content back onto the target's own resolved
     /// directory for the same alias.
     pub alias: String,
-    /// Absolute source directory on the exporting host.
+    /// Absolute source directory on the exporting host, for messages and
+    /// overlap checks.
     pub source: PathBuf,
+    /// The same directory as a lexically-normalized path relative to the
+    /// install root. Always under `shared/`: the planner validates the
+    /// skill-bundle directory contract before planning a source. The copy
+    /// opens the directory by walking these components no-follow from the
+    /// install root, so the path the planner validated is the path the copy
+    /// proves.
+    pub relative: PathBuf,
     /// The bundle's own include/exclude filter. Applied to the copy so a skill
     /// this bundle excludes does not travel: [`SkillBundleConfig::admits_skill`]
     /// is the same filter the runtime applies.
     pub filter: SkillBundleConfig,
 }
 
-/// Where each kind of copy source is allowed to resolve to.
+/// How the copy reaches each kind of source, and what that proves.
 ///
-/// A path is opened after its symlinks are resolved, so a symlinked `shared`,
-/// `shared/skills`, or `agents` directory would otherwise hand the copy a tree
-/// outside the install while every component below it looked ordinary.
-///
-/// Both boundaries are the install root rather than the subdirectory each
-/// source sits in. Anchoring at `<install>/shared` or `<install>/agents` would
-/// be vacuous: those are the very components an attacker replaces, and
-/// resolving the boundary would follow the same link the source did.
+/// An anchored source is named relative to the install root and must be
+/// opened by walking those components without following a symlink at any of
+/// them. A canonicalize-then-compare check cannot give that guarantee twice
+/// over: a symlinked `shared/skills` or `agents` that stays *inside* the
+/// install passes the comparison while moving the source out of the subtree
+/// its contract names, and the object the check resolved is not necessarily
+/// the object a later by-path open finds. The install root itself is the
+/// operator's configured location — like the config file it holds — so
+/// symlinks above it are the operator's own and are followed.
 #[derive(Debug, Clone)]
 pub struct SourceBoundaries {
-    /// Skill-bundle content must resolve inside the install.
-    pub skills: PathBuf,
-    /// The agent's workspace must resolve inside the install when it uses the
-    /// default location. `None` when `workspace.path` places it deliberately,
-    /// since then the configured location is the operator's own boundary.
+    /// The trusted install root every anchored source is walked from.
+    pub install_root: PathBuf,
+    /// Install-relative path of the agent's workspace when it uses the
+    /// default location (`agents/<alias>/workspace`). `None` when
+    /// `workspace.path` places it deliberately, since then the configured
+    /// location is the operator's own boundary and [`ExportPlan`]'s
+    /// `workspace_source` is opened as configured.
     pub workspace: Option<PathBuf>,
 }
 
@@ -378,14 +389,59 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
             });
             continue;
         }
-        if let Ok(source) = crate::skill_bundles::resolve_directory(config, &install_root, &bundle)
-        {
-            skill_sources.push(SkillBundleSource {
-                alias: bundle.clone(),
-                source,
-                filter: configured.clone(),
+        let Ok(source) = crate::skill_bundles::resolve_directory(config, &install_root, &bundle)
+        else {
+            continue;
+        };
+        // The planner enforces the skill-bundle directory contract itself
+        // rather than assuming its `Config` was validated: content is only
+        // planned from where `Config::validate` allows a bundle directory to
+        // sit. A directory outside `<install>/shared/` is not a tree the copy
+        // can walk from the install root, so nothing is planned for it and
+        // the operator hears that the content stayed behind.
+        //
+        // A `..` component is refused even when it lexically stays inside
+        // `shared/`: the runtime resolves the configured path through the
+        // filesystem, where a symlink before the `..` lands somewhere the
+        // lexical form does not name — the export must not carry a tree the
+        // agent does not actually load from.
+        let escapes = crate::skill_bundles::validate_directory(&source, &install_root).is_err()
+            || configured.directory.as_deref().is_some_and(|dir| {
+                std::path::Path::new(dir)
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
             });
+        if escapes {
+            if let Some(table) = table_at_mut(&mut out, &["skill_bundles", &bundle]) {
+                table.remove("directory");
+            }
+            dropped.push(DroppedRef {
+                path: format!("{SKILLS_DIR}/{bundle}"),
+                reason: DropReason::HostSpecific,
+                detail: "the bundle's directory is not a plain path inside the install's \
+                         shared tree, so its content is not the install's to export and is \
+                         not carried; its config travels without the directory, and the \
+                         skills must be installed at the target's default location for this \
+                         alias"
+                    .to_string(),
+            });
+            continue;
         }
+        let normalized = crate::paths::normalize_lexical(&source);
+        let Ok(relative) = normalized.strip_prefix(crate::paths::normalize_lexical(&install_root))
+        else {
+            // Validation above proved the directory sits under
+            // `<install>/shared/`, which is under the install root, so the
+            // prefix strips. Kept as a refusal rather than an unwrap so a
+            // future validator change fails closed here.
+            continue;
+        };
+        skill_sources.push(SkillBundleSource {
+            alias: bundle.clone(),
+            relative: relative.to_path_buf(),
+            source: normalized,
+            filter: configured.clone(),
+        });
     }
     let knowledge_default = to_table(&KnowledgeBundleConfig::default())?;
     for bundle in dedup(&agent.knowledge_bundles) {
@@ -543,11 +599,21 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
         workspace_source: config.agent_workspace_dir(alias),
         skill_sources,
         source_boundaries: SourceBoundaries {
-            skills: install_root.clone(),
             // A configured `workspace.path` is the operator saying where the
             // workspace lives; only the default location is anchored to the
-            // install.
-            workspace: agent.workspace.path.is_none().then(|| install_root.clone()),
+            // install. The relative form is derived from the same resolver
+            // the runtime uses, so the subtree the copy walks is the subtree
+            // the agent actually runs in.
+            workspace: agent.workspace.path.is_none().then(|| {
+                // The strip cannot fail for a path the resolver built from
+                // the install root; an empty fallback fails the copy's
+                // `agents/` subtree check rather than opening anything.
+                crate::paths::normalize_lexical(&config.agent_workspace_dir(alias))
+                    .strip_prefix(crate::paths::normalize_lexical(&install_root))
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_default()
+            }),
+            install_root,
         },
         identity_document,
     })
@@ -2186,9 +2252,17 @@ mod tests {
         assert_eq!(source.alias, "research_tools");
         assert_eq!(
             source.source,
-            config
-                .install_root_dir()
-                .join("shared/skills/research_tools")
+            crate::paths::normalize_lexical(
+                &config
+                    .install_root_dir()
+                    .join("shared/skills/research_tools")
+            )
+        );
+        // The copy walks this from the install root, component by component,
+        // so it must be the shared-tree path and nothing looser.
+        assert_eq!(
+            source.relative,
+            std::path::Path::new("shared/skills/research_tools")
         );
         assert!(source.filter.admits_skill("web_search"));
         assert!(!source.filter.admits_skill("internal_only"));
@@ -2322,8 +2396,11 @@ mod tests {
         assert!(!is_safe_path_component(" spaced"));
     }
 
+    /// An absolute directory names this host twice over: the path cannot
+    /// travel, and unless it sits inside this install's own shared tree the
+    /// content is not the install's to export either.
     #[test]
-    fn an_absolute_skill_bundle_directory_is_dropped_and_reported() {
+    fn an_absolute_skill_bundle_directory_outside_shared_is_dropped_with_its_content() {
         let mut config = fixture();
         config.skill_bundles.insert(
             "research_tools".to_string(),
@@ -2349,11 +2426,22 @@ mod tests {
             plan.dropped
         );
 
-        // The source directory still resolves on this host, so the content
-        // travels even though the path itself cannot.
-        assert_eq!(
-            plan.skill_sources[0].source,
-            std::path::PathBuf::from("/srv/zeroclaw/shared/skills/pool")
+        // The directory sits outside this install's shared tree, so no copy
+        // source is planned for it and the operator hears the content stayed.
+        assert!(plan.skill_sources.is_empty(), "{:?}", plan.skill_sources);
+        assert!(
+            plan.dropped
+                .iter()
+                .any(|d| d.path == "skills/research_tools" && d.reason == DropReason::HostSpecific),
+            "{:?}",
+            plan.dropped
+        );
+        assert!(
+            !plan
+                .risk_flags
+                .iter()
+                .any(|f| f.kind == RiskKind::CarriedSkills),
+            "a grant for content that is not in the bundle"
         );
 
         // And the target validates the bundle against its own install root.
@@ -2362,6 +2450,101 @@ mod tests {
         imported
             .validate()
             .expect("a bundle directory the target owns validates");
+    }
+
+    /// A relative directory that lexically escapes `<install>/shared/` is the
+    /// in-install redirect shape: it stays a valid-looking config entry while
+    /// naming a tree the skill-bundle contract does not cover. A `..` that
+    /// lexically stays inside `shared/` is refused with it: the runtime
+    /// resolves the configured path through the filesystem, where a symlink
+    /// before the `..` lands somewhere the lexical form does not name.
+    #[test]
+    fn a_skill_bundle_directory_escaping_shared_is_dropped_with_its_content() {
+        for escaping in [
+            "shared/../private-skills",
+            "agents/researcher/workspace",
+            "shared/missing/../pool",
+            "shared/skills/staging/../pool",
+        ] {
+            let mut config = fixture();
+            config.skill_bundles.insert(
+                "research_tools".to_string(),
+                SkillBundleConfig {
+                    directory: Some(escaping.to_string()),
+                    ..Default::default()
+                },
+            );
+            if let Some(agent) = config.agents.get_mut("researcher") {
+                agent.skill_bundles = vec!["research_tools".to_string()];
+            }
+
+            let plan = plan_export(&config, "researcher").unwrap();
+            assert!(
+                plan.skill_sources.is_empty(),
+                "{escaping}: {:?}",
+                plan.skill_sources
+            );
+            let bundle = lookup(&plan.config, &["skill_bundles", "research_tools"])
+                .and_then(toml::Value::as_table)
+                .expect("bundle carried");
+            assert!(!bundle.contains_key("directory"), "{escaping}: {bundle:?}");
+            assert!(
+                plan.dropped
+                    .iter()
+                    .any(|d| d.path == "skills/research_tools"),
+                "{escaping} was dropped silently: {:?}",
+                plan.dropped
+            );
+            assert!(
+                !plan
+                    .risk_flags
+                    .iter()
+                    .any(|f| f.kind == RiskKind::CarriedSkills),
+                "{escaping} raised a carried-skills grant"
+            );
+
+            // The carried config must validate on the target without the
+            // escaping path.
+            let text = render_config_toml(&plan).unwrap();
+            let imported: Config = toml::from_str(&text).unwrap();
+            imported
+                .validate()
+                .expect("a bundle without the escaping directory validates");
+        }
+    }
+
+    /// A relative directory deeper inside the shared tree is the operator
+    /// arranging their install, not an escape: the content travels, and the
+    /// copy walks the configured components.
+    #[test]
+    fn a_relative_skill_bundle_directory_inside_shared_is_planned() {
+        let mut config = fixture();
+        config.skill_bundles.insert(
+            "research_tools".to_string(),
+            SkillBundleConfig {
+                directory: Some("shared/skills/pool/research".to_string()),
+                ..Default::default()
+            },
+        );
+        if let Some(agent) = config.agents.get_mut("researcher") {
+            agent.skill_bundles = vec!["research_tools".to_string()];
+        }
+
+        let plan = plan_export(&config, "researcher").unwrap();
+        assert_eq!(plan.skill_sources.len(), 1);
+        assert_eq!(
+            plan.skill_sources[0].relative,
+            std::path::Path::new("shared/skills/pool/research")
+        );
+        // The relative directory is portable, so it is carried as configured.
+        assert_eq!(
+            lookup(
+                &plan.config,
+                &["skill_bundles", "research_tools", "directory"]
+            )
+            .and_then(toml::Value::as_str),
+            Some("shared/skills/pool/research")
+        );
     }
 
     #[test]

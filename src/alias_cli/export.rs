@@ -41,6 +41,13 @@ const STAGING_PREFIX: &str = ".zeroclaw-export-";
 /// Prefix for the previous bundle while the new one is being moved into place.
 const RETIRED_PREFIX: &str = ".zeroclaw-export-old-";
 
+/// Install subtree that owns skill-bundle content. Matches the directory
+/// contract `zeroclaw_config::skill_bundles::validate_directory` enforces.
+const SKILLS_FAMILY: &str = "shared";
+
+/// Install subtree that owns default-location agent workspaces.
+const WORKSPACE_FAMILY: &str = "agents";
+
 /// Files carried by one copy pass.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct CopyTally {
@@ -414,26 +421,182 @@ enum SourceRoot {
     Nothing,
     /// The final component is a symlink. Refused rather than followed.
     Symlinked,
-    /// The path resolves outside the boundary it must stay within, because a
-    /// symlink somewhere above it points out of the install.
-    Outside(PathBuf),
+    /// A component between the trusted install root and the source is a
+    /// symlink, or the declared path leaves the subtree its family owns.
+    /// Refused: the source cannot be reached through real directories inside
+    /// the tree its contract names.
+    Escaped { at: PathBuf },
 }
 
-/// Open a copy source's root, refusing a symlink at its final component.
+/// Open an anchored source root by walking `relative` from the install root,
+/// opening every component without following a link at any of them.
 ///
-/// `Dir::open_ambient_dir` resolves the whole path, final component included,
-/// so a symlinked root would put the entire walk outside the tree the bundle
-/// claims to carry before the no-follow descent below it ever runs. The
-/// ancestors are the operator's configured path and are followed as such; the
-/// last component is opened through a handle on its parent, where a link is an
-/// error instead of a redirect.
+/// The walk is the boundary check. A canonicalize-then-compare answer proves
+/// nothing about the object a later by-path open finds, and comparing against
+/// the install root alone admits the in-install redirect: a symlinked
+/// `shared/skills` or `agents` that points elsewhere *inside* the install
+/// passes the comparison while moving the source out of the subtree its
+/// family's contract names. Opening `shared`, then `skills`, then the bundle
+/// directory — each through the previous handle, each refusing a link — is a
+/// proof about the handle the copy then reads.
 ///
-/// The `symlink_metadata` call only picks which answer to give. The open is
-/// what enforces it, so a swap between the two cannot turn a refusal into a
-/// traversal.
-fn open_source_root(path: &Path, boundary: Option<&Path>) -> Result<SourceRoot> {
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return Ok(SourceRoot::Nothing);
+/// The install root itself is the operator's configured location, so symlinks
+/// above it (a relocated home directory, `/tmp` on macOS) are the operator's
+/// own and are followed, exactly like the config file that names the install.
+///
+/// Each component's `symlink_metadata` only picks which answer to give. The
+/// no-follow open is what enforces it, and the opened handle must then be the
+/// object that was classified, compared by filesystem identity: a component
+/// replaced between the two steps — by a link or by another directory — fails
+/// the export instead of redirecting it.
+///
+/// Mount manipulation is outside this defense. A bind mount planted inside
+/// the subtree reads as an ordinary directory here; creating one takes mount
+/// privileges, which are beyond what an export boundary can defend against.
+fn open_anchored_root(install_root: &Path, relative: &Path, family: &str) -> Result<SourceRoot> {
+    if !relative.starts_with(family) {
+        // The planner binds each family to its subtree (`shared/` for skill
+        // bundles, `agents/` for default workspaces); a path outside it never
+        // reaches an open. This is the boundary that does not depend on the
+        // planner having done so.
+        return Ok(SourceRoot::Escaped {
+            at: install_root.join(relative),
+        });
+    }
+    let root = install_root
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", install_root.display()))?;
+    let mut dir = Dir::open_ambient_dir(&root, ambient_authority())
+        .with_context(|| format!("failed to open {}", root.display()))?;
+    let mut walked = install_root.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            // `..`, `.`, or a new root would re-anchor the walk; the planner
+            // normalizes these away, and one that appears anyway is refused.
+            return Ok(SourceRoot::Escaped {
+                at: install_root.join(relative),
+            });
+        };
+        walked.push(name);
+        let metadata = match dir.symlink_metadata(name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Only an absent component means there is no source. Any
+                // other failure aborts: publishing a bundle that silently
+                // lacks content the operator could not read is a success the
+                // manifest cannot stand behind.
+                return Ok(SourceRoot::Nothing);
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", walked.display()));
+            }
+        };
+        let last = components.peek().is_none();
+        if metadata.file_type().is_symlink() {
+            return Ok(if last {
+                SourceRoot::Symlinked
+            } else {
+                SourceRoot::Escaped { at: walked }
+            });
+        }
+        if !metadata.is_dir() {
+            return Ok(SourceRoot::Nothing);
+        }
+        source_root_swap_seam(&walked);
+        let opened = dir
+            .open_dir_nofollow(name)
+            .with_context(|| format!("failed to open {}", walked.display()))?;
+        let opened_metadata = opened
+            .dir_metadata()
+            .with_context(|| format!("failed to inspect {}", walked.display()))?;
+        if !is_same_object(&metadata, &opened_metadata) {
+            bail!(
+                "{}",
+                mta(
+                    "cli-agent-export-source-root-replaced",
+                    &[("path", walked.display().to_string().as_str())],
+                    "{$path} was replaced while the export was opening it; the copy carries \
+                     the tree it inspected or nothing at all, so run the export again"
+                )
+            );
+        }
+        dir = opened;
+    }
+    Ok(SourceRoot::Opened(dir))
+}
+
+/// Open an operator-configured source root, refusing a symlink at its final
+/// component.
+///
+/// A configured `workspace.path` is the operator's own boundary, so its
+/// ancestors are followed as configured — the same trust the config file's
+/// own location gets. The last component never is: it is classified and
+/// opened through a handle on its canonicalized parent, where a link is an
+/// error instead of a redirect. Canonicalizing the *full* path here would
+/// undo the classification — a root swapped for a link between the two steps
+/// would be resolved silently, and the no-follow open would then vouch for
+/// the link's target as if it were the configured tree.
+fn open_configured_root(path: &Path) -> Result<SourceRoot> {
+    // Judged on the configured path as written, before any resolution: on
+    // Windows `std::path::absolute` collapses a trailing `..` lexically, so
+    // checking afterwards would let such a path export whatever the collapse
+    // lands on. A filesystem root, or a path ending in `..`, has no final
+    // component to classify and open. Refused rather than treated as absent:
+    // the runtime may resolve such a path to a real workspace, and an export
+    // that silently publishes an empty one instead is a success the manifest
+    // cannot stand behind.
+    if !matches!(
+        path.components().next_back(),
+        Some(std::path::Component::Normal(_))
+    ) {
+        bail!(
+            "{}",
+            mta(
+                "cli-agent-export-workspace-path-unresolvable",
+                &[("path", path.display().to_string().as_str())],
+                "the configured workspace path {$path} does not end in a plain directory \
+                 name, so the export cannot bind what it copies to what it checked; set \
+                 `workspace.path` to the resolved directory and export again"
+            )
+        );
+    }
+    let absolute = std::path::absolute(path)
+        .with_context(|| format!("failed to resolve {}", path.display()))?;
+    let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) else {
+        // Unreachable after the check above; kept as the same refusal so a
+        // platform surprise fails closed rather than publishing.
+        bail!(
+            "{}",
+            mta(
+                "cli-agent-export-workspace-path-unresolvable",
+                &[("path", path.display().to_string().as_str())],
+                "the configured workspace path {$path} does not end in a plain directory \
+                 name, so the export cannot bind what it copies to what it checked; set \
+                 `workspace.path` to the resolved directory and export again"
+            )
+        );
+    };
+    let parent = match parent.canonicalize() {
+        Ok(parent) => parent,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SourceRoot::Nothing);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to resolve {}", parent.display()));
+        }
+    };
+    let parent = Dir::open_ambient_dir(&parent, ambient_authority())
+        .with_context(|| format!("failed to open {}", parent.display()))?;
+    let metadata = match parent.symlink_metadata(name) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SourceRoot::Nothing);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
     };
     if metadata.file_type().is_symlink() {
         return Ok(SourceRoot::Symlinked);
@@ -441,34 +604,24 @@ fn open_source_root(path: &Path, boundary: Option<&Path>) -> Result<SourceRoot> 
     if !metadata.is_dir() {
         return Ok(SourceRoot::Nothing);
     }
-
-    // Refusing a symlink at the final component says nothing about the
-    // components above it, and opening the parent by path follows every one of
-    // them. So the path is resolved in full and checked against the tree it is
-    // supposed to live in: a symlinked `shared`, `shared/skills`, or `agents`
-    // hands the copy an outside tree while every visible component looks
-    // ordinary. Both sides are resolved, so a symlink *above* the install (a
-    // relocated home directory, `/tmp` on macOS) still compares equal.
-    let resolved = path
-        .canonicalize()
-        .with_context(|| format!("failed to resolve {}", path.display()))?;
-    if let Some(boundary) = boundary {
-        let boundary = boundary
-            .canonicalize()
-            .with_context(|| format!("failed to resolve {}", boundary.display()))?;
-        if !resolved.starts_with(&boundary) {
-            return Ok(SourceRoot::Outside(resolved));
-        }
-    }
-
-    let (Some(parent), Some(name)) = (resolved.parent(), resolved.file_name()) else {
-        return Ok(SourceRoot::Nothing);
-    };
-    let parent = Dir::open_ambient_dir(parent, ambient_authority())
-        .with_context(|| format!("failed to open {}", parent.display()))?;
+    source_root_swap_seam(&absolute);
     let opened = parent
         .open_dir_nofollow(name)
-        .with_context(|| format!("failed to open {}", resolved.display()))?;
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    let opened_metadata = opened
+        .dir_metadata()
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if !is_same_object(&metadata, &opened_metadata) {
+        bail!(
+            "{}",
+            mta(
+                "cli-agent-export-source-root-replaced",
+                &[("path", path.display().to_string().as_str())],
+                "{$path} was replaced while the export was opening it; the copy carries \
+                 the tree it inspected or nothing at all, so run the export again"
+            )
+        );
+    }
     Ok(SourceRoot::Opened(opened))
 }
 
@@ -491,22 +644,28 @@ fn open_source_root(path: &Path, boundary: Option<&Path>) -> Result<SourceRoot> 
 /// between the two steps fails the export instead of silently redirecting it.
 fn copy_workspace(plan: &ExportPlan, dest: &Path) -> Result<CopyTally> {
     let mut copied = CopyTally::default();
-    let source = match open_source_root(
-        &plan.workspace_source,
-        plan.source_boundaries.workspace.as_deref(),
-    )? {
+    let opened = match plan.source_boundaries.workspace.as_deref() {
+        Some(relative) => open_anchored_root(
+            &plan.source_boundaries.install_root,
+            relative,
+            WORKSPACE_FAMILY,
+        )?,
+        None => open_configured_root(&plan.workspace_source)?,
+    };
+    let source = match opened {
         SourceRoot::Opened(dir) => dir,
         SourceRoot::Nothing => return Ok(copied),
-        SourceRoot::Outside(resolved) => bail!(
+        SourceRoot::Escaped { at } => bail!(
             "{}",
             mta(
-                "cli-agent-export-workspace-root-outside",
+                "cli-agent-export-workspace-root-escape",
                 &[
                     ("path", plan.workspace_source.display().to_string().as_str()),
-                    ("resolved", resolved.display().to_string().as_str())
+                    ("at", at.display().to_string().as_str())
                 ],
-                "the agent workspace {$path} resolves to {$resolved}, outside the install's \
-                 agents directory; a symlink above it points out of the install"
+                "the agent workspace {$path} is not reachable through real directories under \
+                 the install's agents tree: {$at} is a symlink or leaves that tree, so the \
+                 copy cannot prove what it would carry"
             )
         ),
         SourceRoot::Symlinked => bail!(
@@ -547,23 +706,28 @@ fn copy_skill_bundles(plan: &ExportPlan, dest_root: &Path, into: &mut BundleCopy
     // this is the boundary that does not depend on it having done so.
     let skills_root = open_bundle_dir(dest_root)?;
     for source in &plan.skill_sources {
-        let bundle = match open_source_root(&source.source, Some(&plan.source_boundaries.skills))? {
+        let bundle = match open_anchored_root(
+            &plan.source_boundaries.install_root,
+            &source.relative,
+            SKILLS_FAMILY,
+        )? {
             SourceRoot::Opened(dir) => dir,
             SourceRoot::Nothing => {
                 into.skills.without_content.push(source.alias.clone());
                 continue;
             }
-            SourceRoot::Outside(resolved) => bail!(
+            SourceRoot::Escaped { at } => bail!(
                 "{}",
                 mta(
-                    "cli-agent-export-skill-root-outside",
+                    "cli-agent-export-skill-root-escape",
                     &[
                         ("alias", source.alias.as_str()),
                         ("path", source.source.display().to_string().as_str()),
-                        ("resolved", resolved.display().to_string().as_str())
+                        ("at", at.display().to_string().as_str())
                     ],
-                    "skill bundle `{$alias}` at {$path} resolves to {$resolved}, outside the \
-                     install's shared tree; a symlink above it points out of the install"
+                    "skill bundle `{$alias}` at {$path} is not reachable through real \
+                     directories under the install's shared tree: {$at} is a symlink or \
+                     leaves that tree, so the copy cannot prove what it would carry"
                 )
             ),
             SourceRoot::Symlinked => bail!(
@@ -842,6 +1006,19 @@ fn entry_swap_seam(relative: &Path) {
     tests::run_entry_swap_seam(relative);
 }
 
+/// Test seam: runs between a walked component's no-follow classification and
+/// the handle-bound open of that component — the interleaving at which an
+/// ancestor replacement could try to turn an admitted directory into a
+/// redirect. Compiled away outside tests.
+#[cfg(not(test))]
+#[inline]
+fn source_root_swap_seam(_walked: &Path) {}
+
+#[cfg(test)]
+fn source_root_swap_seam(walked: &Path) {
+    tests::run_source_root_swap_seam(walked);
+}
+
 fn report(plan: &ExportPlan, out: &Path, copied: &BundleCopy) {
     let files = copied.workspace.files.to_string();
     let kib = (copied.workspace.bytes / 1024).to_string();
@@ -1081,10 +1258,11 @@ mod tests {
             risk_flags: Vec::new(),
             workspace_source: workspace.to_path_buf(),
             skill_sources: Vec::new(),
-            // Tests point sources at temporary directories, which is the
-            // "operator chose this location" shape: no install to anchor to.
+            // Tests point the workspace at a temporary directory, which is
+            // the "operator chose this location" shape: no install to anchor
+            // to. Skill fixtures re-anchor via `bound_skills_to`.
             source_boundaries: zeroclaw_config::agent_bundle::SourceBoundaries {
-                skills: workspace.to_path_buf(),
+                install_root: workspace.to_path_buf(),
                 workspace: None,
             },
             identity_document: None,
@@ -1137,6 +1315,39 @@ mod tests {
                 swap(relative);
             }
         });
+    }
+
+    thread_local! {
+        /// Swap to perform at [`source_root_swap_seam`], keyed on the walked
+        /// absolute path. Thread-local like [`ENTRY_SWAP`].
+        static SOURCE_ROOT_SWAP: std::cell::RefCell<Option<Swap>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn run_source_root_swap_seam(walked: &Path) {
+        SOURCE_ROOT_SWAP.with_borrow(|swap| {
+            if let Some(swap) = swap.as_ref() {
+                swap(walked);
+            }
+        });
+    }
+
+    /// Installs a swap at the source-root walk's check-to-open seam for as
+    /// long as it is held, so an ancestor replacement race can be reproduced
+    /// at an exact interleaving.
+    struct SourceRootSwap;
+
+    impl SourceRootSwap {
+        fn install(swap: impl Fn(&Path) + 'static) -> Self {
+            SOURCE_ROOT_SWAP.with_borrow_mut(|slot| *slot = Some(Box::new(swap)));
+            Self
+        }
+    }
+
+    impl Drop for SourceRootSwap {
+        fn drop(&mut self) {
+            SOURCE_ROOT_SWAP.with_borrow_mut(|slot| *slot = None);
+        }
     }
 
     /// Installs a swap at the copy's check-to-read seam for as long as it is
@@ -1305,18 +1516,29 @@ mod tests {
         assert_eq!(copied, CopyTally::default());
     }
 
+    /// An install-shaped skills fixture: the returned bundle directory is
+    /// `<install>/shared/skills/<alias>`, the only shape the anchored walk
+    /// opens. The `TempDir` is the install root; keep it alive.
+    fn install_with_skills(alias: &str) -> (tempfile::TempDir, PathBuf) {
+        let install = tempfile::tempdir().unwrap();
+        let dir = install.path().join("shared").join("skills").join(alias);
+        std::fs::create_dir_all(&dir).unwrap();
+        (install, dir)
+    }
+
+    /// Anchor the plan at the install root three components above `dir`,
+    /// which must be `<install>/shared/skills/<alias>`.
+    fn bound_skills_to(plan: &mut ExportPlan, dir: &Path) {
+        let install = dir
+            .ancestors()
+            .nth(3)
+            .map_or_else(|| dir.to_path_buf(), Path::to_path_buf);
+        plan.source_boundaries.install_root = install;
+    }
+
     /// A plan carrying one skill bundle the way `plan_export` builds one: the
     /// source to copy, plus the `carried_skills` grant that advertises it in
     /// the manifest. The advertisement is what has to track reality.
-    /// Point the shared-tree boundary at the parent of a fixture's skill
-    /// directory, which is the shape a real install has: `<install>/shared`
-    /// containing `<install>/shared/skills/<alias>`.
-    fn bound_skills_to(plan: &mut ExportPlan, dir: &Path) {
-        plan.source_boundaries.skills = dir
-            .parent()
-            .map_or_else(|| dir.to_path_buf(), Path::to_path_buf);
-    }
-
     fn plan_with_skills(workspace: &Path, dir: &Path, exclude: &[&str]) -> ExportPlan {
         let mut plan = plan_for(workspace);
         bound_skills_to(&mut plan, dir);
@@ -1331,9 +1553,11 @@ mod tests {
     }
 
     fn skill_source(alias: &str, dir: &Path, exclude: &[&str]) -> SkillBundleSource {
+        let name = dir.file_name().expect("bundle directory has a name");
         SkillBundleSource {
             alias: alias.to_string(),
             source: dir.to_path_buf(),
+            relative: PathBuf::from("shared").join("skills").join(name),
             filter: zeroclaw_config::schema::SkillBundleConfig {
                 directory: None,
                 include: Vec::new(),
@@ -1348,22 +1572,18 @@ mod tests {
         write(&workspace.path().join("IDENTITY.md"), "identity");
 
         // Skills live outside the workspace, under the install-wide tree.
-        let skills = tempfile::tempdir().unwrap();
-        write(&skills.path().join("web_search/SKILL.md"), "# search");
-        write(&skills.path().join("web_search/run.sh"), "#!/bin/sh\n");
-        write(&skills.path().join("internal_only/SKILL.md"), "# internal");
-        write(&skills.path().join(".sync-marker"), "local state");
+        let (_install, skills) = install_with_skills("research_tools");
+        write(&skills.join("web_search/SKILL.md"), "# search");
+        write(&skills.join("web_search/run.sh"), "#!/bin/sh\n");
+        write(&skills.join("internal_only/SKILL.md"), "# internal");
+        write(&skills.join(".sync-marker"), "local state");
 
         let parent = tempfile::tempdir().unwrap();
         let out = parent.path().join("bundle");
 
         let mut plan = plan_for(workspace.path());
-        bound_skills_to(&mut plan, skills.path());
-        plan.skill_sources = vec![skill_source(
-            "research_tools",
-            skills.path(),
-            &["internal_only"],
-        )];
+        bound_skills_to(&mut plan, &skills);
+        plan.skill_sources = vec![skill_source("research_tools", &skills, &["internal_only"])];
 
         let copied = write_bundle(&mut plan, &out, false).await.unwrap();
 
@@ -1385,25 +1605,23 @@ mod tests {
     async fn a_destination_overlapping_a_skill_bundle_is_refused() {
         let workspace = tempfile::tempdir().unwrap();
         write(&workspace.path().join("IDENTITY.md"), "identity");
-        let skills = tempfile::tempdir().unwrap();
-        write(&skills.path().join("web_search/SKILL.md"), "# search");
+        let (_install, skills) = install_with_skills("research_tools");
+        write(&skills.join("web_search/SKILL.md"), "# search");
 
         let mut plan = plan_for(workspace.path());
-        bound_skills_to(&mut plan, skills.path());
-        plan.skill_sources = vec![skill_source("research_tools", skills.path(), &[])];
+        bound_skills_to(&mut plan, &skills);
+        plan.skill_sources = vec![skill_source("research_tools", &skills, &[])];
 
         // Inside the bundle's directory: the copy would consume its own output.
-        let err = write_bundle(&mut plan, &skills.path().join("exports/bundle"), true)
+        let err = write_bundle(&mut plan, &skills.join("exports/bundle"), true)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("inside skill bundle"), "{err}");
 
         // Containing it: publishing would replace the skills being read.
-        let err = write_bundle(&mut plan, skills.path(), true)
-            .await
-            .unwrap_err();
+        let err = write_bundle(&mut plan, &skills, true).await.unwrap_err();
         assert!(err.to_string().contains("contains skill bundle"), "{err}");
-        assert!(skills.path().join("web_search/SKILL.md").is_file());
+        assert!(skills.join("web_search/SKILL.md").is_file());
     }
 
     #[tokio::test]
@@ -1414,9 +1632,11 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let out = parent.path().join("bundle");
 
+        // The install exists; the bundle's directory under it does not.
+        let install = tempfile::tempdir().unwrap();
         let mut plan = plan_with_skills(
             workspace.path(),
-            Path::new("/nonexistent/shared/skills/research_tools"),
+            &install.path().join("shared/skills/research_tools"),
             &[],
         );
 
@@ -1472,18 +1692,18 @@ mod tests {
         write(&workspace.path().join("IDENTITY.md"), "identity");
 
         // Admitted by the bundle's filter, but holding nothing that travels.
-        let skills = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(skills.path().join("web_search")).unwrap();
+        let (_install, skills) = install_with_skills("research_tools");
+        std::fs::create_dir_all(skills.join("web_search")).unwrap();
         std::os::unix::fs::symlink(
             outside.path().join("host.md"),
-            skills.path().join("web_search/SKILL.md"),
+            skills.join("web_search/SKILL.md"),
         )
         .unwrap();
 
         let parent = tempfile::tempdir().unwrap();
         let out = parent.path().join("bundle");
 
-        let mut plan = plan_with_skills(workspace.path(), skills.path(), &[]);
+        let mut plan = plan_with_skills(workspace.path(), &skills, &[]);
         let copied = write_bundle(&mut plan, &out, false).await.unwrap();
 
         assert_eq!(copied.skills.tally.files, 0);
@@ -1520,17 +1740,18 @@ mod tests {
     async fn a_traversing_skill_alias_writes_nothing_outside_the_staging_tree() {
         let workspace = tempfile::tempdir().unwrap();
         write(&workspace.path().join("IDENTITY.md"), "identity");
-        let skills = tempfile::tempdir().unwrap();
-        write(&skills.path().join("web_search/SKILL.md"), "# search");
+        let (_install, skills) = install_with_skills("research_tools");
+        write(&skills.join("web_search/SKILL.md"), "# search");
 
         let parent = tempfile::tempdir().unwrap();
         let out = parent.path().join("bundle");
 
         let mut plan = plan_for(workspace.path());
-        bound_skills_to(&mut plan, skills.path());
+        bound_skills_to(&mut plan, &skills);
         plan.skill_sources = vec![SkillBundleSource {
             alias: "../../outside".to_string(),
-            source: skills.path().to_path_buf(),
+            relative: skill_source("x", &skills, &[]).relative,
+            source: skills.clone(),
             filter: zeroclaw_config::schema::SkillBundleConfig::default(),
         }];
 
@@ -1556,13 +1777,13 @@ mod tests {
         write(&workspace.path().join("IDENTITY.md"), "identity");
         // Scaffolded, never populated. Plus one the bundle excludes, so the
         // "everything here is filtered out" case lands in the same place.
-        let skills = tempfile::tempdir().unwrap();
-        write(&skills.path().join("internal_only/SKILL.md"), "# internal");
+        let (_install, skills) = install_with_skills("research_tools");
+        write(&skills.join("internal_only/SKILL.md"), "# internal");
 
         let parent = tempfile::tempdir().unwrap();
         let out = parent.path().join("bundle");
 
-        let mut plan = plan_with_skills(workspace.path(), skills.path(), &["internal_only"]);
+        let mut plan = plan_with_skills(workspace.path(), &skills, &["internal_only"]);
         let copied = write_bundle(&mut plan, &out, false).await.unwrap();
 
         assert_eq!(copied.skills.bundles, 0);
@@ -1595,13 +1816,13 @@ mod tests {
     async fn a_carried_skill_bundle_is_advertised_and_present() {
         let workspace = tempfile::tempdir().unwrap();
         write(&workspace.path().join("IDENTITY.md"), "identity");
-        let skills = tempfile::tempdir().unwrap();
-        write(&skills.path().join("web_search/SKILL.md"), "# search");
+        let (_install, skills) = install_with_skills("research_tools");
+        write(&skills.join("web_search/SKILL.md"), "# search");
 
         let parent = tempfile::tempdir().unwrap();
         let out = parent.path().join("bundle");
 
-        let mut plan = plan_with_skills(workspace.path(), skills.path(), &[]);
+        let mut plan = plan_with_skills(workspace.path(), &skills, &[]);
 
         write_bundle(&mut plan, &out, false).await.unwrap();
 
@@ -1638,20 +1859,16 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         write(&workspace.path().join("IDENTITY.md"), "identity");
 
-        let skills = tempfile::tempdir().unwrap();
-        write(&skills.path().join("web_search/SKILL.md"), "# search");
-        std::os::unix::fs::symlink(
-            outside.path().join("secret"),
-            skills.path().join("borrowed"),
-        )
-        .unwrap();
+        let (_install, skills) = install_with_skills("research_tools");
+        write(&skills.join("web_search/SKILL.md"), "# search");
+        std::os::unix::fs::symlink(outside.path().join("secret"), skills.join("borrowed")).unwrap();
 
         let parent = tempfile::tempdir().unwrap();
         let out = parent.path().join("bundle");
 
         let mut plan = plan_for(workspace.path());
-        bound_skills_to(&mut plan, skills.path());
-        plan.skill_sources = vec![skill_source("research_tools", skills.path(), &[])];
+        bound_skills_to(&mut plan, &skills);
+        plan.skill_sources = vec![skill_source("research_tools", &skills, &[])];
 
         let copied = write_bundle(&mut plan, &out, false).await.unwrap();
 
@@ -1771,7 +1988,8 @@ mod tests {
 
     /// Refusing a symlink at the final component leaves every component above
     /// it followed. A symlinked `shared` or `shared/skills` hands the copy an
-    /// outside tree while the bundle directory itself looks ordinary.
+    /// outside tree while the bundle directory itself looks ordinary — the
+    /// walk refuses the link at the component where it sits.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_skill_root_reached_through_a_symlinked_ancestor_is_refused() {
@@ -1803,12 +2021,58 @@ mod tests {
         let out = parent.path().join("bundle");
 
         let mut plan = plan_for(workspace.path());
-        plan.source_boundaries.skills = install.path().to_path_buf();
+        plan.source_boundaries.install_root = install.path().to_path_buf();
         plan.skill_sources = vec![skill_source("research_tools", &bundle_root, &[])];
 
         let err = write_bundle(&mut plan, &out, false).await.unwrap_err();
 
-        assert!(err.to_string().contains("outside"), "{err}");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(!out.exists());
+        assert_eq!(entry_names(parent.path()), Vec::<String>::new());
+        assert!(
+            outside
+                .path()
+                .join("research_tools/web_search/SKILL.md")
+                .is_file()
+        );
+    }
+
+    /// The in-install redirect: `shared/skills` points at another directory
+    /// *inside* the install. A boundary compared against the install root
+    /// alone admits this; the no-follow walk refuses the link regardless of
+    /// where it points, because skill content is only ever opened through
+    /// real directories under `shared/`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_skill_root_redirected_inside_the_install_is_refused() {
+        let workspace = tempfile::tempdir().unwrap();
+        write(&workspace.path().join("IDENTITY.md"), "identity");
+
+        // The content lives in the install, but not in the shared tree.
+        let install = tempfile::tempdir().unwrap();
+        write(
+            &install
+                .path()
+                .join("private-skills/research_tools/ops/SKILL.md"),
+            "not shared content",
+        );
+        let shared = install.path().join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::os::unix::fs::symlink(install.path().join("private-skills"), shared.join("skills"))
+            .unwrap();
+        let bundle_root = shared.join("skills/research_tools");
+        assert!(bundle_root.is_dir());
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_for(workspace.path());
+        plan.source_boundaries.install_root = install.path().to_path_buf();
+        plan.skill_sources = vec![skill_source("research_tools", &bundle_root, &[])];
+
+        let err = write_bundle(&mut plan, &out, false).await.unwrap_err();
+
+        assert!(err.to_string().contains("symlink"), "{err}");
         assert!(!out.exists());
         assert_eq!(entry_names(parent.path()), Vec::<String>::new());
     }
@@ -1833,11 +2097,12 @@ mod tests {
         let out = parent.path().join("bundle");
 
         let mut plan = plan_for(&workspace);
-        plan.source_boundaries.workspace = Some(install.path().to_path_buf());
+        plan.source_boundaries.install_root = install.path().to_path_buf();
+        plan.source_boundaries.workspace = Some(PathBuf::from("agents/researcher/workspace"));
 
         let err = write_bundle(&mut plan, &out, false).await.unwrap_err();
 
-        assert!(err.to_string().contains("outside"), "{err}");
+        assert!(err.to_string().contains("symlink"), "{err}");
         assert!(!out.exists());
         assert_eq!(entry_names(parent.path()), Vec::<String>::new());
         // And the host content the ancestor pointed at is untouched.
@@ -1846,6 +2111,305 @@ mod tests {
                 .path()
                 .join("researcher/workspace/host.md")
                 .is_file()
+        );
+    }
+
+    /// The workspace flavor of the in-install redirect: `agents` points at a
+    /// sibling directory inside the install, so an install-root comparison
+    /// passes while the copy walks a tree the agents contract does not own.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_default_workspace_redirected_inside_the_install_is_refused() {
+        let install = tempfile::tempdir().unwrap();
+        write(
+            &install
+                .path()
+                .join("elsewhere/researcher/workspace/host.md"),
+            "not the agents tree",
+        );
+        std::os::unix::fs::symlink(
+            install.path().join("elsewhere"),
+            install.path().join("agents"),
+        )
+        .unwrap();
+        let workspace = install.path().join("agents/researcher/workspace");
+        assert!(workspace.is_dir());
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_for(&workspace);
+        plan.source_boundaries.install_root = install.path().to_path_buf();
+        plan.source_boundaries.workspace = Some(PathBuf::from("agents/researcher/workspace"));
+
+        let err = write_bundle(&mut plan, &out, false).await.unwrap_err();
+
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(!out.exists());
+        assert_eq!(entry_names(parent.path()), Vec::<String>::new());
+    }
+
+    /// Deterministic ancestor replacement: the walk classifies `agents` as a
+    /// real directory, and it becomes a symlink before the open. The open is
+    /// the enforcement, so the export fails instead of following the link —
+    /// the race cannot turn a refusal into a traversal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_workspace_ancestor_replaced_mid_walk_fails_the_export() {
+        let install = tempfile::tempdir().unwrap();
+        let workspace = install.path().join("agents/researcher/workspace");
+        write(&workspace.join("notes.md"), "workspace note");
+        let outside = tempfile::tempdir().unwrap();
+        write(
+            &outside.path().join("researcher/workspace/host.md"),
+            "host content",
+        );
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_for(&workspace);
+        plan.source_boundaries.install_root = install.path().to_path_buf();
+        plan.source_boundaries.workspace = Some(PathBuf::from("agents/researcher/workspace"));
+
+        let agents = install.path().join("agents");
+        let retired = install.path().join("agents-retired");
+        let target = outside.path().to_path_buf();
+        let err = {
+            let _swap = SourceRootSwap::install(move |walked| {
+                if walked.file_name().is_some_and(|name| name == "agents") {
+                    std::fs::rename(&agents, &retired).unwrap();
+                    std::os::unix::fs::symlink(&target, &agents).unwrap();
+                }
+            });
+            write_bundle(&mut plan, &out, false).await.unwrap_err()
+        };
+
+        assert!(err.to_string().contains("failed to open"), "{err}");
+        assert!(!out.exists());
+        assert_eq!(entry_names(parent.path()), Vec::<String>::new());
+        assert!(
+            outside
+                .path()
+                .join("researcher/workspace/host.md")
+                .is_file()
+        );
+    }
+
+    /// The same replacement race against a skill root's `shared/skills`
+    /// ancestor.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_skill_ancestor_replaced_mid_walk_fails_the_export() {
+        let workspace = tempfile::tempdir().unwrap();
+        write(&workspace.path().join("IDENTITY.md"), "identity");
+
+        let (install, skills) = install_with_skills("research_tools");
+        write(&skills.join("web_search/SKILL.md"), "# search");
+        let outside = tempfile::tempdir().unwrap();
+        write(
+            &outside.path().join("research_tools/ops/SKILL.md"),
+            "host skill content",
+        );
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_with_skills(workspace.path(), &skills, &[]);
+
+        let skills_dir = install.path().join("shared/skills");
+        let retired = install.path().join("shared/skills-retired");
+        let target = outside.path().to_path_buf();
+        let err = {
+            let _swap = SourceRootSwap::install(move |walked| {
+                if walked.file_name().is_some_and(|name| name == "skills") {
+                    std::fs::rename(&skills_dir, &retired).unwrap();
+                    std::os::unix::fs::symlink(&target, &skills_dir).unwrap();
+                }
+            });
+            write_bundle(&mut plan, &out, false).await.unwrap_err()
+        };
+
+        assert!(err.to_string().contains("failed to open"), "{err}");
+        assert!(!out.exists());
+        assert_eq!(entry_names(parent.path()), Vec::<String>::new());
+        assert!(outside.path().join("research_tools/ops/SKILL.md").is_file());
+    }
+
+    /// Only an absent source means there is nothing to copy. A source the
+    /// export cannot *read* is a failure: succeeding would publish a bundle
+    /// whose manifest stands behind content nobody inspected.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_workspace_ancestor_fails_the_export_instead_of_publishing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let install = tempfile::tempdir().unwrap();
+        let workspace = install.path().join("agents/researcher/workspace");
+        write(&workspace.join("notes.md"), "workspace note");
+
+        let agents = install.path().join("agents");
+        std::fs::set_permissions(&agents, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::metadata(agents.join("researcher")).is_ok() {
+            // Running with CAP_DAC_OVERRIDE (root): the environment cannot
+            // produce the permission failure this test pins.
+            std::fs::set_permissions(&agents, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_for(&workspace);
+        plan.source_boundaries.install_root = install.path().to_path_buf();
+        plan.source_boundaries.workspace = Some(PathBuf::from("agents/researcher/workspace"));
+
+        let err = write_bundle(&mut plan, &out, false).await.unwrap_err();
+
+        // Restore before asserting so the tempdir can clean up either way.
+        std::fs::set_permissions(&agents, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!out.exists());
+        assert_eq!(entry_names(parent.path()), Vec::<String>::new());
+        let shown = format!("{err:#}");
+        assert!(
+            shown.contains("agents"),
+            "the failure should name the component: {shown}"
+        );
+    }
+
+    /// A component replaced by another *real directory* between classification
+    /// and open passes every symlink test; only filesystem identity separates
+    /// it from the tree that was classified. The copy carries what it
+    /// inspected or nothing at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_walk_component_replaced_by_another_directory_fails_the_export() {
+        let workspace = tempfile::tempdir().unwrap();
+        write(&workspace.path().join("IDENTITY.md"), "identity");
+
+        let (install, skills) = install_with_skills("research_tools");
+        write(&skills.join("web_search/SKILL.md"), "# search");
+        // A sibling tree inside the install, same filesystem, swapped whole.
+        write(
+            &install
+                .path()
+                .join("staging/skills/research_tools/ops/SKILL.md"),
+            "staged content the copy never classified",
+        );
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_with_skills(workspace.path(), &skills, &[]);
+
+        let skills_dir = install.path().join("shared/skills");
+        let retired = install.path().join("shared/skills-retired");
+        let staged = install.path().join("staging/skills");
+        let err = {
+            let _swap = SourceRootSwap::install(move |walked| {
+                if walked.file_name().is_some_and(|name| name == "skills") {
+                    std::fs::rename(&skills_dir, &retired).unwrap();
+                    std::fs::rename(&staged, &skills_dir).unwrap();
+                }
+            });
+            write_bundle(&mut plan, &out, false).await.unwrap_err()
+        };
+
+        assert!(err.to_string().contains("replaced"), "{err}");
+        assert!(!out.exists());
+        assert_eq!(entry_names(parent.path()), Vec::<String>::new());
+    }
+
+    /// The configured-workspace flavor of the replacement race: the leaf is
+    /// classified as a real directory and becomes a symlink before the open.
+    /// The no-follow open on the parent handle is the enforcement.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_configured_workspace_swapped_for_a_link_mid_open_fails_the_export() {
+        let outside = tempfile::tempdir().unwrap();
+        write(&outside.path().join("host-secret.txt"), "not the agent's");
+
+        let home = tempfile::tempdir().unwrap();
+        let workspace = home.path().join("workspace");
+        write(&workspace.join("notes.md"), "workspace note");
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_for(&workspace);
+        let swap_workspace = workspace.clone();
+        let target = outside.path().to_path_buf();
+        let err = {
+            let _swap = SourceRootSwap::install(move |walked| {
+                if walked.file_name().is_some_and(|name| name == "workspace") {
+                    std::fs::remove_dir_all(&swap_workspace).unwrap();
+                    std::os::unix::fs::symlink(&target, &swap_workspace).unwrap();
+                }
+            });
+            write_bundle(&mut plan, &out, false).await.unwrap_err()
+        };
+
+        assert!(err.to_string().contains("failed to open"), "{err}");
+        assert!(!out.exists());
+        assert_eq!(entry_names(parent.path()), Vec::<String>::new());
+        assert!(outside.path().join("host-secret.txt").is_file());
+    }
+
+    /// A configured path with no final component to bind to (it ends in `..`)
+    /// must refuse, not publish an empty workspace: the runtime may resolve
+    /// it to a real tree the bundle then silently lacks.
+    #[tokio::test]
+    async fn a_configured_workspace_path_ending_in_parent_dir_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let real = home.path().join("workspace");
+        write(&real.join("notes.md"), "workspace note");
+        let configured = home.path().join("workspace/inner/..");
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_for(&configured);
+        let err = write_bundle(&mut plan, &out, false).await.unwrap_err();
+
+        assert!(err.to_string().contains("plain directory name"), "{err}");
+        assert!(!out.exists());
+        assert_eq!(entry_names(parent.path()), Vec::<String>::new());
+    }
+
+    /// The configured-workspace flavor of "unreadable is not absent": a parent
+    /// the export cannot search must abort the export, not publish a bundle
+    /// with an empty workspace.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_configured_workspace_parent_fails_the_export() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let holder = home.path().join("holder");
+        let workspace = holder.join("workspace");
+        write(&workspace.join("notes.md"), "workspace note");
+
+        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::metadata(&workspace).is_ok() {
+            // Running with CAP_DAC_OVERRIDE (root): the environment cannot
+            // produce the permission failure this test pins.
+            std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_for(&workspace);
+        let err = write_bundle(&mut plan, &out, false).await.unwrap_err();
+
+        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!out.exists());
+        assert_eq!(entry_names(parent.path()), Vec::<String>::new());
+        let shown = format!("{err:#}");
+        assert!(
+            shown.contains("holder") || shown.contains("workspace"),
+            "the failure should name the path: {shown}"
         );
     }
 
@@ -1889,8 +2453,10 @@ mod tests {
         write(&workspace.path().join("IDENTITY.md"), "identity");
 
         // `<install>/shared/skills/<alias>` is a link out of the shared tree.
-        let shared = tempfile::tempdir().unwrap();
-        let bundle_root = shared.path().join("research_tools");
+        let install = tempfile::tempdir().unwrap();
+        let skills = install.path().join("shared/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        let bundle_root = skills.join("research_tools");
         std::os::unix::fs::symlink(outside.path(), &bundle_root).unwrap();
 
         let parent = tempfile::tempdir().unwrap();
@@ -1959,7 +2525,8 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         write(&workspace.path().join("IDENTITY.md"), "identity");
 
-        let skills = root.path().join("skills");
+        // Same filesystem as `host`, so the swap below is a rename.
+        let skills = root.path().join("shared/skills/research_tools");
         write(&skills.join("web_search/SKILL.md"), "# search");
         write(&skills.join("web_search/notes.md"), "skill note");
 
@@ -2087,25 +2654,18 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         write(&workspace.path().join("IDENTITY.md"), "identity");
 
-        let skills = tempfile::tempdir().unwrap();
-        write(&skills.path().join("web_search/SKILL.md"), "# search");
-        write(
-            &skills.path().join("internal_only/SKILL.md"),
-            "# internal runbook",
-        );
+        let (_install, skills) = install_with_skills("research_tools");
+        write(&skills.join("web_search/SKILL.md"), "# search");
+        write(&skills.join("internal_only/SKILL.md"), "# internal runbook");
 
         let parent = tempfile::tempdir().unwrap();
         let out = parent.path().join("bundle");
 
         let mut plan = plan_for(workspace.path());
-        bound_skills_to(&mut plan, skills.path());
-        plan.skill_sources = vec![skill_source(
-            "research_tools",
-            skills.path(),
-            &["internal_only"],
-        )];
+        bound_skills_to(&mut plan, &skills);
+        plan.skill_sources = vec![skill_source("research_tools", &skills, &["internal_only"])];
 
-        let admitted = skills.path().join("web_search");
+        let admitted = skills.join("web_search");
         let result = {
             let _swap = EntrySwap::install(move |relative| {
                 if relative == Path::new("web_search") {

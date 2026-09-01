@@ -121,7 +121,7 @@ nothing disappears silently.
 | `workspace.path` | A source-host absolute path. |
 | `identity.aieos_path` | Kept only when it resolves to a file inside the exported workspace under the format's own path grammar: `/`-separated, no `..`, no backslashes, drive or UNC prefixes, or control characters, since the importing host may read those differently than the exporting one. Paths into `memory/`, and paths whose file the copy did not carry, are dropped too. |
 | `delegate_same_risk_profile` | Set to `false`: same-profile auto-delegation would otherwise reach agents on the target this one has never been paired with. |
-| `skill_bundles.<alias>.directory` | Dropped only when absolute; it names the source host and would fail the target's own validation. The target resolves its default location for the alias. |
+| `skill_bundles.<alias>.directory` | Dropped when absolute, since it names the source host, and the target resolves its default location for the alias. A directory outside `<install>/shared/`, the tree the skill-bundle contract owns, is dropped together with its content: the bundle's config travels, but its skills are not the install's to export. |
 | `a2a` | An outward-facing surface; the agent must be re-published deliberately. |
 | `cron_jobs` | Not carried by bundle format 1. |
 | `workspace/memory/` | The memory store. See below. |
@@ -151,13 +151,18 @@ it would put the whole copy outside the tree the bundle claims to carry before
 any of the per-entry checks below run. Point the config at the real directory
 and export again.
 
-Its ancestors are checked too: a source that uses its default location must
-still resolve inside the install once every symlink in its path is followed, so
-a redirected `shared`, `shared/skills`, or `agents` directory is refused rather
-than silently read. The comparison is made against the install root, since the
-subdirectory a source sits in is the very component such a redirect replaces. A
-`workspace.path` the operator configured elsewhere is exempt: there the
-configured location is the boundary.
+Its ancestors are checked too, by construction rather than by comparison: a
+source that uses its default location is opened by walking each component from
+the install root (`shared`, then `skills`, then the bundle directory; `agents`,
+then the alias, then `workspace`), each through the previous component's
+handle, refusing a symlink at every step. A redirected `shared/skills` or `agents` is
+refused no matter where it points, even somewhere else inside the install,
+because skill content is only ever read through real directories under
+`shared/` and a default workspace through real directories under `agents/`.
+Symlinks *above* the install root are the operator's own path and are followed,
+with the same trust the config file's location gets. A `workspace.path` the
+operator configured elsewhere is exempt: there the configured location is the
+boundary, and only its final component is refused as a link.
 
 The workspace stays live while the export runs, since the agent that owns it can
 be writing to it through an ordinary tool call. So the copy never re-opens a
