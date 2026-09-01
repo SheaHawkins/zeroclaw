@@ -729,7 +729,19 @@ fn sanitize_agent(
     // agent read outside its own workspace at startup.
     if let Some(raw) = agent.identity.aieos_path.as_deref() {
         match portable_identity_path(raw) {
-            Ok(relative) => *identity_document = Some(relative),
+            Ok(relative) => {
+                // The carried config states the path in the bundle's own
+                // grammar, not as the operator happened to spell it: one
+                // string names the file in `config.toml`, in the copied tree,
+                // and in the caller's carried-content check.
+                if let Some(toml::Value::Table(identity)) = table.get_mut("identity") {
+                    identity.insert(
+                        "aieos_path".to_string(),
+                        toml::Value::String(relative.clone()),
+                    );
+                }
+                *identity_document = Some(relative);
+            }
             Err(detail) => {
                 if let Some(toml::Value::Table(identity)) = table.get_mut("identity") {
                     identity.remove("aieos_path");
@@ -815,8 +827,30 @@ fn portable_identity_path(raw: &str) -> Result<String, String> {
     // so the grammar below is the format's own: `/`-separated, no device or
     // host prefixes, no parent components, nothing a platform could read as a
     // separator or a control.
-    let trimmed = raw.trim();
-    for segment in trimmed.split('/') {
+    // Whitespace is not trimmed away: a filename that starts or ends with a
+    // space is a real (if hostile-looking) name, and quietly exporting the
+    // trimmed spelling would have the imported agent load a different file
+    // than the source agent does.
+    if raw.trim() != raw {
+        return Err(
+            "the AIEOS identity document path has leading or trailing whitespace; name \
+                    the file exactly as it appears in the workspace"
+                .to_string(),
+        );
+    }
+    for segment in raw.split('/') {
+        if segment == ".." {
+            // Even a `..` that lexically stays inside the workspace is
+            // refused: the loader resolves the path through the filesystem,
+            // where a symlink before the `..` lands somewhere the lexical
+            // form does not name, and the bundle would carry a different
+            // file than the agent actually loads.
+            return Err(
+                "the AIEOS identity document path contains a `..` segment; name the file \
+                        by its plain path from the workspace root"
+                    .to_string(),
+            );
+        }
         if segment.contains('\\') {
             return Err(
                 "the AIEOS identity document path contains a backslash, which a Windows \
@@ -837,17 +871,16 @@ fn portable_identity_path(raw: &str) -> Result<String, String> {
             );
         }
     }
-    portable_identity_path_inner(trimmed)
+    portable_identity_path_inner(raw)
 }
 
 /// The rest of the check, once the path is known to be one a target reads the
 /// same way this host does.
 fn portable_identity_path_inner(raw: &str) -> Result<String, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
+    if raw.is_empty() {
         return Err("the AIEOS identity document path is empty".to_string());
     }
-    if std::path::Path::new(trimmed).is_absolute() {
+    if std::path::Path::new(raw).is_absolute() {
         return Err(
             "the AIEOS identity document is referenced by a source-host absolute path; \
                     point the imported agent at a path inside its own workspace"
@@ -855,7 +888,7 @@ fn portable_identity_path_inner(raw: &str) -> Result<String, String> {
         );
     }
     let root = std::path::Path::new(WORKSPACE_DIR);
-    let Ok(resolved) = crate::paths::resolve_under(root, trimmed) else {
+    let Ok(resolved) = crate::paths::resolve_under(root, raw) else {
         return Err(
             "the AIEOS identity document path escapes the workspace, which would have \
                     the imported agent read outside its own tree at startup"
@@ -875,7 +908,33 @@ fn portable_identity_path_inner(raw: &str) -> Result<String, String> {
                 .to_string(),
         );
     }
-    Ok(relative.display().to_string())
+    // Serialize the validated components in the bundle's own grammar rather
+    // than the exporting host's: `display()` would turn the separators back
+    // into `\` on Windows, and a Unix target reads a backslash as part of a
+    // filename. The string written is the string any target resolves.
+    let mut portable = String::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(
+                "the AIEOS identity document path could not be resolved inside the workspace"
+                    .to_string(),
+            );
+        };
+        let Some(name) = name.to_str() else {
+            return Err(
+                "the AIEOS identity document path could not be resolved inside the workspace"
+                    .to_string(),
+            );
+        };
+        if !portable.is_empty() {
+            portable.push('/');
+        }
+        portable.push_str(name);
+    }
+    if portable.is_empty() {
+        return Err("the AIEOS identity document path is empty".to_string());
+    }
+    Ok(portable)
 }
 
 /// Record that the workspace copy did not carry the identity document the
@@ -2152,6 +2211,99 @@ mod tests {
         // workspace the bundle recreates.
         let windows_joined = format!("workspace\\{}", kept.replace('/', "\\"));
         assert!(!windows_joined.contains("\\..\\"), "{windows_joined}");
+    }
+
+    /// The bundle's wire separator is `/` on every exporting platform, and the
+    /// rendered config states the path in that grammar rather than as the
+    /// operator spelled it. Asserted against literal strings, never through
+    /// `Path::display`, so the expectation itself cannot vary by host.
+    #[test]
+    fn a_retained_identity_path_is_rendered_with_the_bundle_separator() {
+        for spelled in ["identity/aieos.json", "./identity/aieos.json"] {
+            let mut config = fixture();
+            if let Some(agent) = config.agents.get_mut("researcher") {
+                agent.identity.aieos_path = Some(spelled.to_string());
+            }
+            let plan = plan_export(&config, "researcher").unwrap();
+
+            // One string names the file everywhere: the tracked document, the
+            // carried config, and the rendered TOML.
+            assert_eq!(
+                plan.identity_document.as_deref(),
+                Some("identity/aieos.json"),
+                "{spelled}"
+            );
+            assert_eq!(
+                lookup(
+                    &plan.config,
+                    &["agents", "researcher", "identity", "aieos_path"]
+                )
+                .and_then(toml::Value::as_str),
+                Some("identity/aieos.json"),
+                "{spelled}"
+            );
+            let text = render_config_toml(&plan).unwrap();
+            assert!(
+                text.contains(r#"aieos_path = "identity/aieos.json""#),
+                "{spelled}: {text}"
+            );
+            assert!(!text.contains(r"identity\aieos.json"), "{spelled}: {text}");
+        }
+    }
+
+    /// Edge whitespace is refused rather than trimmed: quietly exporting the
+    /// trimmed spelling would have the imported agent load a different file
+    /// than the source agent does.
+    #[test]
+    fn an_identity_path_with_edge_whitespace_is_dropped() {
+        for hostile in [
+            " identity/aieos.json",
+            "identity/aieos.json ",
+            "\tidentity/aieos.json",
+        ] {
+            let mut config = fixture();
+            if let Some(agent) = config.agents.get_mut("researcher") {
+                agent.identity.aieos_path = Some(hostile.to_string());
+            }
+            let plan = plan_export(&config, "researcher").unwrap();
+
+            assert!(plan.identity_document.is_none(), "{hostile:?} was retained");
+            assert!(
+                plan.dropped
+                    .iter()
+                    .any(|d| d.path == "agents.researcher.identity.aieos_path"),
+                "{hostile:?} was dropped silently"
+            );
+        }
+    }
+
+    /// A `..` segment is refused even when it lexically stays inside the
+    /// workspace: the loader resolves the path through the filesystem, where
+    /// a symlink before the `..` names a different file than the lexical
+    /// form the bundle would carry.
+    #[test]
+    fn an_identity_path_with_an_inner_parent_segment_is_dropped() {
+        for hostile in ["link/../identity.json", "identity/sub/../aieos.json"] {
+            let mut config = fixture();
+            if let Some(agent) = config.agents.get_mut("researcher") {
+                agent.identity.aieos_path = Some(hostile.to_string());
+            }
+            let plan = plan_export(&config, "researcher").unwrap();
+
+            assert!(plan.identity_document.is_none(), "{hostile} was retained");
+            let identity = lookup(&plan.config, &["agents", "researcher", "identity"])
+                .and_then(toml::Value::as_table);
+            assert!(
+                identity.is_none_or(|table| !table.contains_key("aieos_path")),
+                "{hostile} survived: {identity:?}"
+            );
+            assert!(
+                plan.dropped
+                    .iter()
+                    .any(|d| d.path == "agents.researcher.identity.aieos_path"),
+                "{hostile} was dropped silently"
+            );
+        }
     }
 
     #[test]
