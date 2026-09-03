@@ -1058,6 +1058,8 @@ cli-bundle-rename-failed = rename failed: {$error}
 # ── Agent bundle export — zeroclaw agents export ──
 cli-agent-export-workspace-root-escape = the agent workspace {$path} is not reachable through real directories under the install's agents tree: {$at} is a symlink or leaves that tree, so the copy cannot prove what it would carry
 cli-agent-export-skill-root-escape = skill bundle `{$alias}` at {$path} is not reachable through real directories under the install's shared tree: {$at} is a symlink or leaves that tree, so the copy cannot prove what it would carry
+cli-agent-export-path-unresolvable = {$path} reaches through `..` inside a directory that does not exist yet, so what it names cannot be checked before the export writes; write the path without `..`
+cli-agent-export-source-not-a-directory = {$path} exists but is not a directory; the export refuses to publish a bundle that silently lacks the source it names
 cli-agent-export-workspace-path-unresolvable = the configured workspace path {$path} does not end in a plain directory name, so the export cannot bind what it copies to what it checked; set `workspace.path` to the resolved directory and export again
 cli-agent-export-source-root-replaced = {$path} was replaced while the export was opening it; the copy carries the tree it inspected or nothing at all, so run the export again
 cli-agent-export-workspace-root-symlink = the agent workspace {$path} is a symlink; the bundle would carry whatever it points at as the agent's own tree, so set `workspace.path` to the real directory and export again

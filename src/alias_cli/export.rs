@@ -209,9 +209,27 @@ fn resolve_path(path: &Path) -> Result<PathBuf> {
                 below.push(name.to_os_string());
                 cursor = parent;
             }
+            // A `..` below the nearest existing ancestor: `file_name` is
+            // `None` while ancestors remain. The filesystem will resolve it
+            // only after `create_dir_all` brings the missing component into
+            // being, so no overlap or occupancy check made now describes the
+            // path that would actually be written. Refused: a destination
+            // like `missing/../<workspace>` would otherwise slip past
+            // [`reject_source_overlap`] and publish over the workspace it
+            // reads.
+            (None, Some(_)) => bail!(
+                "{}",
+                mta(
+                    "cli-agent-export-path-unresolvable",
+                    &[("path", path.display().to_string().as_str())],
+                    "{$path} reaches through `..` inside a directory that does not exist \
+                     yet, so what it names cannot be checked before the export writes; \
+                     write the path without `..`"
+                )
+            ),
             // No ancestor exists at all (an absolute path under a missing
             // root); nothing can be canonicalized, so compare it as written.
-            _ => return Ok(absolute),
+            (_, None) => return Ok(absolute),
         }
     }
 }
@@ -502,7 +520,19 @@ fn open_anchored_root(install_root: &Path, relative: &Path, family: &str) -> Res
             });
         }
         if !metadata.is_dir() {
-            return Ok(SourceRoot::Nothing);
+            // Exists but is not a directory. Only absence means there is no
+            // source: a file squatting a component of the install's own tree
+            // is a broken install, and exporting past it would publish a
+            // bundle silently missing what the manifest claims to describe.
+            bail!(
+                "{}",
+                mta(
+                    "cli-agent-export-source-not-a-directory",
+                    &[("path", walked.display().to_string().as_str())],
+                    "{$path} exists but is not a directory; the export refuses to publish a \
+                     bundle that silently lacks the source it names"
+                )
+            );
         }
         source_root_swap_seam(&walked);
         let opened = dir
@@ -602,7 +632,16 @@ fn open_configured_root(path: &Path) -> Result<SourceRoot> {
         return Ok(SourceRoot::Symlinked);
     }
     if !metadata.is_dir() {
-        return Ok(SourceRoot::Nothing);
+        // Same rule as the anchored walk: only absence means "no source".
+        bail!(
+            "{}",
+            mta(
+                "cli-agent-export-source-not-a-directory",
+                &[("path", path.display().to_string().as_str())],
+                "{$path} exists but is not a directory; the export refuses to publish a \
+                 bundle that silently lacks the source it names"
+            )
+        );
     }
     source_root_swap_seam(&absolute);
     let opened = parent
@@ -800,10 +839,10 @@ fn copy_skills(
         if !bundle.filter.admits_skill(skill) {
             continue;
         }
-        let file_type = entry
+        let classified = entry
             .metadata()
-            .with_context(|| format!("failed to stat {root}/{skill}"))?
-            .file_type();
+            .with_context(|| format!("failed to stat {root}/{skill}"))?;
+        let file_type = classified.file_type();
         if file_type.is_symlink() {
             copied.symlinks_skipped += 1;
             continue;
@@ -816,6 +855,18 @@ fn copy_skills(
         let child_source = source
             .open_dir_nofollow(&name)
             .with_context(|| format!("failed to open {root}/{skill}"))?;
+        // The no-follow open proves the name is not a link; it does not prove
+        // *which* directory now wears it. An admitted skill renamed away and
+        // an excluded sibling renamed into its place is still a real
+        // directory, so the opened handle must be the object that was
+        // classified — the same rule the per-entry copy applies below.
+        let opened = child_source
+            .dir_metadata()
+            .with_context(|| format!("failed to stat {root}/{skill}"))?;
+        if !is_same_object(&classified, &opened) {
+            copied.replaced_skipped += 1;
+            continue;
+        }
         dest.create_dir(&name)
             .with_context(|| format!("failed to create {root}/{skill} in the bundle"))?;
         let child_dest = dest
@@ -2355,6 +2406,121 @@ mod tests {
         assert!(outside.path().join("host-secret.txt").is_file());
     }
 
+    /// A destination that reaches through `..` inside a not-yet-existing
+    /// directory resolves to nothing at check time and to a real tree at
+    /// publish time — `missing/../<workspace>` would slip past the overlap
+    /// check and publish over the workspace being read.
+    #[tokio::test]
+    async fn a_destination_through_a_missing_parent_dir_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = home.path().join("workspace");
+        write(&workspace.join("notes.md"), "workspace note");
+
+        let mut plan = plan_for(&workspace);
+        let out = home.path().join("missing/../workspace");
+        let err = write_bundle(&mut plan, &out, true).await.unwrap_err();
+
+        assert!(err.to_string().contains(".."), "{err}");
+        // The workspace is untouched: not retired, not replaced.
+        assert!(workspace.join("notes.md").is_file());
+        assert!(!home.path().join("missing").exists());
+        assert_eq!(
+            entry_names(home.path()),
+            vec!["workspace".to_string()],
+            "nothing was staged or retired"
+        );
+    }
+
+    /// The replacement that defeats every symlink test: an admitted skill
+    /// directory renamed away and the excluded sibling renamed into its
+    /// place, both real directories. Only filesystem identity separates the
+    /// opened handle from the classified entry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_skill_replaced_by_an_excluded_sibling_directory_is_not_copied() {
+        let workspace = tempfile::tempdir().unwrap();
+        write(&workspace.path().join("IDENTITY.md"), "identity");
+
+        let (_install, skills) = install_with_skills("research_tools");
+        write(&skills.join("web_search/SKILL.md"), "# search");
+        write(&skills.join("internal_only/SKILL.md"), "# internal runbook");
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_for(workspace.path());
+        bound_skills_to(&mut plan, &skills);
+        plan.skill_sources = vec![skill_source("research_tools", &skills, &["internal_only"])];
+
+        let admitted = skills.join("web_search");
+        // Retired OUTSIDE the bundle directory so the walk never sees it.
+        let retired = skills.parent().unwrap().join("web_search-retired");
+        let excluded = skills.join("internal_only");
+        let copied = {
+            let _swap = EntrySwap::install(move |relative| {
+                if relative == Path::new("web_search") {
+                    std::fs::rename(&admitted, &retired).unwrap();
+                    std::fs::rename(&excluded, &admitted).unwrap();
+                }
+            });
+            write_bundle(&mut plan, &out, false).await.unwrap()
+        };
+
+        assert_eq!(copied.skills.tally.replaced_skipped, 1);
+        for file in all_files(&out) {
+            let bytes = std::fs::read(&file).unwrap();
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains("internal runbook"),
+                "{} carries the excluded skill",
+                file.display()
+            );
+        }
+    }
+
+    /// A file squatting the source's place is a broken install, not an
+    /// absent source: publishing an empty bundle over it would be a success
+    /// the manifest cannot stand behind.
+    #[tokio::test]
+    async fn a_file_where_the_workspace_should_be_fails_the_export() {
+        let install = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(install.path().join("agents/researcher")).unwrap();
+        write(
+            &install.path().join("agents/researcher/workspace"),
+            "a file, not a directory",
+        );
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let mut plan = plan_for(&install.path().join("agents/researcher/workspace"));
+        plan.source_boundaries.install_root = install.path().to_path_buf();
+        plan.source_boundaries.workspace = Some(PathBuf::from("agents/researcher/workspace"));
+
+        let err = write_bundle(&mut plan, &out, false).await.unwrap_err();
+        assert!(err.to_string().contains("not a directory"), "{err}");
+        assert!(!out.exists());
+        assert_eq!(entry_names(parent.path()), Vec::<String>::new());
+    }
+
+    /// The source flavor of the unresolvable `..`: a configured workspace
+    /// reaching through a directory that does not exist yet cannot be
+    /// overlap-checked, so the export refuses rather than guessing.
+    #[tokio::test]
+    async fn a_configured_workspace_through_a_missing_parent_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        write(&home.path().join("workspace/notes.md"), "workspace note");
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let configured = home.path().join("missing/../workspace");
+        let mut plan = plan_for(&configured);
+        let err = write_bundle(&mut plan, &out, false).await.unwrap_err();
+
+        assert!(err.to_string().contains(".."), "{err}");
+        assert!(!out.exists());
+        assert!(!home.path().join("missing").exists());
+    }
+
     /// A configured path with no final component to bind to (it ends in `..`)
     /// must refuse, not publish an empty workspace: the runtime may resolve
     /// it to a real tree the bundle then silently lacks.
@@ -2363,6 +2529,9 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let real = home.path().join("workspace");
         write(&real.join("notes.md"), "workspace note");
+        // `inner` exists, so the `..` resolves and the walk reaches the leaf
+        // check; the missing-parent case is covered separately below.
+        std::fs::create_dir_all(real.join("inner")).unwrap();
         let configured = home.path().join("workspace/inner/..");
 
         let parent = tempfile::tempdir().unwrap();
