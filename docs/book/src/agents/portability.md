@@ -56,6 +56,16 @@ directory beside the destination and swapped in once it is complete, so:
   bundle alike: an `--out` *inside* a source would have the copy consume its own
   output, and an `--out` that *contains* one would replace the tree being
   exported.
+- The names the bundle format controls, a skill-bundle alias and each
+  component of a retained identity path, are held to one grammar: what every
+  supported target can materialize, not what the exporting host accepts. That
+  rules out separators and control characters, and also the Windows names a
+  Unix host cannot see are special, such as `con`, `nul` or `lpt1` with or
+  without an extension, and names ending in a space or a dot. A reference that
+  breaks the rule is dropped with its reason rather than written into a bundle
+  that cannot be opened on the other side. Workspace and skill content travels
+  under whatever names it already has; this is about the names the format
+  itself chooses.
 - The closure is proved before it is written. The rendered `config.toml` is
   parsed back and put through the same validation the importing install runs,
   on a config holding nothing else. A reference the source install could

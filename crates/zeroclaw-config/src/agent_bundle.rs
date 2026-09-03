@@ -383,17 +383,19 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
                     .to_string(),
             });
         }
-        if !is_safe_path_component(&bundle) {
+        if let Some(reason) = unportable_component(&bundle) {
             // The alias names a directory inside the bundle. One that is not a
             // single component would place carried content outside the bundle
-            // being built, so nothing is planned for it.
+            // being built, and one a supported target cannot create would make
+            // the bundle unopenable there, so nothing is planned for it.
             dropped.push(DroppedRef {
                 path: format!("skill_bundles.{bundle}"),
                 reason: DropReason::HostSpecific,
-                detail: "the skill-bundle alias is not usable as a single directory name, so \
-                         its content cannot be placed inside a bundle; rename the bundle to a \
-                         plain name"
-                    .to_string(),
+                detail: format!(
+                    "the skill-bundle alias {reason}, so it is not a directory name every \
+                     target can create for the bundle's content; rename the bundle to a \
+                     plain name"
+                ),
             });
             continue;
         }
@@ -800,24 +802,89 @@ fn sanitize_agent(
     table
 }
 
+/// Why `component` is not a name every supported target can materialize, or
+/// `None` when it is one.
+///
+/// The bundle format controls two kinds of name: a skill-bundle alias, which
+/// becomes the directory `skills/<alias>/`, and each component of a retained
+/// `aieos_path`. Both are judged here by one grammar, because both are read
+/// by whoever opens the bundle rather than by the host that wrote it. The
+/// rule is therefore the intersection of what the supported targets accept,
+/// not what this one happens to.
+///
+/// Separators, relative-directory names, and controls are the half a Unix
+/// host can see. The Windows half is invisible from here and no less real:
+/// `con`, `nul`, `lpt1` and their kin name character devices whatever
+/// extension follows them, the characters `<>:"|?*` are not allowed in a
+/// filename at all, and a name ending in a space or a dot is silently
+/// stripped to a *different* name — so a bundle carrying one resolves
+/// somewhere its own manifest does not describe.
+///
+/// This governs the names the format itself controls. It is deliberately not
+/// a filter over arbitrary workspace or skill content, which travels under
+/// whatever names it already has.
+fn unportable_component(component: &str) -> Option<&'static str> {
+    if component.is_empty() {
+        return Some("is empty");
+    }
+    if component != component.trim() {
+        return Some("has leading or trailing whitespace");
+    }
+    if component == "." || component == ".." {
+        return Some("names a relative directory rather than an entry");
+    }
+    if component.contains('/') || component.contains('\\') {
+        return Some("contains a directory separator");
+    }
+    if component.contains([':', '<', '>', '"', '|', '?', '*']) {
+        return Some("contains a character Windows does not allow in a filename");
+    }
+    if component.chars().any(char::is_control) {
+        return Some("contains a control character");
+    }
+    if component.ends_with('.') {
+        return Some("ends in a dot, which Windows strips to a different name");
+    }
+    if is_windows_device_name(component) {
+        return Some("is a Windows device name");
+    }
+    None
+}
+
+/// Whether `component` names a Windows character device.
+///
+/// The device is matched on the stem, before the first dot: `nul.json` opens
+/// the null device there exactly as `nul` does, so an extension is no escape.
+fn is_windows_device_name(component: &str) -> bool {
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or(component)
+        .to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    // `COM1`-`COM9` and `LPT1`-`LPT9`. `COM0` and `LPT0` are refused with
+    // them rather than left to differ between Windows versions.
+    let Some(port) = stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"))
+    else {
+        return false;
+    };
+    port.len() == 1 && port.starts_with(|c: char| c.is_ascii_digit())
+}
+
 /// Whether `alias` is safe to use as one path component inside a bundle.
 ///
 /// A skill-bundle alias is a config map key, and the bundle materializes its
 /// content at `skills/<alias>/`. The skill-bundle validator constrains where a
 /// bundle's *directory* may sit, not what its key may contain, so the key is
-/// checked here before it is ever joined to a path: one component, no
-/// separator in any platform's reading, no parent or current directory, no
-/// device or stream prefix, no controls.
+/// checked against the format's own grammar before it is ever joined to a
+/// path. See [`unportable_component`].
 #[must_use]
 pub fn is_safe_path_component(alias: &str) -> bool {
-    !alias.is_empty()
-        && alias == alias.trim()
-        && alias != "."
-        && alias != ".."
-        && !alias.contains('/')
-        && !alias.contains('\\')
-        && !alias.contains(':')
-        && !alias.chars().any(char::is_control)
+    unportable_component(alias).is_none()
 }
 
 /// The workspace-relative form of an `aieos_path` the bundle can carry, or why
@@ -835,18 +902,27 @@ fn portable_identity_path(raw: &str) -> Result<String, String> {
     // so the grammar below is the format's own: `/`-separated, no device or
     // host prefixes, no parent components, nothing a platform could read as a
     // separator or a control.
-    // Whitespace is not trimmed away: a filename that starts or ends with a
-    // space is a real (if hostile-looking) name, and quietly exporting the
-    // trimmed spelling would have the imported agent load a different file
-    // than the source agent does.
-    if raw.trim() != raw {
+    // Judged before the components, so an absolute path is reported as one
+    // rather than as an empty leading component. A leading `/` is checked
+    // directly as well: Windows does not call it absolute, and the format
+    // does not care which host is asking.
+    if raw.is_empty() {
+        return Err("the AIEOS identity document path is empty".to_string());
+    }
+    if raw.starts_with('/') || std::path::Path::new(raw).is_absolute() {
         return Err(
-            "the AIEOS identity document path has leading or trailing whitespace; name \
-                    the file exactly as it appears in the workspace"
+            "the AIEOS identity document is referenced by a source-host absolute path; \
+                    point the imported agent at a path inside its own workspace"
                 .to_string(),
         );
     }
     for segment in raw.split('/') {
+        if segment == "." {
+            // A no-op the normalizer removes before anything is joined. It
+            // names nothing, so there is no name here to judge — unlike a
+            // bundle alias `.`, which would have to become a directory.
+            continue;
+        }
         if segment == ".." {
             // Even a `..` that lexically stays inside the workspace is
             // refused: the loader resolves the path through the filesystem,
@@ -859,24 +935,17 @@ fn portable_identity_path(raw: &str) -> Result<String, String> {
                     .to_string(),
             );
         }
-        if segment.contains('\\') {
-            return Err(
-                "the AIEOS identity document path contains a backslash, which a Windows \
-                        target reads as a directory separator; use `/` only"
-                    .to_string(),
-            );
-        }
-        if segment.contains(':') {
-            return Err(
-                "the AIEOS identity document path contains a drive or stream prefix, \
-                        which does not resolve inside the imported workspace"
-                    .to_string(),
-            );
-        }
-        if segment.chars().any(char::is_control) {
-            return Err(
-                "the AIEOS identity document path contains a control character".to_string(),
-            );
+        // Whitespace is not trimmed away here, and neither is anything else:
+        // a filename that ends in a space or a dot is a real name on this
+        // host, and quietly exporting a different spelling would have the
+        // imported agent load a different file than the source agent does.
+        // The reference is dropped instead, and the operator hears why.
+        if let Some(reason) = unportable_component(segment) {
+            return Err(format!(
+                "the AIEOS identity document path has a component that {reason} \
+                 (`{segment}`); a bundle is opened on hosts other than this one, so it \
+                 can carry only names every supported target can materialize"
+            ));
         }
     }
     portable_identity_path_inner(raw)
@@ -2692,6 +2761,21 @@ mod tests {
             r"..\outside",
             "/absolute",
             "C:evil",
+            // Authored on any host, refused for a target this one cannot
+            // see: Windows character devices, with and without an
+            // extension, and names it would silently strip to something
+            // else.
+            "con",
+            "NUL",
+            "aux",
+            "prn",
+            "com1",
+            "LPT9",
+            "nul.md",
+            "trailing.",
+            "quo\"ted",
+            "pipe|d",
+            "star*",
         ] {
             let mut config = fixture();
             config
@@ -2728,6 +2812,99 @@ mod tests {
         assert!(is_safe_path_component("core"));
         assert!(!is_safe_path_component(""));
         assert!(!is_safe_path_component(" spaced"));
+        // Whitespace-only differences never reach the planner — the agent's
+        // reference list is trimmed before the alias is resolved — so they are
+        // pinned against the grammar directly.
+        assert!(!is_safe_path_component("trailing "));
+    }
+
+    /// The device rule matches names, not substrings. Refusing everything
+    /// that merely starts with `com` would cost the format ordinary words for
+    /// no safety, so the boundary is pinned from both sides.
+    #[test]
+    fn only_the_reserved_windows_names_are_refused() {
+        for reserved in [
+            "con",
+            "CON",
+            "Con",
+            "prn",
+            "aux",
+            "nul",
+            "com0",
+            "com1",
+            "com9",
+            "lpt1",
+            "LPT9",
+            "con.md",
+            "nul.json",
+            "com1.tar.gz",
+        ] {
+            assert!(
+                !is_safe_path_component(reserved),
+                "{reserved:?} is reserved on Windows"
+            );
+        }
+        for ordinary in [
+            "console",
+            "com",
+            "com10",
+            "communication",
+            "lpt",
+            "auxiliary",
+            "nullable",
+            "conf.d",
+            "my.con",
+            "research.tools",
+        ] {
+            assert!(
+                is_safe_path_component(ordinary),
+                "{ordinary:?} is an ordinary name"
+            );
+        }
+    }
+
+    /// The same grammar governs the other name the format controls. A path
+    /// whose component a target cannot open is dropped with its reason rather
+    /// than written into a bundle that cannot be loaded there.
+    #[test]
+    fn an_identity_path_naming_a_windows_device_is_dropped() {
+        for hostile in [
+            "nul",
+            "identity/con.json",
+            "identity/lpt1.json",
+            "identity/report.",
+            "identity/report ",
+            "identity/pipe|d.json",
+        ] {
+            let mut config = fixture();
+            if let Some(agent) = config.agents.get_mut("researcher") {
+                agent.identity.aieos_path = Some(hostile.to_string());
+            }
+            let plan = plan_export(&config, "researcher").unwrap();
+
+            assert!(plan.identity_document.is_none(), "{hostile:?} was retained");
+            let dropped = plan
+                .dropped
+                .iter()
+                .find(|d| d.path == "agents.researcher.identity.aieos_path")
+                .unwrap_or_else(|| panic!("{hostile:?} was dropped silently"));
+            assert!(
+                dropped
+                    .detail
+                    .contains("every supported target can materialize"),
+                "{hostile:?}: {}",
+                dropped.detail
+            );
+            // The reference does not survive into the closure either.
+            assert!(
+                lookup(
+                    &plan.config,
+                    &["agents", "researcher", "identity", "aieos_path"]
+                )
+                .is_none(),
+                "{hostile:?} survived in the closure"
+            );
+        }
     }
 
     /// An absolute directory names this host twice over: the path cannot
