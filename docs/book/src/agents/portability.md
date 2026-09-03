@@ -56,6 +56,14 @@ directory beside the destination and swapped in once it is complete, so:
   bundle alike: an `--out` *inside* a source would have the copy consume its own
   output, and an `--out` that *contains* one would replace the tree being
   exported.
+- What `--force` admits is one directory, not one path. The whole copy sits
+  between the moment the destination is looked at and the moment the bundle is
+  swapped in, so the decision is carried forward as the identity of the object
+  it was made about. A destination that appears during that window, or one that
+  is replaced by another directory, is refused: it is not the thing the
+  operator was shown, and nothing is retired or deleted. The same binding
+  covers the parent directory, which is opened once and used for every step
+  that follows.
 
 ### If the export is killed partway
 

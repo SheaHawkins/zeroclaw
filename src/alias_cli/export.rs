@@ -20,6 +20,7 @@
 //! A crash-atomic directory exchange would need `RENAME_EXCHANGE`, which is
 //! Linux-only, so the guarantee is stated as it is rather than widened.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -47,6 +48,50 @@ const SKILLS_FAMILY: &str = "shared";
 
 /// Install subtree that owns default-location agent workspaces.
 const WORKSPACE_FAMILY: &str = "agents";
+
+/// One filesystem object's identity.
+///
+/// `dev`/`ino` are the portable identity pair `cap-fs-ext` exposes: on Windows
+/// they are the volume serial and file index, and cap-primitives builds every
+/// view from an opened handle, so neither side of a comparison is a by-name
+/// guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObjectId {
+    dev: u64,
+    ino: u64,
+}
+
+impl ObjectId {
+    fn of(metadata: &cap_std::fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    }
+}
+
+/// The destination state the operator's `--force` decision was made against.
+///
+/// The decision and the publication are separated by the whole copy, which is
+/// as long as the export takes. Carrying the decision forward as a value —
+/// including the identity of the object it was made against — is what stops
+/// publication from re-deciding against whatever the destination holds by
+/// then. A directory that appears mid-copy was admitted by nobody, and a
+/// `--force` given for one tree is not a `--force` for the tree that replaced
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// Nothing was at the destination. Publication may create it, and may
+    /// replace nothing.
+    Vacant,
+    /// An empty directory was there. Replacing it needed no `--force` because
+    /// there was nothing to lose, which stays true only while it is that same
+    /// object and still empty.
+    Empty(ObjectId),
+    /// A non-empty directory the operator admitted for replacement with
+    /// `--force`. Publication retires that object and no other.
+    Forced(ObjectId),
+}
 
 /// Files carried by one copy pass.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -118,9 +163,8 @@ pub async fn run(config: &Config, alias: &str, out: &Path, force: bool) -> Resul
 async fn write_bundle(plan: &mut ExportPlan, out: &Path, force: bool) -> Result<BundleCopy> {
     let dest = resolve_path(out)?;
     reject_source_overlap(&dest, plan, out)?;
-    check_destination(&dest, out, force).await?;
 
-    let Some(parent) = dest.parent() else {
+    let (Some(parent_path), Some(name)) = (dest.parent(), dest.file_name()) else {
         bail!(
             "{}",
             mta(
@@ -130,29 +174,61 @@ async fn write_bundle(plan: &mut ExportPlan, out: &Path, force: bool) -> Result<
             )
         );
     };
-    tokio::fs::create_dir_all(parent)
+    // Creating the parent before the destination is admitted costs nothing a
+    // refusal would have to undo: every refusal in `check_destination` needs
+    // an object *at* the destination, which needs the parent to exist already.
+    tokio::fs::create_dir_all(parent_path)
         .await
-        .with_context(|| format!("failed to create destination parent {}", parent.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to create destination parent {}",
+                parent_path.display()
+            )
+        })?;
+    // Opened once, and every later step that touches the destination goes
+    // through it: the occupancy decision, both publishing renames, and the
+    // reap. A parent replaced mid-export therefore cannot redirect the
+    // publish to a directory the operator never named — the handle still
+    // refers to the directory that was admitted, whatever now wears its name.
+    let parent = Dir::open_ambient_dir(parent_path, ambient_authority())
+        .with_context(|| format!("failed to open {}", parent_path.display()))?;
+
+    let admission = check_destination(&parent, name, out, force)?;
 
     // Dropping the staging directory removes it, so every `?` below cleans up
     // after itself and leaves the destination untouched. A crash skips the
     // drop, leaving the staged tree behind for the operator to delete.
+    //
+    // Created by path rather than through the handle above, which is the one
+    // step that cannot be: a parent replaced in the instant between the two
+    // leaves the staged tree invisible to the handle, and publication then
+    // fails to find it. That is a failed export, not a misdirected one.
     let staging = tempfile::Builder::new()
         .prefix(STAGING_PREFIX)
-        .tempdir_in(parent)
+        .tempdir_in(parent_path)
         .with_context(|| {
             format!(
                 "failed to create a staging directory for the bundle in {}",
-                parent.display()
+                parent_path.display()
             )
         })?;
 
+    // Identities of the trees the copy opened. Publication may retire the
+    // object at the destination, and must never retire one of these:
+    // `reject_source_overlap` answers that question by path before the copy,
+    // where a rename during the copy can make the answer stale.
+    let mut sources = Vec::new();
     let workspace_dest = staging.path().join(WORKSPACE_DIR);
     let mut copied = BundleCopy {
-        workspace: copy_workspace(plan, &workspace_dest)?,
+        workspace: copy_workspace(plan, &workspace_dest, &mut sources)?,
         skills: SkillCopy::default(),
     };
-    copy_skill_bundles(plan, &staging.path().join(SKILLS_DIR), &mut copied)?;
+    copy_skill_bundles(
+        plan,
+        &staging.path().join(SKILLS_DIR),
+        &mut copied,
+        &mut sources,
+    )?;
 
     // The closure may reference an identity document inside the workspace. The
     // planner proved the path stays in the tree; only the copy knows whether
@@ -182,7 +258,7 @@ async fn write_bundle(plan: &mut ExportPlan, out: &Path, force: bool) -> Result<
     .map_err(anyhow::Error::new)?;
     write_file(&staging.path().join(MANIFEST_FILE), &manifest_toml).await?;
 
-    publish(staging, &dest, parent)?;
+    publish(staging, &parent, name, &dest, admission, &sources)?;
     Ok(copied)
 }
 
@@ -315,14 +391,41 @@ fn reject_overlap(dest: &Path, source: &Path, out: &Path, bundle: Option<&str>) 
     Ok(())
 }
 
-/// Check that the destination can be published to, without touching it. A
-/// non-directory is refused outright; a directory that already holds files
+/// Decide whether the bundle may be published over what is at the
+/// destination, and bind that decision to the object it was made against.
+///
+/// A non-directory is refused outright; a directory that already holds files
 /// needs `--force`, which replaces its contents rather than merging into them.
-async fn check_destination(dest: &Path, out: &Path, force: bool) -> Result<()> {
-    if !dest.exists() {
-        return Ok(());
+///
+/// The destination is inspected through a handle on its parent, so the answer
+/// describes one object rather than one name. A symlink is refused rather
+/// than followed — publishing through one would replace whatever it points
+/// at, which is not what the operator named — and an object swapped between
+/// the classification and the open fails the export instead of being admitted
+/// on the strength of a decision made about something else.
+fn check_destination(parent: &Dir, name: &OsStr, out: &Path, force: bool) -> Result<Admission> {
+    let metadata = match parent.symlink_metadata(name) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Admission::Vacant);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect destination {}", out.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "{}",
+            mta(
+                "cli-agent-export-dest-symlink",
+                &[("path", out.display().to_string().as_str())],
+                "destination {$path} is a symlink; publishing would replace whatever it \
+                 points at rather than the path you named, so name the directory itself"
+            )
+        );
     }
-    if !dest.is_dir() {
+    if !metadata.is_dir() {
         bail!(
             "{}",
             mta(
@@ -332,15 +435,25 @@ async fn check_destination(dest: &Path, out: &Path, force: bool) -> Result<()> {
             )
         );
     }
-    let mut entries = tokio::fs::read_dir(dest)
-        .await
-        .with_context(|| format!("failed to read destination {}", dest.display()))?;
-    let occupied = entries
-        .next_entry()
-        .await
-        .with_context(|| format!("failed to read destination {}", dest.display()))?
+    let opened = parent
+        .open_dir_nofollow(name)
+        .with_context(|| format!("failed to open destination {}", out.display()))?;
+    let opened_metadata = opened
+        .dir_metadata()
+        .with_context(|| format!("failed to inspect destination {}", out.display()))?;
+    if !is_same_object(&metadata, &opened_metadata) {
+        bail!("{}", destination_changed(out));
+    }
+    let admitted = ObjectId::of(&opened_metadata);
+    let occupied = opened
+        .entries()
+        .with_context(|| format!("failed to read destination {}", out.display()))?
+        .next()
         .is_some();
-    if occupied && !force {
+    if !occupied {
+        return Ok(Admission::Empty(admitted));
+    }
+    if !force {
         bail!(
             "{}",
             mta(
@@ -350,63 +463,212 @@ async fn check_destination(dest: &Path, out: &Path, force: bool) -> Result<()> {
             )
         );
     }
-    Ok(())
+    Ok(Admission::Forced(admitted))
 }
 
-/// Swap the staged bundle into place.
-fn publish(staging: tempfile::TempDir, dest: &Path, parent: &Path) -> Result<()> {
+/// The refusal for a destination that is no longer the object the export
+/// checked. Shared by the admission and by every publication step, because
+/// they are all saying the same thing: nothing was replaced.
+fn destination_changed(out: &Path) -> String {
+    mta(
+        "cli-agent-export-dest-changed",
+        &[("path", out.display().to_string().as_str())],
+        "destination {$path} is not the directory this export checked before copying; \
+         nothing was replaced, so look at what is there and export again",
+    )
+}
+
+/// The identity of the directory at `name`, opened through `parent` without
+/// following a link.
+///
+/// `None` covers every way the name can fail to be a directory this export
+/// could have admitted: absent, a symlink, not a directory, or replaced
+/// between being classified and being opened. Callers compare against what
+/// they admitted, so all of those are one answer — not this object.
+fn destination_identity(parent: &Dir, name: &OsStr, out: &Path) -> Result<Option<ObjectId>> {
+    let metadata = match parent.symlink_metadata(name) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", out.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(None);
+    }
+    let opened = match parent.open_dir_nofollow(name) {
+        Ok(opened) => opened,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to open {}", out.display()));
+        }
+    };
+    let opened = opened
+        .dir_metadata()
+        .with_context(|| format!("failed to inspect {}", out.display()))?;
+    if !is_same_object(&metadata, &opened) {
+        return Ok(None);
+    }
+    Ok(Some(ObjectId::of(&opened)))
+}
+
+/// The identity of an opened source root, recorded so publication can refuse
+/// to retire a tree this export read.
+fn source_identity(dir: &Dir, path: &Path) -> Result<ObjectId> {
+    let metadata = dir
+        .dir_metadata()
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    Ok(ObjectId::of(&metadata))
+}
+
+/// Swap the staged bundle into place, bound to what the operator admitted.
+fn publish(
+    staging: tempfile::TempDir,
+    parent: &Dir,
+    name: &OsStr,
+    dest: &Path,
+    admission: Admission,
+    sources: &[ObjectId],
+) -> Result<()> {
+    let Some(staged) = staging.path().file_name() else {
+        bail!("the staging directory has no name to publish from");
+    };
+    let staged = staged.to_os_string();
     // On failure the guard drops and removes the staged tree. On success the
     // rename has already moved it, so the guard is disarmed rather than left to
     // recurse over a path that is now the published bundle.
-    swap_into_place(staging.path(), dest, parent)?;
+    swap_into_place(parent, &staged, name, dest, admission, sources)?;
     let _ = staging.keep();
     Ok(())
 }
 
-/// Move `staged` onto `dest`, replacing whatever the destination held.
+/// Move the staged bundle onto the destination, replacing only the object the
+/// operator admitted for replacement.
 ///
-/// An existing bundle is moved aside rather than deleted first, so a failed
+/// Every step runs through `parent`, the handle the admission was made
+/// through, so neither a replaced parent nor a replaced destination can move
+/// the publish somewhere the operator did not name.
+///
+/// An admitted bundle is moved aside rather than deleted first, so a failed
 /// move can put it back. The window between the two renames is real: a crash
 /// inside it leaves the destination absent and the previous bundle under the
 /// retired name, which is why that name is derived from the staging token
 /// rather than being random on its own. Recovery is renaming it back.
-fn swap_into_place(staged: &Path, dest: &Path, parent: &Path) -> Result<()> {
-    if !dest.exists() {
-        return std::fs::rename(staged, dest)
-            .with_context(|| format!("failed to move the staged bundle into {}", dest.display()));
+///
+/// The recursive delete at the end is the one irreversible step here, so it
+/// runs only against an object proven twice to be the admitted one: once
+/// before the retiring rename, and once through the retired name afterwards.
+/// A rename moves a name, not necessarily the object that wore it when the
+/// decision to move it was taken.
+fn swap_into_place(
+    parent: &Dir,
+    staged: &OsStr,
+    name: &OsStr,
+    dest: &Path,
+    admission: Admission,
+    sources: &[ObjectId],
+) -> Result<()> {
+    publish_seam(dest);
+    let admitted = match admission {
+        Admission::Vacant => {
+            // Nothing was admitted for replacement, so publication only
+            // creates. The probe is advisory; the rename is the enforcement,
+            // and it cannot replace a non-empty directory or a non-directory
+            // on any supported platform. What it can still replace on Unix is
+            // an empty directory that appeared meanwhile, which loses nothing
+            // and retires nothing.
+            if parent.symlink_metadata(name).is_ok() {
+                bail!(
+                    "{}",
+                    mta(
+                        "cli-agent-export-dest-appeared",
+                        &[("path", dest.display().to_string().as_str())],
+                        "destination {$path} did not exist when the export started and does \
+                         now; replacing it was never admitted, so nothing was written"
+                    )
+                );
+            }
+            return parent.rename(staged, parent, name).with_context(|| {
+                format!("failed to move the staged bundle into {}", dest.display())
+            });
+        }
+        Admission::Empty(admitted) | Admission::Forced(admitted) => admitted,
+    };
+
+    let current = destination_identity(parent, name, dest)?;
+    if current.is_some_and(|current| sources.contains(&current)) {
+        // Named before the identity comparison below, which would refuse this
+        // too but could only say the destination changed. It changed into a
+        // tree this export just read, and publishing would delete it.
+        bail!(
+            "{}",
+            mta(
+                "cli-agent-export-dest-is-source",
+                &[("path", dest.display().to_string().as_str())],
+                "destination {$path} is now one of the trees this export read; publishing \
+                 would replace the source it just copied, so nothing was written"
+            )
+        );
+    }
+    if current != Some(admitted) {
+        bail!("{}", destination_changed(dest));
     }
 
-    let retired = parent.join(retired_name(staged));
-    if retired.exists() {
+    if matches!(admission, Admission::Empty(_)) {
+        // An empty destination was replaceable without `--force` because
+        // there was nothing to lose. `remove_dir` is what keeps that true:
+        // the kernel refuses a directory that has gained entries since, and
+        // no `--force` was ever given for them.
+        parent
+            .remove_dir(name)
+            .with_context(|| format!("failed to clear the empty destination {}", dest.display()))?;
+        return match parent.rename(staged, parent, name) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // Put the empty directory back, so a failed export leaves the
+                // destination as it found it.
+                parent.create_dir(name).ok();
+                Err(error).with_context(|| {
+                    format!("failed to move the staged bundle into {}", dest.display())
+                })
+            }
+        };
+    }
+
+    let retired = retired_name(staged);
+    if parent.symlink_metadata(&retired).is_ok() {
         // A leftover from a run that died mid-publish, wearing the same token.
         // Refuse rather than consume it: the caller cleans up the staged tree
         // and the destination is still the bundle it was.
-        bail!(
-            "cannot retire the existing bundle: {} already exists",
-            retired.display()
-        );
+        bail!("cannot retire the existing bundle: {retired} already exists beside the bundle");
     }
-    std::fs::rename(dest, &retired).with_context(|| {
+    parent.rename(name, parent, &retired).with_context(|| {
         format!(
             "failed to move the existing bundle at {} aside",
             dest.display()
         )
     })?;
-    match std::fs::rename(staged, dest) {
+    if destination_identity(parent, OsStr::new(&retired), dest)? != Some(admitted) {
+        // The name moved, but not the object the admission was made against.
+        // Put it back and refuse rather than point a recursive delete at
+        // something nobody admitted.
+        parent.rename(&retired, parent, name).ok();
+        bail!("{}", destination_changed(dest));
+    }
+    match parent.rename(staged, parent, name) {
         Ok(()) => {
             // The new bundle is published; the old one is now unreferenced.
             // Failing to reap it is untidy, not a failed export.
-            std::fs::remove_dir_all(&retired).ok();
+            parent.remove_dir_all(&retired).ok();
             Ok(())
         }
         Err(err) => {
-            if std::fs::rename(&retired, dest).is_ok() {
+            if parent.rename(&retired, parent, name).is_ok() {
                 return Err(err).with_context(|| {
                     format!("failed to move the staged bundle into {}", dest.display())
                 });
             }
             let dest_display = dest.display().to_string();
-            let retired_display = retired.display().to_string();
             let error = err.to_string();
             bail!(
                 "{}",
@@ -414,7 +676,7 @@ fn swap_into_place(staged: &Path, dest: &Path, parent: &Path) -> Result<()> {
                     "cli-agent-export-restore-failed",
                     &[
                         ("path", dest_display.as_str()),
-                        ("retired", retired_display.as_str()),
+                        ("retired", retired.as_str()),
                         ("error", error.as_str())
                     ],
                     "failed to publish the bundle to {$path} ({$error}), and the previous bundle could not be moved back — it is at {$retired}"
@@ -681,7 +943,11 @@ fn open_configured_root(path: &Path) -> Result<SourceRoot> {
 /// would copy the memory store under the admitted name without ever leaving the
 /// workspace. The open therefore refuses to traverse a link at all, and a swap
 /// between the two steps fails the export instead of silently redirecting it.
-fn copy_workspace(plan: &ExportPlan, dest: &Path) -> Result<CopyTally> {
+fn copy_workspace(
+    plan: &ExportPlan,
+    dest: &Path,
+    sources: &mut Vec<ObjectId>,
+) -> Result<CopyTally> {
     let mut copied = CopyTally::default();
     let opened = match plan.source_boundaries.workspace.as_deref() {
         Some(relative) => open_anchored_root(
@@ -718,6 +984,7 @@ fn copy_workspace(plan: &ExportPlan, dest: &Path) -> Result<CopyTally> {
             )
         ),
     };
+    sources.push(source_identity(&source, &plan.workspace_source)?);
     let target = open_bundle_dir(dest)?;
     let spec = CopySpec {
         root: WORKSPACE_DIR.to_string(),
@@ -735,7 +1002,12 @@ fn copy_workspace(plan: &ExportPlan, dest: &Path) -> Result<CopyTally> {
 /// carries the child directories the bundle admits and nothing else, so a
 /// skill the bundle excludes never travels and loose local state (sync
 /// markers and the like) stays behind.
-fn copy_skill_bundles(plan: &ExportPlan, dest_root: &Path, into: &mut BundleCopy) -> Result<()> {
+fn copy_skill_bundles(
+    plan: &ExportPlan,
+    dest_root: &Path,
+    into: &mut BundleCopy,
+    sources: &mut Vec<ObjectId>,
+) -> Result<()> {
     if plan.skill_sources.is_empty() {
         return Ok(());
     }
@@ -782,6 +1054,7 @@ fn copy_skill_bundles(plan: &ExportPlan, dest_root: &Path, into: &mut BundleCopy
                 )
             ),
         };
+        sources.push(source_identity(&bundle, &source.source)?);
         skills_root.create_dir(&source.alias).with_context(|| {
             format!(
                 "failed to create {SKILLS_DIR}/{} in the bundle",
@@ -898,22 +1171,15 @@ fn copy_skills(
 /// The staging directory's name was allocated uniquely in this parent, so
 /// reusing its random token keeps the retired name unique too, without the
 /// exporter carrying a random-number dependency of its own.
-fn retired_name(staged: &Path) -> String {
-    let token = staged
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
+fn retired_name(staged: &OsStr) -> String {
+    let token = staged.to_string_lossy();
     let token = token.strip_prefix(STAGING_PREFIX).unwrap_or(&token);
     format!("{RETIRED_PREFIX}{token}")
 }
 
 /// Whether two metadata views describe one filesystem object.
-///
-/// `dev`/`ino` are the portable identity pair `cap-fs-ext` exposes: on Windows
-/// they are the volume serial and file index, and cap-primitives builds both
-/// views from an opened handle, so neither side is a by-name guess.
 fn is_same_object(classified: &cap_std::fs::Metadata, opened: &cap_std::fs::Metadata) -> bool {
-    classified.dev() == opened.dev() && classified.ino() == opened.ino()
+    ObjectId::of(classified) == ObjectId::of(opened)
 }
 
 /// Create a directory inside the staging bundle and open a handle on it.
@@ -1068,6 +1334,19 @@ fn source_root_swap_seam(_walked: &Path) {}
 #[cfg(test)]
 fn source_root_swap_seam(walked: &Path) {
     tests::run_source_root_swap_seam(walked);
+}
+
+/// Test seam: runs once the staged tree is complete, immediately before
+/// publication binds itself to the admitted destination — the interleaving at
+/// which the destination can be created, replaced, or moved out from under
+/// the admission that was made about it. Compiled away outside tests.
+#[cfg(not(test))]
+#[inline]
+fn publish_seam(_dest: &Path) {}
+
+#[cfg(test)]
+fn publish_seam(dest: &Path) {
+    tests::run_publish_seam(dest);
 }
 
 fn report(plan: &ExportPlan, out: &Path, copied: &BundleCopy) {
@@ -1383,6 +1662,39 @@ mod tests {
         });
     }
 
+    thread_local! {
+        /// Swap to perform at [`publish_seam`], keyed on the destination.
+        /// Thread-local like [`ENTRY_SWAP`].
+        static PUBLISH_SWAP: std::cell::RefCell<Option<Swap>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn run_publish_seam(dest: &Path) {
+        PUBLISH_SWAP.with_borrow(|swap| {
+            if let Some(swap) = swap.as_ref() {
+                swap(dest);
+            }
+        });
+    }
+
+    /// Installs a swap at the publish seam for as long as it is held, so a
+    /// destination that changes between admission and publication can be
+    /// reproduced at an exact interleaving.
+    struct PublishSwap;
+
+    impl PublishSwap {
+        fn install(swap: impl Fn(&Path) + 'static) -> Self {
+            PUBLISH_SWAP.with_borrow_mut(|slot| *slot = Some(Box::new(swap)));
+            Self
+        }
+    }
+
+    impl Drop for PublishSwap {
+        fn drop(&mut self) {
+            PUBLISH_SWAP.with_borrow_mut(|slot| *slot = None);
+        }
+    }
+
     /// Installs a swap at the source-root walk's check-to-open seam for as
     /// long as it is held, so an ancestor replacement race can be reproduced
     /// at an exact interleaving.
@@ -1424,7 +1736,7 @@ mod tests {
     #[test]
     fn the_retired_name_pairs_with_the_staging_directory() {
         assert_eq!(
-            retired_name(Path::new("/tmp/bundles/.zeroclaw-export-AbC123")),
+            retired_name(OsStr::new(".zeroclaw-export-AbC123")),
             ".zeroclaw-export-old-AbC123"
         );
     }
@@ -1438,7 +1750,7 @@ mod tests {
         write(&source.path().join("memory/brain.db"), "sqlite");
 
         let plan = plan_for(source.path());
-        let copied = copy_workspace(&plan, dest.path()).unwrap();
+        let copied = copy_workspace(&plan, dest.path(), &mut Vec::new()).unwrap();
 
         assert_eq!(copied.files, 2);
         assert!(dest.path().join("IDENTITY.md").exists());
@@ -1528,7 +1840,7 @@ mod tests {
         let _socket = UnixListener::bind(source.path().join("agent.sock")).unwrap();
 
         let plan = plan_for(source.path());
-        let copied = copy_workspace(&plan, dest.path()).unwrap();
+        let copied = copy_workspace(&plan, dest.path(), &mut Vec::new()).unwrap();
 
         assert_eq!(copied.files, 1);
         assert_eq!(copied.others_skipped, 1);
@@ -1552,7 +1864,7 @@ mod tests {
         .unwrap();
 
         let plan = plan_for(source.path());
-        let copied = copy_workspace(&plan, dest.path()).unwrap();
+        let copied = copy_workspace(&plan, dest.path(), &mut Vec::new()).unwrap();
 
         assert_eq!(copied.files, 1);
         assert_eq!(copied.symlinks_skipped, 1);
@@ -1563,7 +1875,7 @@ mod tests {
     fn missing_workspace_is_not_an_error() {
         let dest = tempfile::tempdir().unwrap();
         let plan = plan_for(Path::new("/nonexistent/zeroclaw/workspace"));
-        let copied = copy_workspace(&plan, dest.path()).unwrap();
+        let copied = copy_workspace(&plan, dest.path(), &mut Vec::new()).unwrap();
         assert_eq!(copied, CopyTally::default());
     }
 
@@ -1943,7 +2255,7 @@ mod tests {
             write(&script, "#!/bin/sh\n");
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-            copy_workspace(&plan_for(source.path()), dest.path()).unwrap();
+            copy_workspace(&plan_for(source.path()), dest.path(), &mut Vec::new()).unwrap();
 
             let mode = std::fs::metadata(dest.path().join("run.sh"))
                 .unwrap()
@@ -2969,6 +3281,184 @@ mod tests {
         );
         // Neither the staging nor the retired directory outlived the publish.
         assert_eq!(entry_names(parent.path()), vec!["bundle".to_string()]);
+    }
+
+    /// The destination was absent when the occupancy decision was made, so
+    /// nothing needed `--force` and nothing was given it. A directory that
+    /// appears during the copy was admitted by nobody: publishing over it
+    /// would retire and then recursively delete a tree the operator was never
+    /// shown.
+    #[tokio::test]
+    async fn a_destination_that_appears_after_admission_is_not_retired() {
+        let source = tempfile::tempdir().unwrap();
+        write(&source.path().join("IDENTITY.md"), "identity");
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+
+        let planted = out.clone();
+        let _swap = PublishSwap::install(move |_| {
+            write(
+                &planted.join("someone-elses.md"),
+                "not the export's to delete",
+            );
+        });
+
+        let err = write_bundle(&mut plan_for(source.path()), &out, false)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("did not exist when the export started"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(out.join("someone-elses.md")).unwrap(),
+            "not the export's to delete"
+        );
+        // Nothing was retired, and the staging tree cleaned up after itself.
+        assert_eq!(entry_names(parent.path()), vec!["bundle".to_string()]);
+    }
+
+    /// An empty destination is replaceable without `--force` because there is
+    /// nothing to lose. Content that appears in it during the copy was never
+    /// covered by that, and `remove_dir` is what keeps the promise honest:
+    /// the kernel refuses a directory that has gained entries since.
+    #[tokio::test]
+    async fn an_empty_destination_filled_after_admission_is_not_replaced() {
+        let source = tempfile::tempdir().unwrap();
+        write(&source.path().join("IDENTITY.md"), "identity");
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+        std::fs::create_dir(&out).unwrap();
+
+        let filled = out.clone();
+        let _swap = PublishSwap::install(move |_| {
+            write(&filled.join("arrived.md"), "written after the check");
+        });
+
+        let err = write_bundle(&mut plan_for(source.path()), &out, false)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("failed to clear the empty destination"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(out.join("arrived.md")).unwrap(),
+            "written after the check"
+        );
+        assert_eq!(entry_names(parent.path()), vec!["bundle".to_string()]);
+    }
+
+    /// `--force` admits one directory for replacement. A different directory
+    /// renamed into its place during the copy is not the one the operator
+    /// looked at, so the retire-then-delete path must not be pointed at it.
+    #[tokio::test]
+    async fn a_forced_destination_replaced_after_admission_is_not_retired() {
+        let source = tempfile::tempdir().unwrap();
+        write(&source.path().join("IDENTITY.md"), "identity");
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+        write(&out.join("old.md"), "the bundle the operator forced over");
+
+        let impostor = parent.path().join("impostor");
+        write(&impostor.join("kept.md"), "never admitted for replacement");
+
+        let admitted = out.clone();
+        let moved_aside = parent.path().join("moved-aside");
+        let aside = moved_aside.clone();
+        let _swap = PublishSwap::install(move |_| {
+            std::fs::rename(&admitted, &aside).unwrap();
+            std::fs::rename(aside.with_file_name("impostor"), &admitted).unwrap();
+        });
+
+        let err = write_bundle(&mut plan_for(source.path()), &out, true)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("not the directory this export checked"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(out.join("kept.md")).unwrap(),
+            "never admitted for replacement"
+        );
+        assert!(moved_aside.join("old.md").is_file());
+    }
+
+    /// A tree the export read, renamed onto the destination during the copy.
+    /// The identity check would refuse this anyway, but only to say the
+    /// destination changed; publication names it for what it is, because the
+    /// object it would delete is the workspace the bundle just carried.
+    #[tokio::test]
+    async fn a_source_tree_moved_onto_the_destination_is_not_retired() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("workspace");
+        write(&source.join("IDENTITY.md"), "identity");
+
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("bundle");
+        write(&out.join("old.md"), "the bundle the operator forced over");
+
+        let admitted = out.clone();
+        let workspace = source.clone();
+        let _swap = PublishSwap::install(move |_| {
+            std::fs::remove_dir_all(&admitted).unwrap();
+            std::fs::rename(&workspace, &admitted).unwrap();
+        });
+
+        let err = write_bundle(&mut plan_for(&source), &out, true)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("one of the trees this export read"),
+            "{err}"
+        );
+        assert!(out.join("IDENTITY.md").is_file());
+    }
+
+    /// The parent is opened once and every publishing step goes through that
+    /// handle, so a parent replaced during the copy cannot redirect the
+    /// publish into a directory the operator never named: the bundle lands in
+    /// the object that was admitted, whatever now wears its name. The report
+    /// still prints the path as given, which under this race no longer names
+    /// the published bundle.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_replaced_parent_cannot_redirect_the_publish() {
+        let source = tempfile::tempdir().unwrap();
+        write(&source.path().join("IDENTITY.md"), "identity");
+
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("out");
+        std::fs::create_dir(&parent).unwrap();
+        let out = parent.join("bundle");
+
+        let admitted = parent.clone();
+        let moved = root.path().join("moved");
+        let aside = moved.clone();
+        let _swap = PublishSwap::install(move |_| {
+            std::fs::rename(&admitted, &aside).unwrap();
+            std::fs::create_dir(&admitted).unwrap();
+        });
+
+        write_bundle(&mut plan_for(source.path()), &out, false)
+            .await
+            .unwrap();
+
+        assert!(moved.join("bundle").join(MANIFEST_FILE).is_file());
+        // The impostor that took the admitted parent's name is untouched.
+        assert!(entry_names(&parent).is_empty());
     }
 
     /// Root ignores mode bits, so probe rather than assume the permission-denied
