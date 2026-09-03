@@ -271,14 +271,22 @@ pub enum ExportError {
          This is a bug in the export scrubber — please report it rather than working around it."
     )]
     UnscrubbedSecret { path: String },
+
+    #[error(
+        "the closure for agent '{alias}' does not validate on a clean install: {error}\n\
+         A bundle has to stand on its own, so this one is not written. Fix the reported \
+         field in this install's config and export again."
+    )]
+    ClosureInvalid { alias: String, error: String },
 }
 
 /// Compute the export closure for `alias`.
 ///
-/// Fails only on an unknown alias or a serialization fault; a source config
-/// with dangling references still exports (the unresolvable entries are simply
-/// absent from the closure, and the import-side `Config::validate()` is the
-/// gate that catches them).
+/// Fails only on an unknown alias or a serialization fault. A source config
+/// with dangling references plans without complaint — the unresolvable
+/// entries are simply absent from the closure — and is caught when the
+/// closure is rendered, which is the last point at which its final content is
+/// known. See [`render_config_toml`].
 pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportError> {
     let agent = config
         .agents
@@ -1332,10 +1340,46 @@ const CONFIG_HEADER: &str = "\
 pub fn render_config_toml(plan: &ExportPlan) -> Result<String, ExportError> {
     let body = toml::to_string_pretty(&plan.config)
         .map_err(|err| ExportError::Serialize(err.to_string()))?;
-    Ok(format!(
+    let rendered = format!(
         "{CONFIG_HEADER}{}",
         crate::schema::ensure_blank_line_before_sections(&body)
-    ))
+    );
+    validate_closure(&rendered, &plan.root_alias)?;
+    Ok(rendered)
+}
+
+/// Prove `rendered` is a config in its own right, the way the importing
+/// install will read it.
+///
+/// The bundle's central promise is a closure that stands alone: an import
+/// starts from a config holding none of the source install's entries, so
+/// every reference the closure carries has to resolve inside it. `carry`
+/// copies a referenced entry only when the source config has one, which
+/// leaves the agent pointing at nothing — a shape this code really is handed,
+/// because `Config::load_or_init` reports validation errors and boots anyway
+/// so an operator is never locked out of the CLI that repairs them. The
+/// exporter is one of the commands that stays reachable.
+///
+/// The families are not enumerated here. A hand-kept list drifts from the
+/// schema, and the schema already owns this question: the rendered text is
+/// parsed back into a `Config` and put through the same `Config::validate()`
+/// the target runs at load. Its error names the exact field, so the operator
+/// is told what to fix rather than that something is wrong.
+///
+/// A deserialized fragment carries no `config_path`, so `install_root_dir()`
+/// is the relative default and the skill-bundle directory rules resolve
+/// against it the same way they will against the target's own install root.
+fn validate_closure(rendered: &str, alias: &str) -> Result<(), ExportError> {
+    let imported: Config = toml::from_str(rendered).map_err(|err| ExportError::ClosureInvalid {
+        alias: alias.to_string(),
+        error: err.to_string(),
+    })?;
+    imported
+        .validate()
+        .map_err(|err| ExportError::ClosureInvalid {
+            alias: alias.to_string(),
+            error: format!("{err:#}"),
+        })
 }
 
 /// Build the bundle manifest table.
@@ -2041,6 +2085,144 @@ mod tests {
             imported.validate().unwrap_or_else(|err| {
                 panic!("closure must validate on an empty install: {err}\n{text}")
             });
+        }
+    }
+
+    /// Every reference family the closure carries, made to dangle one at a
+    /// time.
+    ///
+    /// Each of these is a config that *loads*: `Config::load_or_init` demotes
+    /// validation errors to a startup warning so a broken reference never
+    /// locks an operator out of the CLI that repairs it, and the exporter is
+    /// one of the commands that stays reachable. A bundle built from one
+    /// would fail on the importing install, where there is nothing else
+    /// configured for the reference to hide behind.
+    #[test]
+    fn a_dangling_reference_in_any_carried_family_is_refused() {
+        type Break = fn(&mut Config);
+        let cases: &[(&str, Break, &str)] = &[
+            (
+                "model provider",
+                |config| {
+                    config.agents.get_mut("researcher").unwrap().model_provider =
+                        "anthropic.gone".into();
+                },
+                "agents.researcher.model_provider",
+            ),
+            (
+                "classifier provider",
+                |config| {
+                    config
+                        .agents
+                        .get_mut("researcher")
+                        .unwrap()
+                        .classifier_provider = "anthropic.gone".into();
+                },
+                "agents.researcher.classifier_provider",
+            ),
+            (
+                "summary provider",
+                |config| {
+                    config
+                        .agents
+                        .get_mut("researcher")
+                        .unwrap()
+                        .summary_provider = "anthropic.gone".into();
+                },
+                "agents.researcher.summary_provider",
+            ),
+            (
+                "tts provider",
+                |config| {
+                    config.agents.get_mut("researcher").unwrap().tts_provider =
+                        "openai.gone".into();
+                },
+                "agents.researcher.tts_provider",
+            ),
+            (
+                "transcription provider",
+                |config| {
+                    config
+                        .agents
+                        .get_mut("researcher")
+                        .unwrap()
+                        .transcription_provider = "openai.gone".into();
+                },
+                "agents.researcher.transcription_provider",
+            ),
+            (
+                "risk profile",
+                |config| {
+                    config.agents.get_mut("researcher").unwrap().risk_profile = "gone".into();
+                },
+                "agents.researcher.risk_profile",
+            ),
+            (
+                "runtime profile",
+                |config| {
+                    config.agents.get_mut("researcher").unwrap().runtime_profile = "gone".into();
+                },
+                "agents.researcher.runtime_profile",
+            ),
+            (
+                "provider named by a carried runtime profile",
+                |config| {
+                    let mut profile = RuntimeProfileConfig::default();
+                    profile.context_compression.summary_provider = "anthropic.gone".into();
+                    config
+                        .runtime_profiles
+                        .insert("standard".to_string(), profile);
+                    config.agents.get_mut("researcher").unwrap().runtime_profile =
+                        "standard".into();
+                },
+                "runtime_profiles.standard.context_compression.summary_provider",
+            ),
+            (
+                "skill bundle",
+                |config| {
+                    config.agents.get_mut("researcher").unwrap().skill_bundles =
+                        vec!["gone".to_string()];
+                },
+                "agents.researcher.skill_bundles[0]",
+            ),
+            (
+                "knowledge bundle",
+                |config| {
+                    config
+                        .agents
+                        .get_mut("researcher")
+                        .unwrap()
+                        .knowledge_bundles = vec!["gone".to_string()];
+                },
+                "agents.researcher.knowledge_bundles[0]",
+            ),
+            (
+                "mcp bundle",
+                |config| {
+                    config.agents.get_mut("researcher").unwrap().mcp_bundles =
+                        vec!["gone".to_string()];
+                },
+                "agents.researcher.mcp_bundles[0]",
+            ),
+        ];
+
+        for (family, break_reference, expected) in cases {
+            let mut config = fixture();
+            break_reference(&mut config);
+            // Planning is not where this is caught: the closure is not final
+            // until every filesystem answer has been folded back into it.
+            let plan = plan_export(&config, "researcher")
+                .unwrap_or_else(|err| panic!("{family}: planning should still succeed: {err}"));
+
+            let err = render_config_toml(&plan).expect_err(&format!(
+                "{family}: a dangling reference must refuse the bundle"
+            ));
+            let text = err.to_string();
+            assert!(
+                matches!(err, ExportError::ClosureInvalid { .. }),
+                "{family}: {text}"
+            );
+            assert!(text.contains(expected), "{family}: {text}");
         }
     }
 

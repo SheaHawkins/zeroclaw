@@ -56,6 +56,12 @@ directory beside the destination and swapped in once it is complete, so:
   bundle alike: an `--out` *inside* a source would have the copy consume its own
   output, and an `--out` that *contains* one would replace the tree being
   exported.
+- The closure is proved before it is written. The rendered `config.toml` is
+  parsed back and put through the same validation the importing install runs,
+  on a config holding nothing else. A reference the source install could
+  satisfy but the bundle cannot, such as a provider or bundle entry that was
+  never configured, refuses the export and names the field, rather than
+  producing a bundle that fails on arrival.
 - What `--force` admits is one directory, not one path. The whole copy sits
   between the moment the destination is looked at and the moment the bundle is
   swapped in, so the decision is carried forward as the identity of the object

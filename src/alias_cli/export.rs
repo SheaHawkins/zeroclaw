@@ -1564,6 +1564,12 @@ mod tests {
     }
 
     /// A closure whose agent entry names an identity document.
+    ///
+    /// Minimal, but not *below* minimal: the rendered config is proved to
+    /// validate on a clean install before it is written, and an agent entry
+    /// with no model provider or risk profile is not a config anyone could
+    /// import. Both are carried here so these fixtures exercise the identity
+    /// handling rather than the closure gate.
     fn agent_identity_config(path: &str) -> toml::Table {
         let mut identity = toml::Table::new();
         identity.insert(
@@ -1572,10 +1578,37 @@ mod tests {
         );
         let mut agent = toml::Table::new();
         agent.insert("identity".to_string(), toml::Value::Table(identity));
+        agent.insert(
+            "model_provider".to_string(),
+            toml::Value::String("anthropic.main".to_string()),
+        );
+        agent.insert(
+            "risk_profile".to_string(),
+            toml::Value::String("guarded".to_string()),
+        );
         let mut agents = toml::Table::new();
         agents.insert("researcher".to_string(), toml::Value::Table(agent));
+
+        let mut anthropic = toml::Table::new();
+        anthropic.insert("main".to_string(), toml::Value::Table(toml::Table::new()));
+        let mut models = toml::Table::new();
+        models.insert("anthropic".to_string(), toml::Value::Table(anthropic));
+        let mut providers = toml::Table::new();
+        providers.insert("models".to_string(), toml::Value::Table(models));
+
+        let mut risk_profiles = toml::Table::new();
+        risk_profiles.insert(
+            "guarded".to_string(),
+            toml::Value::Table(toml::Table::new()),
+        );
+
         let mut root = toml::Table::new();
         root.insert("agents".to_string(), toml::Value::Table(agents));
+        root.insert("providers".to_string(), toml::Value::Table(providers));
+        root.insert(
+            "risk_profiles".to_string(),
+            toml::Value::Table(risk_profiles),
+        );
         root
     }
 
