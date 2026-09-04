@@ -805,24 +805,10 @@ fn sanitize_agent(
 /// Why `component` is not a name every supported target can materialize, or
 /// `None` when it is one.
 ///
-/// The bundle format controls two kinds of name: a skill-bundle alias, which
-/// becomes the directory `skills/<alias>/`, and each component of a retained
-/// `aieos_path`. Both are judged here by one grammar, because both are read
-/// by whoever opens the bundle rather than by the host that wrote it. The
-/// rule is therefore the intersection of what the supported targets accept,
-/// not what this one happens to.
-///
-/// Separators, relative-directory names, and controls are the half a Unix
-/// host can see. The Windows half is invisible from here and no less real:
-/// `con`, `nul`, `lpt1` and their kin name character devices whatever
-/// extension follows them, the characters `<>:"|?*` are not allowed in a
-/// filename at all, and a name ending in a space or a dot is silently
-/// stripped to a *different* name — so a bundle carrying one resolves
-/// somewhere its own manifest does not describe.
-///
-/// This governs the names the format itself controls. It is deliberately not
-/// a filter over arbitrary workspace or skill content, which travels under
-/// whatever names it already has.
+/// The rule itself is documented on [`is_safe_path_component`], the public
+/// entry point. This form reports *which* rule a name broke, because the
+/// answer is operator-facing: it becomes the detail on the dropped
+/// reference, so a bundle that leaves a name behind says why.
 fn unportable_component(component: &str) -> Option<&'static str> {
     if component.is_empty() {
         return Some("is empty");
@@ -881,7 +867,26 @@ fn is_windows_device_name(component: &str) -> bool {
 /// content at `skills/<alias>/`. The skill-bundle validator constrains where a
 /// bundle's *directory* may sit, not what its key may contain, so the key is
 /// checked against the format's own grammar before it is ever joined to a
-/// path. See [`unportable_component`].
+/// path.
+///
+/// That grammar governs the two kinds of name the bundle format controls: a
+/// skill-bundle alias, and each component of a retained `aieos_path`. Both
+/// are read by whoever opens the bundle rather than by the host that wrote
+/// it, so the rule is the intersection of what the supported targets accept
+/// rather than what this one happens to. Refused: an empty name, leading or
+/// trailing whitespace, `.` and `..`, a directory separator in either
+/// platform's reading, the characters `<>:"|?*`, control characters, a
+/// trailing dot, and the Windows device names (`con`, `nul`, `lpt1` and
+/// their kin, matched on the stem so an extension is no escape).
+///
+/// The last two are invisible from a Unix host and no less real. A name
+/// ending in a space or a dot is silently stripped to a *different* name on
+/// Windows, and a device name opens a device there, so a bundle carrying
+/// either resolves somewhere its own manifest does not describe.
+///
+/// This governs the names the format itself controls. It is deliberately not
+/// a filter over arbitrary workspace or skill content, which travels under
+/// whatever names it already has.
 #[must_use]
 pub fn is_safe_path_component(alias: &str) -> bool {
     unportable_component(alias).is_none()
